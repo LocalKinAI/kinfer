@@ -1,0 +1,25 @@
+# Compiled binaries
+/kinfer
+/kinfer-probe
+/probe
+/probe2
+
+# Downloaded models — hundreds of MB each, and reproducible with `kinfer pull`
+/models/
+
+# Native llama.cpp libraries.
+#
+# These are 4.6 MB of platform-specific binaries that change with every
+# llama.cpp release; committing them would bloat history for no benefit since
+# they are one command away:
+#
+#   go run github.com/dianlight/gollama.cpp/cmd/gollama-download \
+#       -download -copy-libs -libs-dir internal/nativelib/libs
+#
+# The directory itself must survive, though: `//go:embed all:libs` fails to
+# compile when the path does not exist. Hence the README exception below.
+/internal/nativelib/libs/*
+!/internal/nativelib/libs/README.md
+
+# macOS
+.DS_Store
