@@ -290,3 +290,67 @@ func TestListSkipsBrokenSymlinks(t *testing.T) {
 		t.Errorf("a link with nothing at the end of it was listed: %+v", models)
 	}
 }
+
+// Ollama's store belongs to Ollama. kinfer reads models out of it so that
+// someone who already has forty gigabytes on disk is not made to download them
+// again — but it must never write there, and in particular `kinfer rm` must not
+// be able to delete another program's data.
+func TestRemoveRefusesToDeleteOllamasBlobs(t *testing.T) {
+	dir := t.TempDir()
+	ollama := filepath.Join(t.TempDir(), "blobs")
+	if err := os.MkdirAll(ollama, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	blob := filepath.Join(ollama, "sha256-abc123")
+	if err := os.WriteFile(blob, []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, _ := OpenAt(dir)
+	err := s.Remove(blob)
+	if err == nil {
+		t.Fatal("kinfer rm deleted a file from Ollama's blob store")
+	}
+	if !strings.Contains(err.Error(), "ollama rm") {
+		t.Errorf("error does not point at the right tool: %v", err)
+	}
+	if _, statErr := os.Stat(blob); statErr != nil {
+		t.Error("the blob was removed despite the error")
+	}
+}
+
+func TestAllPrefersKinfersOwnCopy(t *testing.T) {
+	// A model present in both places is kinfer's: someone put it there on
+	// purpose, and a borrowed one should not shadow it.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "shared.gguf"), make([]byte, 99), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := OpenAt(dir)
+	all, err := s.All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range all {
+		if m.Name == "shared" && m.Source != FromKinfer {
+			t.Errorf("shared model came from %q, want %q", m.Source, FromKinfer)
+		}
+	}
+}
+
+// OpenAt names one directory and means it. If it reached into Ollama's store as
+// well, a caller asking about a path would get models from somewhere else, and
+// every test here would depend on what the machine running it has installed.
+func TestOpenAtDoesNotBorrow(t *testing.T) {
+	s, err := OpenAt(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := s.All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Errorf("OpenAt on an empty directory returned %d models: %+v", len(all), all)
+	}
+}

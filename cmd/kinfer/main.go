@@ -25,7 +25,7 @@ import (
 const usage = `kinfer — a single-file local inference runtime
 
   kinfer pull <repo>[:quant]   download a model from Hugging Face
-  kinfer list                  show installed models
+  kinfer list                  show models kinfer can load, including Ollama's
   kinfer rm <model>            delete a model
   kinfer run <model> [prompt]  chat with a model (no prompt = interactive)
   kinfer ps                    show which model is loaded right now
@@ -138,22 +138,34 @@ func cmdPull(args []string) error {
 }
 
 func cmdList(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	own := fs.Bool("own", false, "only models in kinfer's own directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
 	st, err := store.Open()
 	if err != nil {
 		return err
 	}
-	models, err := st.List()
+
+	list := st.All
+	if *own {
+		list = st.List
+	}
+	models, err := list()
 	if err != nil {
 		return err
 	}
 	if len(models) == 0 {
-		fmt.Printf("no models in %s\n\ntry: kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M\n", st.Root())
+		fmt.Println("no models yet — kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M")
 		return nil
 	}
 
-	fmt.Printf("%-46s %10s  %s\n", "NAME", "SIZE", "MODIFIED")
+	fmt.Printf("%-44s %10s  %-12s %s\n", "NAME", "SIZE", "MODIFIED", "SOURCE")
 	for _, m := range models {
-		fmt.Printf("%-46s %10s  %s\n", m.Name, store.HumanSize(m.Size), humanTime(m.Modified))
+		fmt.Printf("%-44s %10s  %-12s %s\n",
+			m.Name, store.HumanSize(m.Size), humanTime(m.Modified), m.Source)
 	}
 	return nil
 }

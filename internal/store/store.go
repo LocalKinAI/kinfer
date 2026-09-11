@@ -53,10 +53,23 @@ type Model struct {
 
 	// Modified is the file's mtime.
 	Modified time.Time
+
+	// Source is where the file lives. A borrowed model is read in place and
+	// never written to.
+	Source Source
 }
 
 // Store is a directory of models.
-type Store struct{ root string }
+type Store struct {
+	root string
+
+	// borrow says whether to also offer the models Ollama has on this machine.
+	// Only the default store does. OpenAt names one directory and means it —
+	// reaching into another program's store from there would surprise a caller
+	// who asked about a path, and would make a test depend on whatever the
+	// machine running it happens to have installed.
+	borrow bool
+}
 
 // Open returns the store at ~/.kinfer/models, creating it if needed.
 func Open() (*Store, error) {
@@ -64,7 +77,12 @@ func Open() (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("locate home directory: %w", err)
 	}
-	return OpenAt(filepath.Join(home, ".kinfer", "models"))
+	s, err := OpenAt(filepath.Join(home, ".kinfer", "models"))
+	if err != nil {
+		return nil, err
+	}
+	s.borrow = true
+	return s, nil
 }
 
 // OpenAt returns a store rooted at dir.
@@ -110,7 +128,7 @@ func (s *Store) List() ([]Model, error) {
 		if base, idx := shardOf(e.Name()); idx > 0 {
 			m := shards[base]
 			if m == nil {
-				m = &Model{Name: base}
+				m = &Model{Name: base, Source: FromKinfer}
 				shards[base] = m
 			}
 			m.Size += info.Size()
@@ -130,6 +148,7 @@ func (s *Store) List() ([]Model, error) {
 			Path:     path,
 			Size:     info.Size(),
 			Modified: info.ModTime(),
+			Source:   FromKinfer,
 		})
 	}
 
@@ -143,6 +162,28 @@ func (s *Store) List() ([]Model, error) {
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Modified.After(out[j].Modified) })
 	return out, nil
+}
+
+// All is every model kinfer can load: its own, plus the ones Ollama already has
+// on this machine. A name present in both belongs to kinfer's copy — that is
+// the one someone put there deliberately.
+func (s *Store) All() ([]Model, error) {
+	own, err := s.List()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(own))
+	for _, m := range own {
+		seen[strings.ToLower(m.Name)] = true
+	}
+	if s.borrow {
+		for _, m := range OllamaModels() {
+			if !seen[strings.ToLower(m.Name)] {
+				own = append(own, m)
+			}
+		}
+	}
+	return own, nil
 }
 
 // Resolve turns a user-supplied name into a path.
@@ -164,7 +205,7 @@ func (s *Store) Resolve(name string) (string, error) {
 		}
 	}
 
-	models, err := s.List()
+	models, err := s.All()
 	if err != nil {
 		return "", err
 	}
@@ -205,6 +246,12 @@ func (s *Store) Remove(name string) error {
 	// `kinfer rm` into a general-purpose file remover.
 	rel, err := filepath.Rel(s.root, path)
 	if err != nil || strings.HasPrefix(rel, "..") {
+		// A borrowed model must not be deletable by a kinfer command. That
+		// store belongs to Ollama and is not kinfer's to damage.
+		sep := string(filepath.Separator)
+		if strings.Contains(path, sep+"blobs"+sep) {
+			return fmt.Errorf("%s belongs to Ollama; remove it with `ollama rm %s` instead", name, name)
+		}
 		return fmt.Errorf("%s is outside the model directory; delete it yourself", path)
 	}
 
