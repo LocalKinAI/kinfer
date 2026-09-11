@@ -83,7 +83,32 @@ func (s *Server) remoteModel(name string) bool {
 // What kinfer adds is the deadline. That is the entire point of being in this
 // path: the upstream may stop answering, and a caller that cannot tell a slow
 // model from a dead one is the failure this runtime exists to prevent.
-func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, model string) {
+// retryableUpstream is a failure that says "not now" rather than "not this
+// request": the work is fine, the upstream cannot take it. Only these fall back.
+//
+// A 400 or a 401 must not: the request is wrong or unauthorised, and running it
+// on a different model produces a confident answer to a question the caller
+// already got wrong. A 404 must not either — that name does not exist upstream,
+// and substituting a local model would hide a typo behind a plausible reply.
+func retryableUpstream(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, // rate limited, which is the case this exists for
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// forward proxies one request upstream. It reports whether the caller should
+// fall back to a local model instead.
+//
+// True is only ever returned when nothing has been written: no header, no byte
+// of body. Once a reply has begun streaming there is no falling back, for the
+// same reason a request already mid-batch is not re-run when an engine dies —
+// the client has seen part of an answer, and a second attempt would repeat it.
+func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, model string) (fallback bool) {
 	deadline := s.opts.MaxGenerate
 	if deadline == 0 {
 		deadline = engine.DefaultMaxGenerate
@@ -100,7 +125,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, mo
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
+		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if a := r.Header.Get("Authorization"); a != "" {
@@ -110,14 +135,22 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, mo
 	log.Printf("→ %s for %s, forwarded to %s", r.URL.Path, model, s.upstream)
 	resp, err := s.upstreamClient.Do(req)
 	if err != nil {
-		// Nothing was written yet, so this can still be a status. An upstream
-		// that is not there must fail immediately: turning "Ollama is not
-		// running" into a five-minute wait would move the original outage
-		// rather than fix it.
+		// An upstream that is unreachable or silent is the same kind of "not
+		// now" as a 429, and nothing has been written yet.
+		if s.fallback != "" {
+			return true
+		}
+		// An upstream that is not there must fail immediately: turning "Ollama
+		// is not running" into a five-minute wait would move the original
+		// outage rather than fix it.
 		writeUpstreamError(w, model, s.upstream, err)
-		return
+		return false
 	}
 	defer resp.Body.Close()
+
+	if s.fallback != "" && retryableUpstream(resp.StatusCode) {
+		return true
+	}
 
 	for _, h := range []string{"Content-Type", "Retry-After"} {
 		if v := resp.Header.Get(h); v != "" {
@@ -134,7 +167,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, mo
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
+				return false
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -151,7 +184,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, mo
 					flusher.Flush()
 				}
 			}
-			return
+			return false
 		}
 	}
 }

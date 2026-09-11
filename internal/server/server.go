@@ -41,6 +41,12 @@ type Server struct {
 	upstream       string
 	upstreamClient *http.Client
 
+	// fallback is the local model to run when the upstream says "not now".
+	// Empty means never substitute, which is the default: answering with a
+	// different model than the caller asked for is only acceptable when someone
+	// has decided it is.
+	fallback string
+
 	// Exactly one model stays resident. A 7B model is several GB, so keeping a
 	// map of them would exhaust memory on the laptops kinfer targets; loading is
 	// fast enough (0.5s for a 0.5B, a few seconds for a 7B) that swapping on
@@ -443,8 +449,16 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.remoteModel(req.Model) {
-		s.forward(w, r, body, req.Model)
-		return
+		if !s.forward(w, r, body, req.Model) {
+			return
+		}
+		// The upstream could not take it and nothing has been written, so this
+		// can still be run locally. Under the local model's own name: a caller
+		// handed a different model's work without being told is exactly the
+		// substitution this project refuses to make, and the reply's model
+		// field is where it gets told.
+		log.Printf("%s unavailable upstream; answering with %s instead", req.Model, s.fallback)
+		req.Model = s.fallback
 	}
 
 	loadStart := time.Now()
@@ -738,8 +752,16 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.remoteModel(req.Model) {
-		s.forward(w, r, body, req.Model)
-		return
+		if !s.forward(w, r, body, req.Model) {
+			return
+		}
+		// The upstream could not take it and nothing has been written, so this
+		// can still be run locally. Under the local model's own name: a caller
+		// handed a different model's work without being told is exactly the
+		// substitution this project refuses to make, and the reply's model
+		// field is where it gets told.
+		log.Printf("%s unavailable upstream; answering with %s instead", req.Model, s.fallback)
+		req.Model = s.fallback
 	}
 
 	eng, release, err := s.acquire(req.Model)

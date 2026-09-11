@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -196,5 +197,76 @@ func TestUpstreamHonoursOllamaHost(t *testing.T) {
 	t.Setenv("OLLAMA_HOST", "")
 	if got := Upstream(); got != DefaultUpstream {
 		t.Errorf("Upstream() = %q, want %q", got, DefaultUpstream)
+	}
+}
+
+// A rate-limited cloud model falls back to the local one, and the reply says
+// which model actually answered. Silent substitution — a caller asking for a
+// trillion-parameter hosted model and quietly getting a local one — is the
+// same lie this project keeps removing, in a new place.
+func TestRateLimitFallsBackAndSaysSo(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limit"}`))
+	}))
+	defer up.Close()
+
+	srv := cloudServer(t, up)
+	srv.fallback = "local"
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return &fakeEngine{path: p, frags: []string{"local ", "answer"}}, nil
+	}
+
+	w := post(srv, "/api/chat", `{"model":"kimi-k2.5:cloud","messages":[],"stream":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 — the fallback should have answered: %s", w.Code, w.Body.String())
+	}
+	var got ollamaChatResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Message.Content != "local answer" {
+		t.Errorf("content = %q, want the local model's reply", got.Message.Content)
+	}
+	if got.Model != "local" {
+		t.Errorf("model = %q, want \"local\" — the caller must be told who answered", got.Model)
+	}
+}
+
+// Only "not now" falls back. A rejected or unknown request must surface: running
+// it on another model produces a confident answer to a question that was already
+// wrong, and hides a typo behind a plausible reply.
+func TestOnlyRetryableUpstreamFailuresFallBack(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		want   bool
+	}{
+		{http.StatusTooManyRequests, true},
+		{http.StatusServiceUnavailable, true},
+		{http.StatusGatewayTimeout, true},
+		{http.StatusBadGateway, true},
+		{http.StatusBadRequest, false},
+		{http.StatusUnauthorized, false},
+		{http.StatusNotFound, false},
+		{http.StatusOK, false},
+	} {
+		if got := retryableUpstream(c.status); got != c.want {
+			t.Errorf("retryableUpstream(%d) = %v, want %v", c.status, got, c.want)
+		}
+	}
+}
+
+// With no fallback configured, nothing is substituted — an upstream failure is
+// reported as itself.
+func TestNoFallbackMeansNoSubstitution(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer up.Close()
+
+	srv := cloudServer(t, up) // fallback left empty
+	w := post(srv, "/api/chat", `{"model":"kimi-k2.5:cloud","messages":[],"stream":false}`)
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("status %d, want the upstream's own 429 passed through", w.Code)
 	}
 }
