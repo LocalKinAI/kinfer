@@ -37,31 +37,38 @@ import (
 // A promise that fails later is the thing kinfer exists to not do. So measure
 // the budget while the model is loading, and refuse before serving.
 
-// thinHeadroom is the point below which kinfer says out loud how little room
-// is left. It is a caution, not a measured limit, and the difference matters.
+// thinHeadroom is the point below which kinfer says out loud how little room is
+// left for anything else on the machine.
 //
-// What prompted it: -ctx 16384 -slots 4 left 1.6 GiB free on a 96 GB Mac
-// Studio, and a batch failed to allocate, retiring the model and ending 26
-// requests at once. -ctx 16384 -slots 2, at 2.7 GiB, had been serving for
-// hours. A line at 2 GiB separates those two.
+// The failure it warns about is understood, and the account is the one thing on
+// this machine worth writing down. ggml-metal derives free from
+// recommendedMaxWorkingSetSize minus currentAllocatedSize, and
+// currentAllocatedSize belongs to the calling process. Every process is
+// therefore told how much of the budget IT has spent, and nothing about the
+// others — while the hardware limit they are all spending against is shared.
+// When the sum crosses, an allocation fails, and no process could see it coming.
 //
-// What did not survive checking it: the failure could not be reproduced. The
-// same binary, flags and load at the same 1.6 GiB completed 5 runs out of 5,
-// and 12 out of 12 more while a second process hammered the same GPU with
-// 3000-token prefills specifically to contend for it. A sweep of per-slot
-// prefill chunks from 512 down to 64 at that headroom found no size that
-// failed. So batch size is not demonstrably the trigger, and 1.6 GiB is not
-// demonstrably too little.
+// Measured, with each process logging its own figure and the sums added
+// afterwards, against a 77.8 GiB budget and a 73.4 GiB model:
 //
-// What is left is the company: every observed failure happened while another
-// process held GPU memory, and none happened on an exclusive machine. Two of
-// those were self-inflicted — a second kinfer left running with a 73 GiB model
-// resident makes every configuration here fail, reliably, at any concurrency.
-// Since this reading cannot see that process at all, a thin margin is at the
-// mercy of something invisible from here. Worth saying; not the same as a
-// threshold that predicts failure. Hence a notice rather than a refusal, and no
-// guard in the scheduler: a mitigation aimed at an unreproduced mechanism is a
-// guess with a runtime cost.
+//	processes                 sum       margin   outcome
+//	alone                     76.2 GiB  -1.6     passes
+//	+ one 0.5B under load     77.3 GiB  -0.5     32/32 answered, three runs
+//	+ two 0.5B under load     78.4 GiB  +0.7     fails, both runs
+//	+ a second copy of itself 151.3 GiB +73.5    fails immediately
+//
+// The only difference between the third row and the second is 1.1 GiB belonging
+// to someone else, and the sum crosses exactly there. It explains what weeks of
+// looking inside one process could not: why an exclusive machine never
+// reproduces the failure at any concurrency, prompt length or batch size; why a
+// second big model reproduces it instantly; and why the original outage looked
+// intermittent — it sat within a gigabyte of the line.
+//
+// Two consequences for this file. The figure it prints is exact for this
+// process and says nothing about the machine, which is why it is labelled that
+// way. And the line below is not a prediction that this configuration will
+// fail: it is the point at which there is no longer room for company, which on
+// a shared machine is the thing that decides it.
 const thinHeadroom = 2 << 30 // 2 GiB
 
 // budget tracks the accelerator's free memory across the stages of a load.
