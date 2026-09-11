@@ -86,7 +86,7 @@ type lease struct {
 // generating, which segfaulted the process.
 type generator interface {
 	Chat(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, error)
-	ChatFull(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, bool, error)
+	ChatFull(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, engine.Stats, error)
 	Broken() bool
 	ToolFormat() tools.Format
 	Close()
@@ -351,11 +351,42 @@ type ollamaChatResponse struct {
 	Done       bool      `json:"done"`
 	DoneReason string    `json:"done_reason,omitempty"`
 
+	// Timings, in integer nanoseconds, on the final object only — Ollama's
+	// shape exactly, because everything that measures a local model reads these
+	// and none of it asks kinfer how it spells them. `ollama run --verbose`
+	// divides eval_count by eval_duration for its tokens-per-second line;
+	// benchmark scripts and dashboards do the same. Absent, they read zero, and
+	// a runtime that reports zero tokens in zero nanoseconds can only be timed
+	// from outside with a stopwatch.
+	//
+	// They are omitempty so the streaming path's per-token objects stay as
+	// slim as Ollama's, which carry no counts at all.
+	TotalDuration      int64 `json:"total_duration,omitempty"`
+	LoadDuration       int64 `json:"load_duration,omitempty"`
+	PromptEvalCount    int   `json:"prompt_eval_count,omitempty"`
+	PromptEvalDuration int64 `json:"prompt_eval_duration,omitempty"`
+	EvalCount          int   `json:"eval_count,omitempty"`
+	EvalDuration       int64 `json:"eval_duration,omitempty"`
+
 	// Error travels in-band because the response headers are long gone by the
 	// time generation can fail. Without it a failure is indistinguishable from
 	// an empty reply — which is precisely how a context overflow reached
 	// LocalKin as a silent empty answer over a 200 OK.
 	Error string `json:"error,omitempty"`
+}
+
+// withTimings fills in the measurements a caller reads to work out how fast
+// this was. load is how long acquiring the model took — seconds when the
+// request paid for a load, microseconds when it found one resident — and total
+// is the whole request, prompt to last token.
+func (r ollamaChatResponse) withTimings(st engine.Stats, load, total time.Duration) ollamaChatResponse {
+	r.TotalDuration = total.Nanoseconds()
+	r.LoadDuration = load.Nanoseconds()
+	r.PromptEvalCount = st.PromptTokens
+	r.PromptEvalDuration = st.PromptEvalDuration.Nanoseconds()
+	r.EvalCount = st.EvalTokens
+	r.EvalDuration = st.EvalDuration.Nanoseconds()
+	return r
 }
 
 func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
@@ -366,6 +397,8 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("→ /api/chat from %s", r.RemoteAddr)
 
+	start := time.Now()
+
 	var req ollamaChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("  decode failed: %v", err)
@@ -373,12 +406,17 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	loadStart := time.Now()
 	eng, release, err := s.acquire(req.Model)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
 	defer release()
+	// Whatever acquire took is load time: reading a GGUF off disk, or waiting
+	// behind another request's swap. It is near zero when the model was already
+	// resident, which is the number a caller wants to see.
+	load := time.Since(loadStart)
 
 	msgs := toChatMessages(req.Messages)
 	params := applyOllamaOptions(engine.DefaultGenParams(), req.Options)
@@ -398,7 +436,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	// client fragments of syntax. With functions on the table the reply is
 	// buffered and delivered once, parsed.
 	if len(req.Tools) > 0 {
-		text, truncated, err := eng.ChatFull(r.Context(), msgs, params, nil)
+		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -408,7 +446,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		// made.
 		thinking, answer := chat.SplitThinking(text)
 		content, calls := eng.ToolFormat().Parse(answer)
-		reason := doneReason(truncated)
+		reason := doneReason(st.Truncated)
 		if len(calls) > 0 {
 			reason = "tool_calls"
 		}
@@ -422,7 +460,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 			Message:    msg,
 			Done:       true,
 			DoneReason: reason,
-		})
+		}.withTimings(st, load, time.Since(start)))
 		return
 	}
 
@@ -430,7 +468,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	stream := req.Stream == nil || *req.Stream
 
 	if !stream {
-		text, truncated, err := eng.ChatFull(r.Context(), msgs, params, nil)
+		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -445,8 +483,8 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:  time.Now(),
 			Message:    msg,
 			Done:       true,
-			DoneReason: doneReason(truncated),
-		})
+			DoneReason: doneReason(st.Truncated),
+		}.withTimings(st, load, time.Since(start)))
 		return
 	}
 
@@ -475,17 +513,20 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	_, truncated, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
+	_, st, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
 		emit(split.Next(frag))
 	})
 	emit(split.Flush())
+	// The terminal object is the only one that carries counts, and it is the
+	// one a streaming client reads them from — `ollama run` streams, so this is
+	// the path its verbose line is computed from.
 	final := ollamaChatResponse{
 		Model:      req.Model,
 		CreatedAt:  time.Now(),
 		Message:    ollamaMsg{Role: "assistant"},
 		Done:       true,
-		DoneReason: doneReason(truncated),
-	}
+		DoneReason: doneReason(st.Truncated),
+	}.withTimings(st, load, time.Since(start))
 	if genErr != nil {
 		// Headers are already out, so the error can only travel as a final
 		// frame. It MUST travel: a 200 that ends in an empty message is
@@ -598,6 +639,25 @@ type openAIChatRequest struct {
 	Seed        *int64          `json:"seed"`
 	Tools       []tools.Tool    `json:"tools"`
 	Think       json.RawMessage `json:"think"`
+
+	// StreamOptions is where a streaming caller asks for token counts. OpenAI
+	// sends usage on a stream only when include_usage is set, in one extra
+	// chunk after the last content — so a client that did not ask must not get
+	// it, and one that did must not have to guess.
+	StreamOptions *struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
+}
+
+// usage is the OpenAI dialect's token accounting. Clients bill, budget and
+// trim context against it; an object of zeros tells a caller its whole
+// conversation cost nothing, which it then believes.
+func usage(st engine.Stats) map[string]any {
+	return map[string]any{
+		"prompt_tokens":     st.PromptTokens,
+		"completion_tokens": st.EvalTokens,
+		"total_tokens":      st.PromptTokens + st.EvalTokens,
+	}
 }
 
 func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
@@ -649,7 +709,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// As in the Ollama dialect: a tool call arrives as JSON across many tokens,
 	// so with functions on the table the reply is buffered and parsed.
 	if len(req.Tools) > 0 {
-		text, truncated, err := eng.ChatFull(r.Context(), msgs, params, nil)
+		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
 			return
@@ -661,7 +721,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		if wantThinking(req.Think) && thinking != "" {
 			msg["reasoning_content"] = thinking
 		}
-		finish := doneReason(truncated)
+		finish := doneReason(st.Truncated)
 		if len(calls) > 0 {
 			finish = "tool_calls"
 			wire := make([]any, len(calls))
@@ -676,12 +736,13 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id": id, "object": "chat.completion", "created": created, "model": req.Model,
 			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
+			"usage":   usage(st),
 		})
 		return
 	}
 
 	if !req.Stream {
-		text, truncated, err := eng.ChatFull(r.Context(), msgs, params, nil)
+		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
 			return
@@ -695,7 +756,8 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id": id, "object": "chat.completion", "created": created, "model": req.Model,
-			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": doneReason(truncated)}},
+			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": doneReason(st.Truncated)}},
+			"usage":   usage(st),
 		})
 		return
 	}
@@ -731,7 +793,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, truncated, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
+	_, st, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
 		emit(split.Next(frag))
 	})
 	if err := genErr; err != nil {
@@ -749,7 +811,16 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	emit(split.Flush())
-	chunk(map[string]any{}, doneReason(truncated))
+	chunk(map[string]any{}, doneReason(st.Truncated))
+	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
+		// OpenAI's shape for this: one last chunk carrying no choices at all,
+		// only the counts.
+		payload, _ := json.Marshal(map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": req.Model,
+			"choices": []any{}, "usage": usage(st),
+		})
+		fmt.Fprintf(w, "data: %s\n\n", payload)
+	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }

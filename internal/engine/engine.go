@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/llama"
@@ -66,6 +67,50 @@ type GenParams struct {
 	// into the prompt in the form the model was trained on; whether it knows
 	// that form at all is SupportsTools.
 	Tools []tools.Tool
+}
+
+// Stats are the token counts and timings for one reply.
+//
+// They exist because a runtime that cannot be measured cannot be chosen. Ollama
+// reports these on every reply and everything that benchmarks a local model
+// reads them — `ollama run --verbose`, dashboards, benchmark scripts — so a
+// runtime that answers with zeros is not fast, it is unmeasurable, and against
+// a self-reporting Ollama the only comparison left is a stopwatch.
+//
+// The durations are wall clock for one request, not exclusive GPU time. A
+// request shares each forward pass with every other busy slot, so under load
+// its eval duration counts their tokens as well as its own. That is the honest
+// answer to "how long did this caller wait", and the number Ollama reports too.
+type Stats struct {
+	// Truncated records that the reply stopped because it ran out of budget
+	// rather than because the model finished. Reporting the two the same way
+	// tells a caller a cut-off answer is complete — and a reasoning model that
+	// spends its whole budget thinking returns nothing at all, which is
+	// baffling unless the reason is given.
+	Truncated bool
+
+	// PromptTokens is the whole rendered prompt, counting the part the prefix
+	// pool supplied from cache rather than prefilled. Ollama counts
+	// prompt_eval_count the same way, so a pooled prefix shows up as an
+	// unchanged count against a tiny PromptEvalDuration — which is the saving,
+	// stated, rather than a prompt that appears not to have existed.
+	PromptTokens int
+
+	// EvalTokens is how many tokens the model generated.
+	EvalTokens int
+
+	// PromptEvalDuration runs from the moment a slot takes the request to the
+	// first sampled token — the prefill and nothing else. Time spent queueing
+	// for a slot is not in it; that shows up only in the caller's own total,
+	// which is the right place for it, since a queue says how busy the server
+	// was rather than how fast the model is.
+	PromptEvalDuration time.Duration
+
+	// EvalDuration starts at that first sampled token, so it excludes prefill.
+	// That is the boundary Ollama draws, and drawing it anywhere else would
+	// make EvalTokens/EvalDuration — the tokens-per-second everything quotes —
+	// mean something different here than it does there.
+	EvalDuration time.Duration
 }
 
 // Defaults for a machine nobody has measured yet.
@@ -283,18 +328,20 @@ func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onT
 	return text, err
 }
 
-// ChatFull is Chat plus whether the reply was cut short by the token budget.
+// ChatFull is Chat plus what was counted and measured while producing it: the
+// token counts and timings the HTTP dialects report, and whether the reply was
+// cut short by the token budget.
 //
-// The distinction matters most for a reasoning model: it can spend an entire
-// budget thinking and return an empty answer, and a caller told that completed
-// normally has no way to tell that from a model with nothing to say.
-func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p GenParams, onToken func(string)) (string, bool, error) {
+// That last distinction matters most for a reasoning model: it can spend an
+// entire budget thinking and return an empty answer, and a caller told that
+// completed normally has no way to tell that from a model with nothing to say.
+func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p GenParams, onToken func(string)) (string, Stats, error) {
 	e.mu.Lock()
 	sched := e.sched
 	e.mu.Unlock()
 
 	if sched == nil {
-		return "", false, fmt.Errorf("engine for %s is closed", e.path)
+		return "", Stats{}, fmt.Errorf("engine for %s is closed", e.path)
 	}
 
 	// Size the buffer to hold the whole reply. The scheduler never blocks on a
@@ -313,7 +360,7 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p GenParams,
 		done:   make(chan struct{}),
 	}
 	if err := sched.submit(j); err != nil {
-		return "", false, err
+		return "", Stats{}, err
 	}
 
 	var out strings.Builder
@@ -324,5 +371,5 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p GenParams,
 		}
 	}
 	<-j.done
-	return out.String(), j.truncated, j.err
+	return out.String(), j.stats, j.err
 }
