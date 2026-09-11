@@ -512,6 +512,36 @@ tokens, and streaming it would hand the client fragments of syntax; with
 functions on the table the reply is buffered and delivered once, parsed. Without
 them, streaming is unchanged.
 
+## Reasoning models
+
+A reasoning model writes its working out before it answers, wrapped in `<think>`
+tags. That text is not the reply: a client showing replies verbatim shows the
+model talking to itself, and — worse for a fleet — a tool call *decided on*
+inside the thinking block is not a tool call, so a caller waiting for one sees
+prose. kinfer separates the two, as Ollama does.
+
+```
+POST /api/chat  {"think": true, …}
+
+{"message": {"role":"assistant", "content":"4",
+             "thinking":"The user asks \"What is 2+2?\" and wants just the number…"}}
+```
+
+Without `think`, the working out is split off and dropped, so `content` is the
+answer and nothing else. Streaming separates them as they arrive rather than
+buffering the reply. The OpenAI dialect uses `reasoning_content`, the field
+DeepSeek introduced and most clients now look for.
+
+Thinking is split before tool calls are parsed, so a `<tool_call>` the model
+merely considered while reasoning is not mistaken for one it made. All three
+arrive separately:
+
+```
+tool_calls  [{"function":{"name":"get_weather","arguments":{"city":"Berlin"}}}]
+content     ""
+thinking    "The user is asking about the weather in Berlin. I have a tool available…"
+```
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary

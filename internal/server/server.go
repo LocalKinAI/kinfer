@@ -262,11 +262,18 @@ type ollamaChatRequest struct {
 	Stream   *bool          `json:"stream"`
 	Options  *ollamaOptions `json:"options"`
 	Tools    []tools.Tool   `json:"tools"`
+
+	// Think asks for a reasoning model's working out to be returned separately
+	// rather than dropped. Ollama takes true/false or a level string; only
+	// presence matters here, since kinfer does not instruct the model either
+	// way — it splits whatever the model produced.
+	Think json.RawMessage `json:"think"`
 }
 
 type ollamaMsg struct {
 	Role      string       `json:"role"`
 	Content   string       `json:"content"`
+	Thinking  string       `json:"thinking,omitempty"`
 	ToolCalls []ollamaCall `json:"tool_calls,omitempty"`
 }
 
@@ -274,6 +281,23 @@ type ollamaMsg struct {
 // "function" key; kinfer's own tools.Call is the flat form.
 type ollamaCall struct {
 	Function tools.Call `json:"function"`
+}
+
+// wantThinking reports whether the caller asked to see a reasoning model's
+// working out. Absent or false, it is split off and dropped: it is not the
+// reply, and a client that prints replies verbatim would show the model talking
+// to itself.
+func wantThinking(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var b bool
+	if json.Unmarshal(raw, &b) == nil {
+		return b
+	}
+	// Ollama also accepts a level ("low", "high"); any string asks for it.
+	var s string
+	return json.Unmarshal(raw, &s) == nil && s != "" && s != "false"
 }
 
 func wireCalls(calls []tools.Call) []ollamaCall {
@@ -368,15 +392,23 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		content, calls := tools.Parse(text)
+		// Thinking first: a reasoning model decides on its tool call inside the
+		// block, and a <tool_call> it merely considered there is not one it
+		// made.
+		thinking, answer := chat.SplitThinking(text)
+		content, calls := tools.Parse(answer)
 		reason := "stop"
 		if len(calls) > 0 {
 			reason = "tool_calls"
 		}
+		msg := ollamaMsg{Role: "assistant", Content: content, ToolCalls: wireCalls(calls)}
+		if wantThinking(req.Think) {
+			msg.Thinking = thinking
+		}
 		writeJSON(w, http.StatusOK, ollamaChatResponse{
 			Model:      req.Model,
 			CreatedAt:  time.Now(),
-			Message:    ollamaMsg{Role: "assistant", Content: content, ToolCalls: wireCalls(calls)},
+			Message:    msg,
 			Done:       true,
 			DoneReason: reason,
 		})
@@ -392,10 +424,15 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
+		thinking, content := chat.SplitThinking(text)
+		msg := ollamaMsg{Role: "assistant", Content: content}
+		if wantThinking(req.Think) {
+			msg.Thinking = thinking
+		}
 		writeJSON(w, http.StatusOK, ollamaChatResponse{
 			Model:      req.Model,
 			CreatedAt:  time.Now(),
-			Message:    ollamaMsg{Role: "assistant", Content: text},
+			Message:    msg,
 			Done:       true,
 			DoneReason: "stop",
 		})
@@ -412,14 +449,25 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	enc := json.NewEncoder(w)
-	_, genErr := eng.Chat(r.Context(), msgs, params, func(frag string) {
-		_ = enc.Encode(ollamaChatResponse{
-			Model:     req.Model,
-			CreatedAt: time.Now(),
-			Message:   ollamaMsg{Role: "assistant", Content: frag},
-		})
+	showThinking := wantThinking(req.Think)
+	var split chat.ThinkSplitter
+
+	emit := func(thinking, content string) {
+		if content == "" && (thinking == "" || !showThinking) {
+			return
+		}
+		msg := ollamaMsg{Role: "assistant", Content: content}
+		if showThinking {
+			msg.Thinking = thinking
+		}
+		_ = enc.Encode(ollamaChatResponse{Model: req.Model, CreatedAt: time.Now(), Message: msg})
 		flusher.Flush()
+	}
+
+	_, genErr := eng.Chat(r.Context(), msgs, params, func(frag string) {
+		emit(split.Next(frag))
 	})
+	emit(split.Flush())
 	final := ollamaChatResponse{
 		Model:      req.Model,
 		CreatedAt:  time.Now(),
@@ -530,14 +578,15 @@ func modelName(path string) string {
 // ─── OpenAI dialect ──────────────────────────────────────────────────────────
 
 type openAIChatRequest struct {
-	Model       string       `json:"model"`
-	Messages    []ollamaMsg  `json:"messages"`
-	Stream      bool         `json:"stream"`
-	Temperature *float64     `json:"temperature"`
-	TopP        *float64     `json:"top_p"`
-	MaxTokens   *int         `json:"max_tokens"`
-	Seed        *int64       `json:"seed"`
-	Tools       []tools.Tool `json:"tools"`
+	Model       string          `json:"model"`
+	Messages    []ollamaMsg     `json:"messages"`
+	Stream      bool            `json:"stream"`
+	Temperature *float64        `json:"temperature"`
+	TopP        *float64        `json:"top_p"`
+	MaxTokens   *int            `json:"max_tokens"`
+	Seed        *int64          `json:"seed"`
+	Tools       []tools.Tool    `json:"tools"`
+	Think       json.RawMessage `json:"think"`
 }
 
 func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
@@ -594,9 +643,13 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
 			return
 		}
-		content, calls := tools.Parse(text)
+		thinking, answer := chat.SplitThinking(text)
+		content, calls := tools.Parse(answer)
 
 		msg := map[string]any{"role": "assistant", "content": content}
+		if wantThinking(req.Think) && thinking != "" {
+			msg["reasoning_content"] = thinking
+		}
 		finish := "stop"
 		if len(calls) > 0 {
 			finish = "tool_calls"
@@ -622,13 +675,16 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
 			return
 		}
+		thinking, content := chat.SplitThinking(text)
+		msg := map[string]any{"role": "assistant", "content": content}
+		if wantThinking(req.Think) && thinking != "" {
+			// OpenAI has no standard field for this; reasoning_content is what
+			// DeepSeek introduced and what most clients now look for.
+			msg["reasoning_content"] = thinking
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id": id, "object": "chat.completion", "created": created, "model": req.Model,
-			"choices": []any{map[string]any{
-				"index":         0,
-				"message":       ollamaMsg{Role: "assistant", Content: text},
-				"finish_reason": "stop",
-			}},
+			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": "stop"}},
 		})
 		return
 	}
@@ -652,8 +708,20 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	chunk(map[string]any{"role": "assistant"}, nil)
+
+	showThinking := wantThinking(req.Think)
+	var split chat.ThinkSplitter
+	emit := func(thinking, content string) {
+		if content != "" {
+			chunk(map[string]any{"content": content}, nil)
+		}
+		if showThinking && thinking != "" {
+			chunk(map[string]any{"reasoning_content": thinking}, nil)
+		}
+	}
+
 	if _, err := eng.Chat(r.Context(), msgs, params, func(frag string) {
-		chunk(map[string]any{"content": frag}, nil)
+		emit(split.Next(frag))
 	}); err != nil {
 		// Reporting finish_reason "stop" here would claim the model finished
 		// normally. Emit an error event first — the shape OpenAI clients
@@ -668,6 +736,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
+	emit(split.Flush())
 	chunk(map[string]any{}, "stop")
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
