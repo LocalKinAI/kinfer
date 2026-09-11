@@ -105,10 +105,14 @@ func New(p Params) *Sampler {
 	return &Sampler{chain: chain}
 }
 
-// Sample returns the next token for ctx, reading the logits of its most recent
-// decode. It also records the token for the repetition penalty.
-func (s *Sampler) Sample(ctx llama.Context) llama.Token {
-	return llama.SamplerSample(s.chain, ctx, -1)
+// Sample returns the next token for ctx, reading the logits at index idx of the
+// most recent decode. It also records the token for the repetition penalty.
+//
+// idx matters once a batch carries several sequences: each one's logits live at
+// the position its last token occupied, and -1 (the last row) would hand every
+// slot the same token.
+func (s *Sampler) Sample(ctx llama.Context, idx int32) llama.Token {
+	return llama.SamplerSample(s.chain, ctx, idx)
 }
 
 // Reset forgets the penalty history, as if the sampler were new.

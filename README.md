@@ -292,8 +292,8 @@ by then the writer serves many streams and the generation loop must not block.
 
 **Ollama runs one request at a time**, and a bigger machine does not change it:
 on the M3 Ultra eight concurrent requests still take eight times as long as one,
-its log still shows only `slot id 0`. kinfer serialises too, for now. What
-continuous batching is worth — `llama-server --parallel 8 -cb`, same machine,
+its log still shows only `slot id 0`. kinfer no longer does — see *Continuous
+batching* below. What it is worth — `llama-server --parallel 8 -cb`, same machine,
 same model, same rounds:
 
 | concurrent requests | llama-server `-cb` | Ollama | kinfer |
@@ -349,6 +349,44 @@ every later request, starts fast.
 **CPU beats Metal on a 0.5B model** — transfer overhead outweighs the compute
 win at this size. `kinfer fit` already reports this (it recommends CPU for
 anything at or below 1.5B); acting on it without being asked is Phase 3.
+
+## Continuous batching
+
+Conversations run side by side as separate sequences in one KV cache, advanced
+together by a single forward pass per step. One goroutine owns the context and
+everything else hands it work over a channel.
+
+```
+$ kinfer serve -slots 8
+kinfer serving on :11500 — 1 model(s) in ~/.kinfer/models
+  8 slots × 4096 tokens — conversations share one forward pass
+```
+
+Eight concurrent requests on the M4, with `KINFER_DEBUG_SCHED=1`:
+
+```
+sched:   44 steps/s   mean batch   8.0 tokens   mean active slots  8.0
+```
+
+Every step carries one token from each of the eight slots: 44 × 8 = **352 tok/s
+aggregate against 164 for a single stream.** `llama-batched-bench` puts this
+machine's own ceiling at a batch of eight at 393.5 tok/s, so the scheduler
+reaches **89% of what llama.cpp achieves on the same hardware**.
+
+The gain is the machine's to give, not the scheduler's. This M4 saturates early
+— 2.39× at a batch of eight, where the M3 Ultra reaches 4.46× there and 21.6× at
+128. Slot counts come from `{8, 32, 64, 128}`; see the table above for why never
+12–16.
+
+Two things the scheduler will not do. It never blocks on a client: a consumer
+that stops reading stalls only its own slot, because a blocked send would freeze
+every other conversation with it. And prompts are prefilled in 512-token chunks
+rather than whole, so an agent arriving with an 8k system prompt shares a step
+with the conversations already generating instead of stopping them.
+
+Sequences must not leak into each other, so that is tested directly: eight
+arithmetic questions with distinguishable answers, asked serially and then all
+at once, must produce identical replies. They do.
 
 ## Roadmap
 

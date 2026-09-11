@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/llama"
@@ -26,8 +25,19 @@ type Options struct {
 	// 114 tok/s Metal on a 0.5B.
 	GPULayers int
 
-	// ContextSize in tokens. 0 takes the model's own training context.
+	// ContextSize is the context ONE conversation gets, in tokens. The context
+	// llama.cpp allocates is this times Slots, because it divides a context
+	// between sequences.
 	ContextSize int
+
+	// Slots is how many conversations share the model, each with its own
+	// sequence in the KV cache. They are served by one forward pass per step,
+	// so aggregate throughput climbs far faster than per-stream speed falls.
+	//
+	// Pick from {8, 32, 64, 128}: step time roughly doubles between a batch of
+	// 8 and 12 and then stays flat to 32, so 12-16 costs more than 8 and
+	// returns less. See the table in README. 0 means 8.
+	Slots int
 
 	// Template forces a chat family ("chatml", "llama3", "mistral").
 	// Empty means guess from the filename.
@@ -42,6 +52,24 @@ type GenParams struct {
 	MaxTokens int
 }
 
+// Defaults for a machine nobody has measured yet.
+const (
+	// DefaultSlots is the conservative end of the useful range: step time is
+	// still cheap at a batch of 8, and the KV cost is eight conversations'
+	// worth rather than thirty-two.
+	DefaultSlots = 8
+
+	// DefaultContextSize is the context one conversation gets.
+	DefaultContextSize = 4096
+
+	// batchCapacity bounds one forward pass: a full prefill chunk plus a token
+	// for every slot, with room to spare.
+	batchCapacity = 2048
+
+	// maxFragBuffer caps the per-request fragment queue.
+	maxFragBuffer = 2048
+)
+
 // DefaultGenParams are sane conversational defaults.
 func DefaultGenParams() GenParams {
 	return GenParams{Params: sampling.DefaultParams(), MaxTokens: 512}
@@ -49,10 +77,14 @@ func DefaultGenParams() GenParams {
 
 // Engine is one loaded model, ready to answer.
 //
-// Safe for concurrent use, but generation is serialised: a llama.cpp context
-// holds mutable KV-cache state, so two conversations sharing one context would
-// corrupt each other. A future version can keep a pool of contexts; for a local
-// runtime, one at a time is the honest tradeoff.
+// Safe for concurrent use, and concurrency is the point: conversations run side
+// by side as separate sequences in one KV cache, advanced together by a single
+// forward pass per step. Generating a token means reading every weight in the
+// model, so serving eight conversations in one pass costs barely more than
+// serving one — measured on an M3 Ultra with Qwen2.5-0.5B, 300 tok/s alone
+// against 1337 at a batch of eight.
+//
+// Chat is a thin wrapper over the scheduler, which owns the context outright.
 type Engine struct {
 	mu    sync.Mutex
 	model llama.Model
@@ -60,7 +92,10 @@ type Engine struct {
 	vocab llama.Vocab
 	tpl   *chat.Template
 	path  string
-	nCtx  int
+	nCtx  int // per conversation
+	slots int
+
+	sched *scheduler
 }
 
 // Open loads a GGUF file.
@@ -81,9 +116,21 @@ func Open(path string, opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("load %s: llama.cpp could not read the model (see its output above)", path)
 	}
 
+	slots := opts.Slots
+	if slots <= 0 {
+		slots = DefaultSlots
+	}
+	perSeq := opts.ContextSize
+	if perSeq <= 0 {
+		perSeq = DefaultContextSize
+	}
+
 	cp := llama.DefaultContextParams()
-	if opts.ContextSize > 0 {
-		cp.NCtx = uint32(opts.ContextSize)
+	cp.NSeqMax = uint32(slots)
+	// llama.cpp divides n_ctx between sequences, so ask for the total.
+	cp.NCtx = uint32(perSeq * slots)
+	if cp.NBatch < uint32(batchCapacity) {
+		cp.NBatch = uint32(batchCapacity)
 	}
 
 	lctx := llama.NewContext(model, cp)
@@ -108,28 +155,40 @@ func Open(path string, opts Options) (*Engine, error) {
 	// months, and it stays: a struct that silently drifts out of sync with
 	// llama.h would fail here instead of somewhere unrecognisable.
 	actualCtx := llama.NCtx(lctx)
-	if opts.ContextSize > 0 && actualCtx < opts.ContextSize {
+	if actualCtx < perSeq*slots {
 		llama.FreeContext(lctx)
 		llama.FreeModel(model)
-		return nil, fmt.Errorf("asked for a %d-token context but llama.cpp allocated %d "+
+		return nil, fmt.Errorf("asked for a %d-token context (%d slots x %d) but llama.cpp allocated %d "+
 			"(llama_context_params may have changed shape — see internal/llama)",
-			opts.ContextSize, actualCtx)
+			perSeq*slots, slots, perSeq, actualCtx)
 	}
 
-	return &Engine{
+	vocab := llama.GetVocab(model)
+	e := &Engine{
 		model: model,
 		lctx:  lctx,
-		vocab: llama.GetVocab(model),
+		vocab: vocab,
 		tpl:   tpl,
 		path:  path,
-		nCtx:  actualCtx,
-	}, nil
+		nCtx:  actualCtx / slots,
+		slots: slots,
+	}
+	e.sched = newScheduler(lctx, vocab, tpl, slots, actualCtx, batchCapacity)
+	return e, nil
 }
 
-// Close releases the model and its context.
+// Slots is how many conversations this engine serves at once.
+func (e *Engine) Slots() int { return e.slots }
+
+// Close stops the scheduler and releases the model and its context.
 func (e *Engine) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.sched != nil {
+		// Stop decoding before anything it decodes into is freed.
+		e.sched.close()
+		e.sched = nil
+	}
 	if e.lctx != 0 {
 		llama.FreeContext(e.lctx)
 		e.lctx = 0
@@ -152,96 +211,47 @@ func (e *Engine) VocabSize() int { return int(llama.NVocab(e.vocab)) }
 // Chat generates a reply. onToken, if non-nil, receives each fragment as it is
 // produced — that is what the HTTP server streams.
 //
-// ctx cancels generation between tokens; a request that goes away should not
-// keep the model busy.
+// ctx cancels generation; a request that goes away releases its slot at the
+// next step rather than holding it for the full reply.
+//
+// Calls run concurrently. Each takes a slot and rides along in the shared
+// forward pass, so the cost of the tenth caller is far below ten times the cost
+// of the first.
 func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onToken func(string)) (string, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	sched := e.sched
+	e.mu.Unlock()
 
-	// A closed engine has a NULL context, and llama.cpp does not check: the
-	// call segfaults the process rather than returning. Callers should hold a
-	// reference that prevents this (see server.acquire); the check is here so a
-	// bookkeeping mistake costs one failed request instead of the whole fleet's
-	// fallback.
-	if e.lctx == 0 {
+	if sched == nil {
 		return "", fmt.Errorf("engine for %s is closed", e.path)
 	}
 
-	// Wipe the KV cache. Without this, turn N+1 silently inherits turn N's
-	// state and the model answers a question nobody asked.
-	llama.ClearMemory(e.lctx)
-
-	prompt := e.tpl.Render(msgs)
-	tokens, err := llama.Tokenize(e.vocab, prompt, true, true)
-	if err != nil {
-		return "", fmt.Errorf("tokenize: %w", err)
-	}
-	if len(tokens) >= e.nCtx {
-		return "", fmt.Errorf("prompt is %d tokens but the context holds %d", len(tokens), e.nCtx)
+	// Size the buffer to hold the whole reply. The scheduler never blocks on a
+	// consumer — a client that stopped reading must not stall the other slots —
+	// so a buffer that cannot hold a reply would drop the tail of it instead.
+	buf := p.MaxTokens
+	if buf <= 0 || buf > maxFragBuffer {
+		buf = maxFragBuffer
 	}
 
-	sampler := sampling.New(p.Params)
-	defer sampler.Close() // a sampler chain is C memory; Go will not reclaim it
-
-	maxTokens := p.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = e.nCtx - len(tokens)
+	j := &job{
+		ctx:    ctx,
+		msgs:   msgs,
+		params: p,
+		frags:  make(chan string, buf+8),
+		done:   make(chan struct{}),
+	}
+	if err := sched.submit(j); err != nil {
+		return "", err
 	}
 
-	var (
-		out     strings.Builder
-		emitted int
-		cur     = tokens
-	)
-
-	for i := 0; i < maxTokens; i++ {
-		if err := ctx.Err(); err != nil {
-			return out.String(), err
+	var out strings.Builder
+	for frag := range j.frags {
+		out.WriteString(frag)
+		if onToken != nil {
+			onToken(frag)
 		}
-		if len(tokens)+i >= e.nCtx {
-			break // context is full
-		}
-
-		if err := llama.DecodeTokens(e.lctx, cur); err != nil {
-			return out.String(), fmt.Errorf("decode at token %d: %w", i, err)
-		}
-
-		// Sampling happens inside llama.cpp over its own logit buffer. The
-		// previous version copied all 151,936 logits into Go and sorted them
-		// once per token, which cost roughly two thirds of the throughput.
-		tok := sampler.Sample(e.lctx)
-		if llama.IsEOG(e.vocab, tok) {
-			break
-		}
-
-		piece := llama.TokenToPiece(e.vocab, tok, false)
-		if piece == "" {
-			break
-		}
-		out.WriteString(piece)
-
-		// Some templates leak their stop marker as ordinary text; cut there.
-		text, hitStop := e.tpl.TrimStop(out.String())
-
-		// Emit only what has become valid UTF-8. A CJK character spans two or
-		// three tokens, and half of one is not printable.
-		if onToken != nil && len(text) > emitted {
-			pending := text[emitted:]
-			if utf8.ValidString(pending) {
-				onToken(pending)
-				emitted = len(text)
-			}
-		}
-
-		if hitStop {
-			return text, nil
-		}
-		cur = []llama.Token{tok}
 	}
-
-	text, _ := e.tpl.TrimStop(out.String())
-	if onToken != nil && len(text) > emitted {
-		onToken(text[emitted:])
-	}
-	return text, nil
+	<-j.done
+	return out.String(), j.err
 }

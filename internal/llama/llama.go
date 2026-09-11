@@ -169,6 +169,8 @@ var (
 	getLogitsIth       func(c Context, i int32) *float32
 	getMemory          func(c Context) Memory
 	memoryClear        func(mem Memory, data bool)
+	memorySeqRm        func(mem Memory, seq, p0, p1 int32) bool
+	memorySeqCp        func(mem Memory, src, dst, p0, p1 int32)
 	tokenize           func(v Vocab, text string, textLen int32, out *Token, max int32, addSpecial, parseSpecial bool) int32
 	modelGetVocab      func(m Model) Vocab
 	vocabNTokens       func(v Vocab) int32
@@ -255,6 +257,8 @@ func bind(dir string) error {
 		{&getLogitsIth, "llama_get_logits_ith"},
 		{&getMemory, "llama_get_memory"},
 		{&memoryClear, "llama_memory_clear"},
+		{&memorySeqRm, "llama_memory_seq_rm"},
+		{&memorySeqCp, "llama_memory_seq_cp"},
 		{&tokenize, "llama_tokenize"},
 		{&modelGetVocab, "llama_model_get_vocab"},
 		{&vocabNTokens, "llama_vocab_n_tokens"},
@@ -447,6 +451,116 @@ func Logits(c Context, i int32, nVocab int32) []float32 {
 // ClearMemory wipes the KV cache. Without it, a second conversation on the same
 // context silently inherits the first one's state.
 func ClearMemory(c Context) { memoryClear(getMemory(c), true) }
+
+// ForgetSequence drops one sequence's KV cells, leaving every other sequence
+// sharing the context untouched. This is what frees a slot for reuse: clearing
+// the whole cache would take the other slots' conversations with it.
+//
+// p0 and p1 bound the positions removed; -1 for either means "no bound".
+func ForgetSequence(c Context, seq int32, p0, p1 int32) {
+	memorySeqRm(getMemory(c), seq, p0, p1)
+}
+
+// CopySequence makes dst share src's KV cells over [p0, p1).
+//
+// It does not copy anything: llama.cpp tags the existing cells with a second
+// sequence id. That is what will make a shared prompt prefix — one agent's
+// system prompt, prefilled once and reused on every turn it takes — nearly
+// free.
+func CopySequence(c Context, src, dst int32, p0, p1 int32) {
+	memorySeqCp(getMemory(c), src, dst, p0, p1)
+}
+
+// ─── multi-sequence batches ──────────────────────────────────────────────────
+
+// BatchBuilder assembles one llama_batch holding tokens from several sequences.
+//
+// This is the unit of work continuous batching runs on: one forward pass that
+// advances every active conversation by a token, plus whatever prompt chunks
+// are being prefilled. The weights are read once and serve the whole batch,
+// which is why aggregate throughput climbs while per-stream speed barely moves.
+//
+// It owns Go memory that llama.cpp reads through raw pointers, so a builder must
+// outlive the Decode call that reads it. Keep one per scheduler rather than
+// allocating per step.
+type BatchBuilder struct {
+	tokens  []Token
+	pos     []int32
+	nSeqID  []int32
+	seqIDs  []int32   // one sequence per token — kinfer never needs more
+	seqPtrs []uintptr // seqPtrs[i] = &seqIDs[i], because C wants llama_seq_id**
+	logits  []int8
+	n       int
+}
+
+// NewBatchBuilder makes a builder holding up to n tokens per batch.
+func NewBatchBuilder(n int) *BatchBuilder {
+	b := &BatchBuilder{
+		tokens:  make([]Token, n),
+		pos:     make([]int32, n),
+		nSeqID:  make([]int32, n),
+		seqIDs:  make([]int32, n),
+		seqPtrs: make([]uintptr, n),
+		logits:  make([]int8, n),
+	}
+	for i := range b.seqIDs {
+		b.seqPtrs[i] = uintptr(unsafe.Pointer(&b.seqIDs[i]))
+		b.nSeqID[i] = 1
+	}
+	return b
+}
+
+// Cap is the largest batch this builder can hold.
+func (b *BatchBuilder) Cap() int { return len(b.tokens) }
+
+// Len is how many tokens are queued.
+func (b *BatchBuilder) Len() int { return b.n }
+
+// Reset empties the batch.
+func (b *BatchBuilder) Reset() { b.n = 0 }
+
+// Add appends one token of sequence seq at position pos, returning the index to
+// read its logits at. Returns -1 if the batch is full.
+//
+// wantLogits marks the token whose logits will be read afterwards — the last
+// token of each sequence in the batch, and nothing else. llama.cpp computes
+// only the output rows that are asked for, so marking every token would do many
+// times the work for results nobody reads.
+func (b *BatchBuilder) Add(tok Token, pos int32, seq int32, wantLogits bool) int32 {
+	if b.n >= len(b.tokens) {
+		return -1
+	}
+	i := b.n
+	b.tokens[i] = tok
+	b.pos[i] = pos
+	b.seqIDs[i] = seq
+	b.logits[i] = 0
+	if wantLogits {
+		b.logits[i] = 1
+	}
+	b.n++
+	return int32(i)
+}
+
+// Decode runs the forward pass for everything added since Reset.
+func (b *BatchBuilder) Decode(c Context) error {
+	if b.n == 0 {
+		return nil
+	}
+	batch := Batch{
+		NTokens: int32(b.n),
+		Token:   uintptr(unsafe.Pointer(&b.tokens[0])),
+		Pos:     uintptr(unsafe.Pointer(&b.pos[0])),
+		NSeqID:  uintptr(unsafe.Pointer(&b.nSeqID[0])),
+		SeqID:   uintptr(unsafe.Pointer(&b.seqPtrs[0])),
+		Logits:  uintptr(unsafe.Pointer(&b.logits[0])),
+	}
+	err := Decode(c, batch)
+	// Every field above crossed as a raw pointer, which the collector cannot
+	// see. Hold the slices until llama.cpp has finished reading them.
+	runtime.KeepAlive(b)
+	return err
+}
 
 // ─── sampling ────────────────────────────────────────────────────────────────
 

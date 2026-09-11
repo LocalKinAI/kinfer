@@ -187,7 +187,7 @@ func main() {
 
 		// Sampling runs inside llama.cpp over its own logit buffer — no copy
 		// of the 151,936-entry row crosses into Go.
-		tok := sampler.Sample(lctx)
+		tok := sampler.Sample(lctx, -1)
 		sampleTime += time.Since(tAfterSync)
 		if llama.IsEOG(vocab, tok) {
 			stopped = true
