@@ -30,9 +30,16 @@ var shardName = regexp.MustCompile(`-\d{5}-of-\d{5}\.gguf$`)
 // ("clip"). Reading the architecture from it, or offering it as something to
 // pull, points someone at a few hundred megabytes that cannot answer a
 // question. imatrix files are calibration data and not weights at all.
-// mtp files are speculative-decoding draft heads — a few dozen tensors that
-// ride alongside a model rather than replacing it.
-var auxiliary = regexp.MustCompile(`(?i)(^|/)(mmproj|mtp-|.*imatrix.*)`)
+// auxiliary matches anywhere in the path, not just at the start of a segment.
+// Uploaders place these markers wherever they like — "mmproj-F16.gguf" in one
+// repo, "Model-Name.mmproj-f16.gguf" in another — and anchoring the match let
+// the second form through, which read the vision projector's architecture
+// ("clip") as the model's and offered 600 MB as something to download.
+//
+// mtp files are speculative-decoding draft heads: a few dozen tensors that ride
+// alongside a model rather than replacing it. imatrix files are calibration
+// data and not weights at all.
+var auxiliary = regexp.MustCompile(`(?i)(mmproj|imatrix|[.\-_]mtp[.\-_]|(^|/)mtp-)`)
 
 // IsModel reports whether a GGUF in a repo is a model rather than something
 // shipped alongside one.

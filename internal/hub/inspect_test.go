@@ -12,6 +12,11 @@ func TestIsModelExcludesWhatShipsBesideTheModel(t *testing.T) {
 		"mmproj-F16.gguf",
 		"mmproj-BF16.gguf",
 		"UD-Q2_K_XL/mmproj-F16.gguf",
+		// Uploaders put the marker mid-name too. Anchoring the match to the
+		// start of a path segment let this form through, and then the vision
+		// projector's architecture ("clip") was read as the model's.
+		"Qwen3.5-27B-kimi-k2.5-Reasoning-Distilled.mmproj-Q8_0.gguf",
+		"Qwen3.5-27B-kimi-k2.5-Reasoning-Distilled.mmproj-f16.gguf",
 		"Qwen3.8-Flash-Next-imatrix.gguf",
 		"imatrix_unsloth.gguf",
 	} {
@@ -23,6 +28,8 @@ func TestIsModelExcludesWhatShipsBesideTheModel(t *testing.T) {
 		"Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
 		"UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf",
 		"qwen2.5-0.5b-instruct-q4_k_m.gguf",
+		// A real model whose name merely contains the letters is not auxiliary.
+		"Qwen3.5-27B-kimi-k2.5-Reasoning-Distilled.Q4_K_M.gguf",
 	} {
 		if !IsModel(n) {
 			t.Errorf("IsModel(%q) = false, want true", n)
