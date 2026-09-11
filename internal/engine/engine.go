@@ -136,10 +136,15 @@ func Open(path string, opts Options) (*Engine, error) {
 	mp := llama.DefaultModelParams()
 	mp.NGpuLayers = int32(opts.GPULayers)
 
+	// Read the accelerator's free memory before anything is allocated, so the
+	// model's and the context's real costs can be measured rather than guessed.
+	bud := newBudget()
+
 	model := llama.LoadModel(path, mp)
 	if model == 0 {
 		return nil, fmt.Errorf("load %s: llama.cpp could not read the model (see its output above)", path)
 	}
+	bud.afterModel = bud.sample()
 
 	slots := opts.Slots
 	if slots <= 0 {
@@ -179,6 +184,8 @@ func Open(path string, opts Options) (*Engine, error) {
 		llama.FreeModel(model)
 		return nil, fmt.Errorf("create context for %s", path)
 	}
+	bud.afterCtx = bud.sample()
+	bud.report(slots, prefix, perSeq)
 
 	tpl := chat.FromModel(model, path)
 	if opts.Template != "" {

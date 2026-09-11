@@ -299,6 +299,11 @@ func bind(dir string) error {
 			return err
 		}
 	}
+
+	// The device registry lives in libggml. It is how kinfer learns the GPU's
+	// working-set budget, and it is best-effort: a build without it still
+	// serves, it just cannot warn about a configuration that will not fit.
+	bindGGML(dir)
 	return nil
 }
 
