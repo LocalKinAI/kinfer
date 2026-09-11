@@ -106,6 +106,19 @@ type Stats struct {
 	// was rather than how fast the model is.
 	PromptEvalDuration time.Duration
 
+	// ReloadDuration is time spent loading a replacement model in the middle of
+	// this request, after the one it started against died.
+	//
+	// It is separate from the caller's own load measurement because that one is
+	// taken when the model is acquired, before generation begins, and this
+	// happens after. Adding them is the caller's job and is not optional: on a
+	// retried request the first acquire found a resident model and reports
+	// microseconds, while the reload it hides can be most of a minute. Left out,
+	// the components of a forty-second request all read as milliseconds — worse
+	// than the missing zeros this whole set of fields removed, because a
+	// plausible small number does not look wrong.
+	ReloadDuration time.Duration
+
 	// EvalDuration starts at that first sampled token, so it excludes prefill.
 	// That is the boundary Ollama draws, and drawing it anywhere else would
 	// make EvalTokens/EvalDuration — the tokens-per-second everything quotes —

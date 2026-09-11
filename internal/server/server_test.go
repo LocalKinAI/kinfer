@@ -791,3 +791,71 @@ func TestRetryHappensOnceOnly(t *testing.T) {
 		t.Error("a request that never ran twice reported success")
 	}
 }
+
+// A request that paid for a reload must say so in load_duration.
+//
+// The trap is where the measurement is taken: the handler times acquire, which
+// happens before generation, while a mid-request reload happens during it. Left
+// unaccounted, a request that spent forty seconds loading a replacement reports
+// every component in milliseconds and only total_duration knows — which is
+// worse than a missing figure, because a plausible small number does not look
+// wrong.
+func TestReloadTimeReachesLoadDuration(t *testing.T) {
+	srv, reg := newTestServer(t, "alpha")
+
+	const pause = 60 * time.Millisecond
+	var opened int
+	srv.open = func(path string, _ engine.Options) (generator, error) {
+		opened++
+		if opened == 1 {
+			f := &fakeEngine{path: path, err: engine.ErrNotStarted, broken: true}
+			reg.put(f)
+			return f, nil
+		}
+		time.Sleep(pause) // the replacement is expensive to load, as a real one is
+		f := &fakeEngine{path: path, frags: []string{"ok"}}
+		reg.put(f)
+		return f, nil
+	}
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(body)))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var got ollamaChatResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.LoadDuration < pause.Nanoseconds() {
+		t.Errorf("load_duration = %v, want at least the %v the reload took — "+
+			"the reload happened inside ChatFull and was not counted",
+			time.Duration(got.LoadDuration), pause)
+	}
+	// And the parts must still add up to no more than the whole.
+	parts := got.LoadDuration + got.PromptEvalDuration + got.EvalDuration
+	if parts > got.TotalDuration {
+		t.Errorf("components sum to %v, more than the total %v — the reload was double counted",
+			time.Duration(parts), time.Duration(got.TotalDuration))
+	}
+}
+
+// And a request that never needed a reload must not acquire a phantom one.
+func TestLoadDurationUnchangedWithoutARetry(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(body)))
+
+	var got ollamaChatResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.LoadDuration > got.TotalDuration {
+		t.Errorf("load_duration %v exceeds total %v on a request that loaded once",
+			time.Duration(got.LoadDuration), time.Duration(got.TotalDuration))
+	}
+}

@@ -384,9 +384,14 @@ type ollamaChatResponse struct {
 // this was. load is how long acquiring the model took — seconds when the
 // request paid for a load, microseconds when it found one resident — and total
 // is the whole request, prompt to last token.
+//
+// A model that died mid-request and was reloaded adds to load rather than
+// vanishing: the caller took its reading before generation, the reload happened
+// during it, and the two are the same cost. Without this the components of a
+// retried request sum to well under its total.
 func (r ollamaChatResponse) withTimings(st engine.Stats, load, total time.Duration) ollamaChatResponse {
 	r.TotalDuration = total.Nanoseconds()
-	r.LoadDuration = load.Nanoseconds()
+	r.LoadDuration = (load + st.ReloadDuration).Nanoseconds()
 	r.PromptEvalCount = st.PromptTokens
 	r.PromptEvalDuration = st.PromptEvalDuration.Nanoseconds()
 	r.EvalCount = st.EvalTokens

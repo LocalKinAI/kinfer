@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/engine"
@@ -105,10 +106,17 @@ func (rt *retrying) ChatFull(ctx context.Context, msgs []chat.Message, p engine.
 	// Nothing of this request reached llama.cpp or the client, so running it
 	// again is not a repeat — it is the first attempt that gets to happen.
 	log.Printf("%s went down before a queued request started; retrying it on a fresh model", rt.name)
+	reloadStart := time.Now()
 	if err := rt.swap(); err != nil {
 		return "", engine.Stats{}, err
 	}
-	return rt.current().ChatFull(ctx, msgs, p, onToken)
+	reload := time.Since(reloadStart)
+
+	// The caller measured its load before generation started, so the reload
+	// this request just paid for is invisible to it. Hand it back.
+	text, st, err = rt.current().ChatFull(ctx, msgs, p, onToken)
+	st.ReloadDuration += reload
+	return text, st, err
 }
 
 func (rt *retrying) Chat(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, error) {
