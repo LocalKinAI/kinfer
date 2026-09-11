@@ -57,21 +57,31 @@ func cmdCanRun(args []string) error {
 		return err
 	}
 	arch, archFrom := "", ""
+	var archErr error
 
 	if len(quants) > 0 {
 		// A GGUF repo states its architecture in the file itself, and a ranged
 		// request reads it without fetching the model.
-		if a, err := hub.Architecture(ctx, repo, quants[0].Files[0]); err == nil {
+		a, err := hub.Architecture(ctx, repo, quants[0].Files[0])
+		if err == nil {
 			arch, archFrom = a, "GGUF metadata"
+		} else {
+			archErr = err
 		}
 	}
 	if arch == "" {
 		if a, err := hub.ModelType(ctx, repo); err == nil && a != "" {
 			arch, archFrom = a, "config.json"
+			archErr = nil
 		}
 	}
 
 	switch {
+	case arch == "" && archErr != nil:
+		// "no metadata" and "the metadata could not be fetched" are different
+		// claims, and only one of them is about the model.
+		fmt.Printf("  architecture   could not be read: %v\n", archErr)
+
 	case arch == "":
 		fmt.Printf("  architecture   unknown — no GGUF metadata and no config.json\n")
 
