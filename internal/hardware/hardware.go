@@ -19,13 +19,13 @@ import (
 
 // Info describes the machine.
 type Info struct {
-	OS     string
-	Arch   string
-	Cores  int
-	RAM    int64  // bytes; 0 when it could not be determined
-	GPU    string // human-readable accelerator description
-	Metal  bool   // Apple GPU with unified memory
-	CUDA   bool
+	OS      string
+	Arch    string
+	Cores   int
+	RAM     int64  // bytes; 0 when it could not be determined
+	GPU     string // human-readable accelerator description
+	Metal   bool   // Apple GPU with unified memory
+	CUDA    bool
 	Unified bool // GPU shares system RAM (Apple Silicon)
 }
 

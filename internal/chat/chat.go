@@ -50,8 +50,12 @@ type Template struct {
 	// so there is no marker to match.
 	Stops []string
 
-	render  func(msgs []Message) string
-	toolsOK bool
+	render func(msgs []Message) string
+
+	// toolFmt is the tool-call convention this model was trained on, read from
+	// its own template. Declaring functions in another one makes the model
+	// fight its training rather than answer.
+	toolFmt tools.Format
 }
 
 // Render builds the prompt, ending in the assistant's opening so the model
@@ -63,7 +67,7 @@ type Template struct {
 // through the C API — but the convention they encode can be reproduced, and
 // then the template has nothing unusual left to render.
 func (t *Template) Render(msgs []Message, ts []tools.Tool) string {
-	return t.render(fold(msgs, ts))
+	return t.render(fold(msgs, ts, t.toolFmt))
 }
 
 // fold rewrites a conversation into plain {role, content} turns.
@@ -76,8 +80,8 @@ func (t *Template) Render(msgs []Message, ts []tools.Tool) string {
 //     which is the form the model itself produced them in
 //   - a tool result becomes a user turn wrapped in <tool_response>, because no
 //     instruct model has a "tool" role of its own
-func fold(msgs []Message, ts []tools.Tool) []Message {
-	decl := tools.Declare(ts)
+func fold(msgs []Message, ts []tools.Tool, f tools.Format) []Message {
+	decl := f.Declare(ts)
 	out := make([]Message, 0, len(msgs)+1)
 
 	if decl != "" && (len(msgs) == 0 || msgs[0].Role != "system") {
@@ -91,7 +95,7 @@ func fold(msgs []Message, ts []tools.Tool) []Message {
 			m.Content += decl
 			decl = ""
 		case m.Role == "assistant" && len(m.ToolCalls) > 0:
-			m.Content += tools.RenderCalls(m.ToolCalls)
+			m.Content += f.RenderCalls(m.ToolCalls)
 			m.ToolCalls = nil
 		case m.Role == "tool":
 			m.Role = "user"
@@ -102,11 +106,11 @@ func fold(msgs []Message, ts []tools.Tool) []Message {
 	return out
 }
 
-// SupportsTools reports whether this model was trained on the <tool_call>
-// convention. A model that was not will answer in prose however the functions
-// are declared, so a caller expecting a function call should be told rather
-// than left waiting.
-func (t *Template) SupportsTools() bool { return t.toolsOK }
+// ToolFormat is the tool-call convention this model knows, or tools.None when
+// its template describes none. A model that knows none will answer in prose
+// however the functions are declared, so a caller expecting a call should be
+// told rather than left waiting.
+func (t *Template) ToolFormat() tools.Format { return t.toolFmt }
 
 // TrimStop cuts the output at the first stop marker and reports whether one was
 // found. Generation loops call this every step: stop markers arrive as ordinary
@@ -130,7 +134,7 @@ var chatml = &Template{
 	Stops: []string{"<|im_end|>", "<|endoftext|>"},
 	// The ChatML fallback is reached mainly for Qwen-lineage models, which is
 	// where this convention comes from.
-	toolsOK: true,
+	toolFmt: tools.Hermes,
 	render: func(msgs []Message) string {
 		var b strings.Builder
 		for _, m := range msgs {
@@ -230,7 +234,7 @@ func FromModel(model llama.Model, path string) *Template {
 
 	return &Template{
 		Name:    "gguf",
-		toolsOK: tools.Supported(tmpl),
+		toolFmt: tools.Detect(tmpl),
 		// No stop strings. Generation ends on an end-of-generation token, which
 		// llama_vocab_is_eog reports for whatever terminator this model uses —
 		// a surer signal than matching text, and the only one available when

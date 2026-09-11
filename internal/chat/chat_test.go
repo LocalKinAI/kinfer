@@ -155,7 +155,7 @@ func TestFoldDeclaresToolsInTheSystemTurn(t *testing.T) {
 	got := fold([]Message{
 		{Role: "system", Content: "You are terse."},
 		{Role: "user", Content: "Weather?"},
-	}, ts)
+	}, ts, tools.Hermes)
 	if len(got) != 2 {
 		t.Fatalf("fold produced %d messages, want 2", len(got))
 	}
@@ -168,7 +168,7 @@ func TestFoldDeclaresToolsInTheSystemTurn(t *testing.T) {
 
 	// Without one, a system turn is created — the declaration has nowhere else
 	// to go, and a model that never sees it will never call anything.
-	got = fold([]Message{{Role: "user", Content: "Weather?"}}, ts)
+	got = fold([]Message{{Role: "user", Content: "Weather?"}}, ts, tools.Hermes)
 	if len(got) != 2 || got[0].Role != "system" {
 		t.Fatalf("fold did not add a system turn: %+v", got)
 	}
@@ -184,7 +184,7 @@ func TestFoldRewritesToolResultsAsUserTurns(t *testing.T) {
 		{Role: "user", Content: "Weather?"},
 		{Role: "assistant", ToolCalls: []tools.Call{{Name: "get_weather", Arguments: []byte(`{"city":"Berlin"}`)}}},
 		{Role: "tool", Content: `{"temp": 7}`},
-	}, nil)
+	}, nil, tools.Hermes)
 
 	if got[1].Role != "assistant" || !strings.Contains(got[1].Content, "<tool_call>") {
 		t.Errorf("the assistant's call did not become text: %+v", got[1])
@@ -202,7 +202,7 @@ func TestFoldRewritesToolResultsAsUserTurns(t *testing.T) {
 
 func TestFoldWithoutToolsChangesNothing(t *testing.T) {
 	in := []Message{{Role: "system", Content: "s"}, {Role: "user", Content: "u"}}
-	got := fold(in, nil)
+	got := fold(in, nil, tools.Hermes)
 	if len(got) != 2 || got[0].Content != "s" || got[1].Content != "u" {
 		t.Errorf("fold altered a plain conversation: %+v", got)
 	}

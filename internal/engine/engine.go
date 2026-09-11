@@ -242,10 +242,10 @@ func (e *Engine) Path() string { return e.path }
 // Template reports the chat family in use.
 func (e *Engine) Template() string { return e.tpl.Name }
 
-// SupportsTools reports whether this model was trained on the tool-call
-// convention kinfer speaks. A model that was not will answer in prose no matter
-// how the functions are declared.
-func (e *Engine) SupportsTools() bool { return e.tpl.SupportsTools() }
+// ToolFormat is the tool-call convention this model was trained on, read from
+// its own chat template. tools.None means it knows none, and will answer in
+// prose no matter how the functions are declared.
+func (e *Engine) ToolFormat() tools.Format { return e.tpl.ToolFormat() }
 
 // VocabSize is the model's true vocabulary size.
 func (e *Engine) VocabSize() int { return int(llama.NVocab(e.vocab)) }

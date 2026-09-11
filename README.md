@@ -496,10 +496,28 @@ signatures join the end of the system prompt, an assistant's calls become
 `<tool_response>`, because no instruct model has a `tool` role of its own. The
 template then has nothing unusual left to render.
 
-**That convention is not universal.** Llama 3.1 emits `<|python_tag|>`, Mistral
-emits `[TOOL_CALLS]`, and a model trained on either will answer in prose no
-matter how the functions are declared. kinfer checks the model's own template
-for the `<tool_call>` marker and refuses rather than answering uselessly:
+**There is no single convention**, so kinfer reads which one a model knows out
+of its own chat template and both declares and parses in that one. Two are
+implemented:
+
+| | declaration | a call looks like |
+|---|---|---|
+| **hermes** | "You may call one or more functions…" | `<tool_call>{"name":…,"arguments":{…}}</tool_call>` |
+| **function-xml** | "You have access to the following functions:" | `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>` |
+
+Getting this wrong is not a near miss. Told to answer in JSON when it had been
+taught the XML form, `ornith-1.5:35b` produced `{"name":_get_weather"` —
+deterministically, four runs out of four. It was trying to obey an instruction
+that contradicted its training. Reading the convention from the template instead
+makes the same model answer correctly, with `days: 3` arriving as a number
+rather than the string the XML form carries.
+
+Both conventions wrap their calls in `<tool_call>`, so only the inner form tells
+them apart — checking the outer tag first would misread every XML model as
+Hermes.
+
+A model whose template describes neither is refused rather than answered
+uselessly, since it would reply in prose however the functions are declared:
 
 ```
 $ curl … -d '{"model":"gemma","tools":[…]}'

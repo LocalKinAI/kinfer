@@ -16,6 +16,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/engine"
 	"github.com/LocalKinAI/kinfer/internal/store"
+	"github.com/LocalKinAI/kinfer/internal/tools"
 )
 
 // fakeEngine stands in for a loaded model. Chat blocks until release is closed,
@@ -77,7 +78,12 @@ func (f *fakeEngine) Chat(ctx context.Context, _ []chat.Message, _ engine.GenPar
 	return out.String(), f.err
 }
 
-func (f *fakeEngine) SupportsTools() bool { return f.tools }
+func (f *fakeEngine) ToolFormat() tools.Format {
+	if f.tools {
+		return tools.Hermes
+	}
+	return tools.None
+}
 
 func (f *fakeEngine) Close() {
 	f.mu.Lock()

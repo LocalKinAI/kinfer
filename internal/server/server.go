@@ -86,7 +86,7 @@ type lease struct {
 // generating, which segfaulted the process.
 type generator interface {
 	Chat(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, error)
-	SupportsTools() bool
+	ToolFormat() tools.Format
 	Close()
 }
 
@@ -373,7 +373,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	params := applyOllamaOptions(engine.DefaultGenParams(), req.Options)
 	params.Tools = req.Tools
 
-	if len(req.Tools) > 0 && !eng.SupportsTools() {
+	if len(req.Tools) > 0 && eng.ToolFormat() == tools.None {
 		// Declaring functions to a model that was never trained on this
 		// convention produces prose where the caller is waiting for a call.
 		// Saying so beats answering something useless.
@@ -396,7 +396,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		// block, and a <tool_call> it merely considered there is not one it
 		// made.
 		thinking, answer := chat.SplitThinking(text)
-		content, calls := tools.Parse(answer)
+		content, calls := eng.ToolFormat().Parse(answer)
 		reason := "stop"
 		if len(calls) > 0 {
 			reason = "tool_calls"
@@ -628,7 +628,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 
-	if len(req.Tools) > 0 && !eng.SupportsTools() {
+	if len(req.Tools) > 0 && eng.ToolFormat() == tools.None {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{
 			"message": "this model's chat template does not use the <tool_call> convention, so it cannot answer with tool calls",
 		}})
@@ -644,7 +644,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		thinking, answer := chat.SplitThinking(text)
-		content, calls := tools.Parse(answer)
+		content, calls := eng.ToolFormat().Parse(answer)
 
 		msg := map[string]any{"role": "assistant", "content": content}
 		if wantThinking(req.Think) && thinking != "" {

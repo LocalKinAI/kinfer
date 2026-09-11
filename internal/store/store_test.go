@@ -63,10 +63,10 @@ func TestResolve(t *testing.T) {
 	s := newStore(t, "qwen2.5-0.5b-instruct-q4_k_m.gguf", "llama-3.2-3b.gguf")
 
 	cases := []struct{ in, wantFile string }{
-		{"qwen2.5-0.5b-instruct-q4_k_m", "qwen2.5-0.5b-instruct-q4_k_m.gguf"}, // exact name
+		{"qwen2.5-0.5b-instruct-q4_k_m", "qwen2.5-0.5b-instruct-q4_k_m.gguf"},      // exact name
 		{"qwen2.5-0.5b-instruct-q4_k_m.gguf", "qwen2.5-0.5b-instruct-q4_k_m.gguf"}, // filename
-		{"QWEN2.5-0.5B-INSTRUCT-Q4_K_M", "qwen2.5-0.5b-instruct-q4_k_m.gguf"}, // case-insensitive
-		{"qwen", "qwen2.5-0.5b-instruct-q4_k_m.gguf"},                          // unique prefix
+		{"QWEN2.5-0.5B-INSTRUCT-Q4_K_M", "qwen2.5-0.5b-instruct-q4_k_m.gguf"},      // case-insensitive
+		{"qwen", "qwen2.5-0.5b-instruct-q4_k_m.gguf"},                              // unique prefix
 		{"llama", "llama-3.2-3b.gguf"},
 	}
 	for _, c := range cases {
@@ -145,9 +145,9 @@ func TestRemove_RefusesOutsideStore(t *testing.T) {
 
 func TestHumanSize(t *testing.T) {
 	cases := map[int64]string{
-		512:              "512 B",
-		1024:             "1.0 KB",
-		1024 * 1024:      "1.0 MB",
+		512:                    "512 B",
+		1024:                   "1.0 KB",
+		1024 * 1024:            "1.0 MB",
 		5 * 1024 * 1024 * 1024: "5.0 GB",
 	}
 	for in, want := range cases {
