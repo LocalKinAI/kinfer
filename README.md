@@ -546,7 +546,13 @@ POST /api/chat  {"think": true, …}
 ```
 
 Without `think`, the working out is split off and dropped, so `content` is the
-answer and nothing else. Streaming separates them as they arrive rather than
+answer and nothing else.
+
+A reasoning model can spend an entire token budget thinking and return an empty
+answer, so a reply cut short by the budget reports `done_reason: "length"` —
+`finish_reason` in the OpenAI dialect — rather than `"stop"`. Told a truncated
+reply completed normally, a caller has no way to tell it from a model that had
+nothing to say. Streaming separates them as they arrive rather than
 buffering the reply. The OpenAI dialect uses `reasoning_content`, the field
 DeepSeek introduced and most clients now look for.
 

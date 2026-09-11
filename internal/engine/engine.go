@@ -260,12 +260,22 @@ func (e *Engine) VocabSize() int { return int(llama.NVocab(e.vocab)) }
 // forward pass, so the cost of the tenth caller is far below ten times the cost
 // of the first.
 func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onToken func(string)) (string, error) {
+	text, _, err := e.ChatFull(ctx, msgs, p, onToken)
+	return text, err
+}
+
+// ChatFull is Chat plus whether the reply was cut short by the token budget.
+//
+// The distinction matters most for a reasoning model: it can spend an entire
+// budget thinking and return an empty answer, and a caller told that completed
+// normally has no way to tell that from a model with nothing to say.
+func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p GenParams, onToken func(string)) (string, bool, error) {
 	e.mu.Lock()
 	sched := e.sched
 	e.mu.Unlock()
 
 	if sched == nil {
-		return "", fmt.Errorf("engine for %s is closed", e.path)
+		return "", false, fmt.Errorf("engine for %s is closed", e.path)
 	}
 
 	// Size the buffer to hold the whole reply. The scheduler never blocks on a
@@ -284,7 +294,7 @@ func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onT
 		done:   make(chan struct{}),
 	}
 	if err := sched.submit(j); err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	var out strings.Builder
@@ -295,5 +305,5 @@ func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onT
 		}
 	}
 	<-j.done
-	return out.String(), j.err
+	return out.String(), j.truncated, j.err
 }

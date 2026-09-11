@@ -28,7 +28,8 @@ type fakeEngine struct {
 	frags   []string
 	release chan struct{}
 
-	tools bool
+	tools     bool
+	truncated bool
 
 	mu     sync.Mutex
 	closed bool
@@ -76,6 +77,11 @@ func (f *fakeEngine) Chat(ctx context.Context, _ []chat.Message, _ engine.GenPar
 		out.WriteString(frag)
 	}
 	return out.String(), f.err
+}
+
+func (f *fakeEngine) ChatFull(ctx context.Context, m []chat.Message, p engine.GenParams, onToken func(string)) (string, bool, error) {
+	text, err := f.Chat(ctx, m, p, onToken)
+	return text, f.truncated, err
 }
 
 func (f *fakeEngine) ToolFormat() tools.Format {
@@ -413,5 +419,46 @@ func TestVersionParsesAsAVersion(t *testing.T) {
 		if part == "" || strings.TrimLeft(part, "0123456789") != "" {
 			t.Fatalf("version %q is not numeric-dotted; clients that semver-compare it will silently disable features", out.Version)
 		}
+	}
+}
+
+// TestTruncatedReplyReportsLength guards the third member of a family of bugs
+// this server has had: reporting that something completed normally when it did
+// not. A reasoning model can spend an entire token budget thinking and return
+// an empty answer, and "stop" tells the caller the model had nothing to say.
+func TestTruncatedReplyReportsLength(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	defer srv.Close()
+	srv.open = func(path string, _ engine.Options) (generator, error) {
+		return &fakeEngine{path: path, frags: []string{"cut off here"}, truncated: true}, nil
+	}
+
+	for _, c := range []struct{ path, field string }{
+		{"/api/chat", "done_reason"},
+		{"/v1/chat/completions", "finish_reason"},
+	} {
+		body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(body)))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status %d", c.path, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"length"`) {
+			t.Errorf("%s: a truncated reply did not report %s \"length\":\n%s", c.path, c.field, rec.Body.String())
+		}
+	}
+}
+
+func TestCompleteReplyReportsStop(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	defer srv.Close()
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(body)))
+
+	if !strings.Contains(rec.Body.String(), `"done_reason":"stop"`) {
+		t.Errorf("a complete reply did not report stop:\n%s", rec.Body.String())
 	}
 }

@@ -83,6 +83,13 @@ type job struct {
 	frags chan string
 	err   error
 	done  chan struct{}
+
+	// truncated records that the reply stopped because it ran out of budget
+	// rather than because the model finished. Reporting the two the same way
+	// tells a caller a cut-off answer is complete — and a reasoning model that
+	// spends its whole budget thinking returns nothing at all, which is
+	// baffling unless the reason is given.
+	truncated bool
 }
 
 func (j *job) finish(err error) {
@@ -432,7 +439,12 @@ func (s *scheduler) harvest(sl *slot) {
 		}
 	}
 
-	if hitStop || sl.nGen >= sl.maxGen || int(sl.nPast) >= s.ctxPerSeq {
+	if hitStop {
+		s.finishSlot(sl)
+		return
+	}
+	if sl.nGen >= sl.maxGen || int(sl.nPast) >= s.ctxPerSeq {
+		sl.job.truncated = true
 		s.finishSlot(sl)
 	}
 }

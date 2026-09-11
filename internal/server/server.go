@@ -86,6 +86,7 @@ type lease struct {
 // generating, which segfaulted the process.
 type generator interface {
 	Chat(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, error)
+	ChatFull(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, bool, error)
 	ToolFormat() tools.Format
 	Close()
 }
@@ -387,7 +388,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	// client fragments of syntax. With functions on the table the reply is
 	// buffered and delivered once, parsed.
 	if len(req.Tools) > 0 {
-		text, err := eng.Chat(r.Context(), msgs, params, nil)
+		text, truncated, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -397,7 +398,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		// made.
 		thinking, answer := chat.SplitThinking(text)
 		content, calls := eng.ToolFormat().Parse(answer)
-		reason := "stop"
+		reason := doneReason(truncated)
 		if len(calls) > 0 {
 			reason = "tool_calls"
 		}
@@ -419,7 +420,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	stream := req.Stream == nil || *req.Stream
 
 	if !stream {
-		text, err := eng.Chat(r.Context(), msgs, params, nil)
+		text, truncated, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -434,7 +435,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:  time.Now(),
 			Message:    msg,
 			Done:       true,
-			DoneReason: "stop",
+			DoneReason: doneReason(truncated),
 		})
 		return
 	}
@@ -464,7 +465,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	_, genErr := eng.Chat(r.Context(), msgs, params, func(frag string) {
+	_, truncated, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
 		emit(split.Next(frag))
 	})
 	emit(split.Flush())
@@ -473,7 +474,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:  time.Now(),
 		Message:    ollamaMsg{Role: "assistant"},
 		Done:       true,
-		DoneReason: "stop",
+		DoneReason: doneReason(truncated),
 	}
 	if genErr != nil {
 		// Headers are already out, so the error can only travel as a final
@@ -638,7 +639,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// As in the Ollama dialect: a tool call arrives as JSON across many tokens,
 	// so with functions on the table the reply is buffered and parsed.
 	if len(req.Tools) > 0 {
-		text, err := eng.Chat(r.Context(), msgs, params, nil)
+		text, truncated, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
 			return
@@ -650,7 +651,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		if wantThinking(req.Think) && thinking != "" {
 			msg["reasoning_content"] = thinking
 		}
-		finish := "stop"
+		finish := doneReason(truncated)
 		if len(calls) > 0 {
 			finish = "tool_calls"
 			wire := make([]any, len(calls))
@@ -670,7 +671,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !req.Stream {
-		text, err := eng.Chat(r.Context(), msgs, params, nil)
+		text, truncated, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
 			return
@@ -684,7 +685,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id": id, "object": "chat.completion", "created": created, "model": req.Model,
-			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": "stop"}},
+			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": doneReason(truncated)}},
 		})
 		return
 	}
@@ -720,9 +721,10 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if _, err := eng.Chat(r.Context(), msgs, params, func(frag string) {
+	_, truncated, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
 		emit(split.Next(frag))
-	}); err != nil {
+	})
+	if err := genErr; err != nil {
 		// Reporting finish_reason "stop" here would claim the model finished
 		// normally. Emit an error event first — the shape OpenAI clients
 		// already understand — then close the stream.
@@ -737,7 +739,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	emit(split.Flush())
-	chunk(map[string]any{}, "stop")
+	chunk(map[string]any{}, doneReason(truncated))
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
@@ -783,6 +785,17 @@ func applyOllamaOptions(p engine.GenParams, o *ollamaOptions) engine.GenParams {
 		p.Seed = *o.Seed
 	}
 	return p
+}
+
+// doneReason names why generation ended. "length" is what both dialects use for
+// a reply cut short by the token budget, and it is the only signal a caller has
+// that a reasoning model returned nothing because it spent the whole budget
+// thinking rather than because it had nothing to say.
+func doneReason(truncated bool) string {
+	if truncated {
+		return "length"
+	}
+	return "stop"
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
