@@ -168,6 +168,19 @@ func freeAt(b *budget, newPerSeq, slots, prefix, perSeq int) uint64 {
 // cache includes a per-sequence recurrent state of fixed size — so the context
 // it suggests frees less than the arithmetic implies, and the warning says so
 // rather than quoting a figure.
+//
+// How far out that assumption goes, measured on qwen3.8-flash-next at the same
+// 32768 total tokens:
+//
+//	 2 sequences x 16384   1.7 GiB
+//	32 sequences x  1024   4.3 GiB
+//
+// Identical token counts, two and a half times the memory, entirely from the
+// number of sequences. Scaling a cache cost by tokens alone underestimated the
+// second by 2.6 GiB and left a 73.4 GiB model with no headroom at all — twice,
+// on two different days, by someone who had already written this paragraph. The
+// per-sequence term dominates once the sequence count is large; when sizing
+// -slots, that is the term to think about, not -ctx.
 func suggestCtx(b *budget, slots, prefix, perSeq int) int {
 	seqs := slots + prefix
 	ctxCost := sub(b.afterModel, b.afterCtx)

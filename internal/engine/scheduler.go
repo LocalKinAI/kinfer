@@ -39,6 +39,47 @@ const minPrefixMatch = 128
 // produce less total throughput than eight. See the table in README; slot
 // counts come from {8, 32, 64, 128} and never from 12-16.
 //
+// That paragraph is about a dense model and does not carry over to a
+// mixture-of-experts one. "The weights are read once" is the claim batching
+// rests on, and for MoE it is mostly false: each token in the batch routes to
+// its own experts, so a second token in the same pass fetches its own weights
+// rather than riding along with the first. Measured here, as the cost of
+// doubling the tokens in one decode step — 1.00x would be free, 2.00x would be
+// no saving at all:
+//
+//	tokens      ornith-1.5-35b     qwen3.8-flash-next
+//	            (35B.A3B)          (125B.A6B)
+//	 1 ->  2     1.15x              1.53x
+//	 2 ->  4     1.68x              1.57x
+//	 4 ->  8     1.62x              1.54x
+//	 8 -> 16     1.60x              1.81x
+//
+// So the saving is 20-40%, and it shrinks as the batch grows. Batching is still
+// worth doing — aggregate throughput on ornith climbs 83 -> 166 -> 231 tok/s at
+// 1, 8 and 24 streams — but it climbs because more tokens are in flight, not
+// because they are cheap.
+//
+// The consequence worth writing down is for speculative decoding, which has not
+// been built and on this evidence should not be. It works by putting k drafted
+// tokens into one pass and verifying them together, and it pays only when that
+// fatter pass is nearly free — exactly the property the table says is missing.
+// Feeding the measured step times through the usual expectation, (1-a^(k+1))
+// over (1-a) tokens of progress per step for a per-token acceptance a, with the
+// draft model's own passes charged for:
+//
+//	                        per stream, baseline -> speculative
+//	ornith  N=1  k=3 a=0.9   69.9 -> 102.6 tok/s   +47%
+//	ornith  N=8  k=3 a=0.9   22.4 ->  22.4         +-0%
+//	ornith  N=8  k=3 a=0.75  22.4 ->  17.8         -21%
+//	125B    N=1  k=3 a=0.9   33.7 ->  46.0         +37%
+//	125B    N=8  k=3 a=0.9    9.1 ->   8.8          -3%
+//	125B    N=8  k=3 a=0.75   9.1 ->   7.0         -23%
+//
+// Speculation buys a lot for one stream and nothing for eight, and below about
+// 90% acceptance it costs, because a rejected draft is wasted expert traffic
+// rather than wasted arithmetic. A fleet of agents lives in the bottom rows.
+// One person waiting for one answer lives in the top ones.
+//
 // Exactly one goroutine — run — touches the context. Everything else hands it
 // work over a channel. A llama.cpp context is mutable state with no locking of
 // its own, and two goroutines decoding into it would interleave KV writes.
