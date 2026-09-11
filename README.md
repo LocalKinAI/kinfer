@@ -301,14 +301,44 @@ same model, same rounds:
 | 1 | 207.8 | 273.2 | 266.9 |
 | 4 | **569.2** (2.74×) | 281.4 (1.03×) | 292.5 (1.10×) |
 | 8 | **988.3** (4.76×) | 291.9 (1.07×) | 297.0 (1.11×) |
-| 16 | **1014.0** (4.88×) | 294.6 (1.08×) | 301.4 (1.13×) |
 
 Aggregate tok/s; the multiplier is scaling against that server's own N=1.
+Batching returns **3.4× more total throughput than Ollama at eight concurrent
+requests.** For one person typing at a model that is a bad trade. For a fleet it
+is the whole game, and neither runtime here is taking it.
 
-Batching costs about 24% of single-stream speed and returns **3.4× more total
-throughput than Ollama at eight concurrent requests.** For one person typing at
-a model that is a bad trade. For a fleet it is the whole game, and neither
-runtime on this machine is taking it.
+### How far it scales, and the one batch size to avoid
+
+Measured with `llama-batched-bench`, which puts no HTTP client in the way — a
+350-token prompt and 200 generated, on the M3 Ultra:
+
+| batch | aggregate tok/s | per stream | ms per step | vs 1 |
+|---|---|---|---|---|
+| 1 | 299.8 | 299.8 | 3.3 | 1.00× |
+| 4 | 883.6 | 220.9 | 4.5 | 2.95× |
+| **8** | **1336.9** | 167.1 | 6.0 | **4.46×** |
+| 12 | 1103.8 | 92.0 | **10.9** | 3.68× |
+| 16 | 1441.2 | 90.1 | 11.1 | 4.81× |
+| 24 | 2092.1 | 87.2 | 11.5 | 6.98× |
+| **32** | **2824.7** | 88.3 | 11.3 | **9.42×** |
+| 64 | 4293.1 | 67.1 | 14.9 | 14.32× |
+| 128 | 6483.0 | 50.6 | 19.7 | **21.63×** |
+
+Step time nearly doubles between 8 and 12 — 6.0 ms to 10.9 ms — then stays flat
+all the way to 32. Almost certainly Metal switching from a vector-matrix to a
+matrix-matrix kernel. It splits the curve into three regimes:
+
+- **at or below 8** the step is cheap: 4.5× aggregate, 167 tok/s per stream
+- **12 to 16 is the worst place to be.** The step cost is paid and not yet
+  amortised, so twelve concurrent requests produce *less* total throughput than
+  eight
+- **20 and above** the step time stops growing while the batch keeps growing, so
+  throughput climbs nearly linearly: 9.4× at 32, 21.6× at 128
+
+A slot count therefore comes from `{8, 32, 64, 128}` and never from 12–16 —
+which intuition gets backwards, since 16 looks like it must beat 8. Margins do
+fade past 32 (32→64 is +52%, 64→96 +32%, 96→128 +14%), but at 128 each stream
+still gets 50 tok/s, far above what an agent needs.
 
 That is Phase 2, and it is why per-stream speed is the smaller opportunity.
 
