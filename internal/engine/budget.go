@@ -26,30 +26,29 @@ import (
 // A promise that fails later is the thing kinfer exists to not do. So measure
 // the budget while the model is loading, and refuse before serving.
 
-// thinHeadroom is how much of the accelerator's budget should still be free
-// once the model, its KV cache and the reserved compute graph are in place.
+// thinHeadroom is the point below which kinfer says out loud how little room
+// is left. It is a caution, not a measured limit, and the difference matters.
 //
-// A heuristic from three observations, all on one 96 GB Mac Studio whose Metal
-// budget is 77.8 GiB, serving one 73.4 GiB model:
+// What prompted it: -ctx 16384 -slots 4 left 1.6 GiB free on a 96 GB Mac
+// Studio, and a batch failed to allocate, retiring the model and ending 26
+// requests at once. -ctx 16384 -slots 2, at 2.7 GiB, had been serving for
+// hours. A line at 2 GiB separates those two.
 //
-//	free 1.6 GiB  (-ctx 16384 -slots 4)  died mid-batch, taking the model with it
-//	free 2.7 GiB  (-ctx 16384 -slots 2)  served for hours
-//	free 3.1 GiB  (-ctx  2048 -slots 4)  survived 8 concurrent streams
+// What did not survive checking it: the failure could not be reproduced. The
+// same binary, flags and load at the same 1.6 GiB completed 5 runs out of 5,
+// and 12 out of 12 more while a second process hammered the same GPU with
+// 3000-token prefills specifically to contend for it. A sweep of per-slot
+// prefill chunks from 512 down to 64 at that headroom found no size that
+// failed. So batch size is not demonstrably the trigger, and 1.6 GiB is not
+// demonstrably too little.
 //
-// So the line sits at 2 GiB, between the one that died and the ones that did
-// not. Absolute rather than a fraction of the budget: what fails is a transient
-// allocation for one batch, and Metal sizes that command buffer by the batch,
-// not by the machine. Three points on one machine is a rule of thumb, not a
-// law — which is the other reason this only warns.
-//
-// The reading is also taken at the wrong moment to be complete. It happens once
-// the context exists, and the allocation most likely to exhaust what is left is
-// the prefill batch, which has not been built yet. A sibling session
-// demonstrated the point cleanly by running two 0.5B models — 1.6 GiB of
-// weights between them — into the same OOM with 3000-token prompts. kinfer
-// chunks prefill at 512 tokens per slot so its batch is bounded, but bounded is
-// not accounted for, and the ceiling rises with -slots. A configuration that
-// clears this check can still be too tight for its own prompts.
+// What is left is the timing: every observed failure happened while another
+// process was doing large prefills, and none happened afterwards. Free memory
+// counts the whole machine, so a margin this thin is at the mercy of whatever
+// else runs — which is worth saying, and is not the same as a threshold that
+// predicts failure. Hence a notice rather than a refusal, and no guard in the
+// scheduler: a mitigation aimed at an unreproduced mechanism is a guess with
+// a runtime cost.
 const thinHeadroom = 2 << 30 // 2 GiB
 
 // budget tracks the accelerator's free memory across the stages of a load.
@@ -110,15 +109,14 @@ func (b *budget) report(slots, prefix, perSeq int) {
 		return
 	}
 
-	log.Printf("memory: WARNING — only %s of %s is left, under the %s this needs.\n"+
-		"          A batch that cannot allocate fails the whole model, not one request:\n"+
-		"          llama.cpp reports it fatally, kinfer retires the model, and every\n"+
-		"          in-flight and queued request ends at once.\n"+
-		"          Try -ctx %d -slots %d, or keep -ctx %d and drop to -slots %d.\n"+
-		"          The cache will shrink by less than the ratio suggests: part of it is\n"+
-		"          per-sequence state that does not scale with the context length.\n"+
-		"          Free memory also counts other processes, so this margin moves.",
-		gib(free), gib(total), gib(thinHeadroom),
+	log.Printf("memory: only %s of %s is left after loading.\n"+
+		"          Free memory here counts every process on the machine, and a batch\n"+
+		"          that cannot allocate is not recoverable in place: the Metal backend\n"+
+		"          latches the error, llama.cpp reports it fatally, and kinfer retires\n"+
+		"          the model — ending every in-flight and queued request at once.\n"+
+		"          Configurations this tight have run for hours and have also died.\n"+
+		"          -ctx %d -slots %d, or -ctx %d -slots %d, would leave more.",
+		gib(free), gib(total),
 		suggestCtx(b, slots, prefix, perSeq), slots,
 		perSeq, max(1, slots/2))
 }

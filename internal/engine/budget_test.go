@@ -57,8 +57,10 @@ func TestSuggestedContextClearsTheWarning(t *testing.T) {
 	}
 }
 
-// The warning must fire for the configuration that died and stay quiet for the
-// one that worked — that is the whole claim this file makes.
+// The notice must fire for the configuration that died and stay quiet for the
+// one that served for hours. That is a smaller claim than it looks: the failure
+// did not reproduce afterwards, so this pins the line where it was drawn rather
+// than asserting the line predicts anything.
 func TestThinHeadroomSeparatesTheMeasuredCases(t *testing.T) {
 	thin := func(b *budget) bool { return b.afterCtx < thinHeadroom }
 	worked := budgetFor(budgetTotal, modelCost, ctxCost2Slot) // 2.7 GiB free
