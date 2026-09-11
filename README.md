@@ -440,6 +440,36 @@ prompt, which a position error would destroy. What is lost is the guarantee that
 a fixed seed reproduces a previous run exactly, so `-prefix -1` turns the pool
 off for callers who need it.
 
+## Chat templates come from the model
+
+An instruct model answers properly only when the prompt is wrapped the way it
+was fine-tuned to see. kinfer used to guess that from the filename and knew
+three families, so anything else silently got ChatML — a format it had never
+seen. The template it was actually trained on is right there in the GGUF's
+metadata, so kinfer reads it.
+
+`llama_chat_apply_template` does not run Jinja. It matches the stored template
+string against the families llama.cpp implements in C++ and applies that one, so
+binding it buys **54 families** without shipping a template engine.
+
+The difference, on Gemma 3 — which has no system role at all:
+
+```
+from the GGUF   <start_of_turn>user\nYou are terse.\n\nHi.<end_of_turn>\n<start_of_turn>model\n
+guessed         <|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\n…
+```
+
+The guess does not merely look wrong, it shows: asked the same question through
+each, the model's own template stops cleanly while the guessed one leaks
+`<|im_end` into the reply, because ChatML's marker is not what this model was
+taught to stop at.
+
+Generation stops on an end-of-generation token — `llama_vocab_is_eog` reports
+whichever terminator the model uses — so a template read from metadata needs no
+stop strings of its own. The three hand-written families remain as a fallback
+for a file that carries no template, or one llama.cpp does not implement, and
+`-template` still forces one.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary

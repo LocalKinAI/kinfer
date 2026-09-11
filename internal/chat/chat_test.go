@@ -118,3 +118,31 @@ func TestGet_Unknown(t *testing.T) {
 		t.Error("Get on unknown template should error")
 	}
 }
+
+// FromModel needs a loaded model, so what is unit-testable is the fallback:
+// a file whose metadata carries no template must still get a sensible guess
+// rather than a nil template and a panic on the first request. The path that
+// matters — a real GGUF template rendering the format the model was trained
+// on — is exercised end to end, and the difference is stark: Gemma 3 rendered
+// through its own template stops cleanly, while the same model rendered as
+// ChatML leaks "<|im_end" into the reply, because ChatML's marker is not what
+// this model was taught to stop at.
+func TestFromModelFallsBackWithoutAModel(t *testing.T) {
+	cases := []struct{ path, want string }{
+		{"/models/llama-3-8b-instruct.gguf", "llama3"},
+		{"/models/mistral-7b-instruct.gguf", "mistral"},
+		{"/models/qwen2.5-0.5b-instruct.gguf", "chatml"},
+	}
+	for _, c := range cases {
+		got := FromModel(0, c.path)
+		if got == nil {
+			t.Fatalf("FromModel(0, %q) returned nil", c.path)
+		}
+		if got.Name != c.want {
+			t.Errorf("FromModel(0, %q) = %q, want the filename guess %q", c.path, got.Name, c.want)
+		}
+		if got.Render(nil) == "" && len(got.Stops) == 0 {
+			t.Errorf("%q fell back to something unusable", c.path)
+		}
+	}
+}

@@ -191,7 +191,17 @@ var (
 	samplerSample       func(s Sampler, c Context, idx int32) Token
 	samplerReset        func(s Sampler)
 	samplerFree         func(s Sampler)
+
+	modelChatTemplate    func(m Model, name *byte) *byte
+	chatApplyTemplate    func(tmpl *byte, msgs *chatMessage, n uint64, addAss bool, buf *byte, length int32) int32
+	chatBuiltinTemplates func(out **byte, n uint64) int32
 )
+
+// chatMessage mirrors struct llama_chat_message: two C strings.
+type chatMessage struct {
+	role    uintptr
+	content uintptr
+}
 
 // Bind makes llama.cpp usable: it loads libllama from dir, resolves every entry
 // point, and initialises the backend. Safe to call repeatedly; the work happens
@@ -278,6 +288,9 @@ func bind(dir string) error {
 		{&samplerSample, "llama_sampler_sample"},
 		{&samplerReset, "llama_sampler_reset"},
 		{&samplerFree, "llama_sampler_free"},
+		{&modelChatTemplate, "llama_model_chat_template"},
+		{&chatApplyTemplate, "llama_chat_apply_template"},
+		{&chatBuiltinTemplates, "llama_chat_builtin_templates"},
 	} {
 		// RegisterLibFunc panics on a missing symbol, which would abort the
 		// program on an unexpected llama.cpp build. Convert it to an error so
@@ -627,6 +640,111 @@ func SamplerFree(s Sampler) { samplerFree(s) }
 // unpacked directory has to carry the names its DT_NEEDED entries actually ask
 // for. The unversioned libllama.dylib in the release tarball is a symlink, and
 // //go:embed cannot carry symlinks — every file here is a real copy.
+// ─── chat templates ──────────────────────────────────────────────────────────
+
+// ChatTemplate returns the chat template stored in the model's GGUF metadata,
+// or "" when the file carries none.
+//
+// It is a Jinja string, but it is not rendered as one — see ApplyChatTemplate.
+func ChatTemplate(m Model) string {
+	p := modelChatTemplate(m, nil)
+	if p == nil {
+		return ""
+	}
+	return goString(p)
+}
+
+// ApplyChatTemplate renders a conversation the way the model was fine-tuned to
+// see it. roles and contents must be the same length.
+//
+// llama.cpp does NOT run Jinja here. It matches the template string against a
+// list of families it implements in C++ and applies that. The consequence is
+// worth knowing in both directions: kinfer gets every family llama.cpp knows
+// without shipping a template engine, and a model whose template matches none
+// of them fails rather than rendering something subtly wrong.
+//
+// addAssistant appends the tokens that open an assistant turn, which is what
+// makes the model answer rather than continue the conversation.
+func ApplyChatTemplate(tmpl string, roles, contents []string, addAssistant bool) (string, error) {
+	if len(roles) != len(contents) {
+		return "", fmt.Errorf("chat template: %d roles but %d contents", len(roles), len(contents))
+	}
+	if len(roles) == 0 {
+		return "", nil
+	}
+
+	// C wants null-terminated strings and reads them during the call, so the
+	// backing arrays have to stay alive until it returns.
+	cstrs := make([][]byte, 0, len(roles)*2)
+	cstr := func(s string) uintptr {
+		b := append([]byte(s), 0)
+		cstrs = append(cstrs, b)
+		return uintptr(unsafe.Pointer(&b[0]))
+	}
+
+	msgs := make([]chatMessage, len(roles))
+	total := 0
+	for i := range roles {
+		msgs[i] = chatMessage{role: cstr(roles[i]), content: cstr(contents[i])}
+		total += len(roles[i]) + len(contents[i])
+	}
+	tmplC := append([]byte(tmpl), 0)
+
+	// llama.h recommends twice the characters of all messages; the call reports
+	// the size it needs when that is not enough, so one retry always suffices.
+	buf := make([]byte, 2*total+1024)
+	n := chatApplyTemplate(&tmplC[0], &msgs[0], uint64(len(msgs)), addAssistant, &buf[0], int32(len(buf)))
+	if int(n) > len(buf) {
+		buf = make([]byte, n)
+		n = chatApplyTemplate(&tmplC[0], &msgs[0], uint64(len(msgs)), addAssistant, &buf[0], int32(len(buf)))
+	}
+	runtime.KeepAlive(cstrs)
+	runtime.KeepAlive(tmplC)
+	runtime.KeepAlive(msgs)
+
+	if n < 0 {
+		return "", fmt.Errorf("llama.cpp does not implement this model's chat template")
+	}
+	return string(buf[:n]), nil
+}
+
+// BuiltinTemplates lists the chat families llama.cpp implements.
+func BuiltinTemplates() []string {
+	n := chatBuiltinTemplates(nil, 0)
+	if n <= 0 {
+		return nil
+	}
+	// []*byte rather than []uintptr: the strings are static C data, and letting
+	// Go hold them as pointers keeps this free of a uintptr conversion that vet
+	// rightly distrusts.
+	ptrs := make([]*byte, n)
+	if got := chatBuiltinTemplates(&ptrs[0], uint64(n)); got < 0 {
+		return nil
+	}
+	out := make([]string, 0, n)
+	for _, p := range ptrs {
+		if p != nil {
+			out = append(out, goString(p))
+		}
+	}
+	return out
+}
+
+// goString copies a null-terminated C string.
+func goString(p *byte) string {
+	if p == nil {
+		return ""
+	}
+	var n int
+	for ptr := unsafe.Pointer(p); *(*byte)(ptr) != 0; ptr = unsafe.Add(ptr, 1) {
+		n++
+		if n > 1<<20 {
+			break // not a sane C string; refuse to walk off the end
+		}
+	}
+	return string(unsafe.Slice(p, n))
+}
+
 func libName() string {
 	switch runtime.GOOS {
 	case "darwin":

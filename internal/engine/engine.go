@@ -168,7 +168,7 @@ func Open(path string, opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("create context for %s", path)
 	}
 
-	tpl := chat.Detect(path)
+	tpl := chat.FromModel(model, path)
 	if opts.Template != "" {
 		t, err := chat.Get(opts.Template)
 		if err != nil {

@@ -35,6 +35,7 @@ func main() {
 		system    = flag.String("system", "", "system prompt — a LocalKin soul goes here")
 		raw       = flag.Bool("raw", false, "skip the chat template and continue the text directly")
 		temp      = flag.Float64("temp", 0.7, "sampling temperature (0 = greedy)")
+		forceTpl  = flag.String("template", "", "force a built-in chat family instead of the model's own (chatml, llama3, mistral)")
 		topP      = flag.Float64("top-p", 0.95, "nucleus sampling threshold")
 		topK      = flag.Int("top-k", 40, "keep only the K most likely tokens")
 		repeatPen = flag.Float64("repeat-penalty", 1.1, "penalty on recently used tokens")
@@ -102,7 +103,14 @@ func main() {
 	// ---- build the prompt ----
 	// Without the template this is text continuation, not conversation: the
 	// system prompt would be ignored and the soul would never take effect.
-	tpl := chat.Detect(*modelPath)
+	tpl := chat.FromModel(model, *modelPath)
+	if *forceTpl != "" {
+		t, err := chat.Get(*forceTpl)
+		if err != nil {
+			fatal("%v", err)
+		}
+		tpl = t
+	}
 	promptText := *prompt
 	if !*raw {
 		var msgs []chat.Message
@@ -112,6 +120,14 @@ func main() {
 		msgs = append(msgs, chat.Message{Role: "user", Content: *prompt})
 		promptText = tpl.Render(msgs)
 		fmt.Printf("  ✅ chat template          %s\n", tpl.Name)
+		// Apple Silicon steers low-QoS threads onto efficiency cores, where
+		// llama_decode's CPU half takes roughly twice as long (measured: 2035
+		// µs/token clamped to background against 719 at the default). Worth
+		// printing, because it is invisible otherwise and explains an otherwise
+		// baffling halving of throughput.
+		initQoS()
+		fmt.Printf("  thread QoS     : %s\n", qosReport())
+
 	}
 
 	// ---- tokenize ----
@@ -134,14 +150,6 @@ func main() {
 	defer sampler.Close()
 
 	fmt.Printf("── output ────────────────────────────────────\n  ")
-
-	// Apple Silicon steers low-QoS threads onto efficiency cores, where
-	// llama_decode's CPU half takes roughly twice as long (measured: 2035
-	// µs/token clamped to background against 719 at the default). Worth
-	// printing, because it is invisible otherwise and explains an otherwise
-	// baffling halving of throughput.
-	initQoS()
-	fmt.Printf("  thread QoS     : %s\n", qosReport())
 
 	cur := tokens
 	tGen := time.Now()
