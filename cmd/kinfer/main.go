@@ -365,8 +365,8 @@ func cmdServe(args []string) error {
 	slots := fs.Int("slots", engine.DefaultSlots, "conversations served at once (use 8, 32, 64 or 128 — never 12-16)")
 	prefix := fs.Int("prefix", engine.DefaultPrefixSlots, "prompt prefixes kept resident so repeat requests skip prefilling them (-1 disables)")
 	queue := fs.Int("queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
-	maxGen := fs.Duration("max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (negative disables)")
-	maxWait := fs.Duration("max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (negative disables)")
+	maxGen := fs.Duration("max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
+	maxWait := fs.Duration("max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
 	keepAlive := fs.Duration("keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -378,7 +378,7 @@ func cmdServe(args []string) error {
 	}
 	srv := server.New(st, engine.Options{
 		GPULayers: *ngl, ContextSize: *nCtx, Slots: *slots, PrefixSlots: *prefix,
-		MaxQueue: *queue, MaxGenerate: *maxGen, MaxWait: *maxWait,
+		MaxQueue: *queue, MaxGenerate: noLimit(*maxGen), MaxWait: noLimit(*maxWait),
 	})
 	srv.SetKeepAlive(*keepAlive)
 	defer srv.Close()
@@ -484,4 +484,24 @@ func humanTime(t time.Time) string {
 	default:
 		return fmt.Sprintf("%d days ago", int(d.Hours()/24))
 	}
+}
+
+// noLimit translates the command line's way of removing a limit into the
+// package's.
+//
+// They differ because they answer different questions. engine.Options is a Go
+// struct whose zero value has to mean "I did not set this", so a limit is
+// removed there with a negative. A flag always has a value — its default is
+// already the default — so on the command line 0 can mean what an operator
+// expects it to mean, and "-max-gen 0" is how you say no limit.
+//
+// Writing "-max-gen -1" would not have worked in any case: Go parses a duration
+// and "-1" has no unit, so the flag package prints an error and exits. Which it
+// did, into a log nobody was reading, and cost an afternoon's confusion over a
+// server that would not start.
+func noLimit(d time.Duration) time.Duration {
+	if d == 0 {
+		return -1
+	}
+	return d
 }
