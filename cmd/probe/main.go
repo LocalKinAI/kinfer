@@ -18,14 +18,11 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-	"unsafe"
-
-	gollama "github.com/dianlight/gollama.cpp"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/llama"
-	"github.com/LocalKinAI/kinfer/internal/sampling"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
+	"github.com/LocalKinAI/kinfer/internal/sampling"
 )
 
 func main() {
@@ -38,6 +35,7 @@ func main() {
 		system    = flag.String("system", "", "system prompt — a LocalKin soul goes here")
 		raw       = flag.Bool("raw", false, "skip the chat template and continue the text directly")
 		temp      = flag.Float64("temp", 0.7, "sampling temperature (0 = greedy)")
+		forceTpl  = flag.String("template", "", "force a built-in chat family instead of the model's own (chatml, llama3, mistral)")
 		topP      = flag.Float64("top-p", 0.95, "nucleus sampling threshold")
 		topK      = flag.Int("top-k", 40, "keep only the K most likely tokens")
 		repeatPen = flag.Float64("repeat-penalty", 1.1, "penalty on recently used tokens")
@@ -50,7 +48,7 @@ func main() {
 	}
 
 	fmt.Printf("── kinfer probe ──────────────────────────────\n")
-	fmt.Printf("  binding : gollama.cpp (purego, no CGO)\n")
+	fmt.Printf("  binding : internal/llama (purego, no CGO)\n")
 	fmt.Printf("  model   : %s\n", *modelPath)
 	fmt.Printf("  ngl     : %d %s\n", *nGpuLayer, backendLabel(*nGpuLayer))
 	fmt.Println()
@@ -66,49 +64,53 @@ func main() {
 	fmt.Printf("  ✅ libs unpacked          %6.2fs  %s\n", time.Since(tLib).Seconds(), libDir)
 
 	tInit := time.Now()
-	if err := nativelib.Load(); err != nil {
-		fatal("could not initialise the embedded llama.cpp: %v", err)
-	}
-	defer gollama.Backend_free()
-	fmt.Printf("  ✅ native lib loaded      %6.2fs\n", time.Since(tInit).Seconds())
-
-	// Bind the entry points gollama gets wrong or omits — real vocabulary size,
-	// real detokenizer, real end-of-generation test.
 	if err := llama.Bind(libDir); err != nil {
 		fatal("could not bind llama.cpp symbols: %v", err)
 	}
+	defer llama.BackendFree()
+	fmt.Printf("  ✅ native lib loaded      %6.2fs\n", time.Since(tInit).Seconds())
 
 	// ---- load model ----
-	mp := gollama.Model_default_params()
+	mp := llama.DefaultModelParams()
 	mp.NGpuLayers = int32(*nGpuLayer)
 
 	tLoad := time.Now()
-	model, err := gollama.Model_load_from_file(*modelPath, mp)
-	if err != nil {
-		fatal("Model_load_from_file failed: %v", err)
+	model := llama.LoadModel(*modelPath, mp)
+	if model == 0 {
+		fatal("llama_model_load_from_file failed for %s", *modelPath)
 	}
-	defer gollama.Model_free(model)
+	defer llama.FreeModel(model)
 	loadSec := time.Since(tLoad).Seconds()
 	fmt.Printf("  ✅ model loaded           %6.2fs\n", loadSec)
 
-	vocab := llama.Vocab(uintptr(model))
+	vocab := llama.GetVocab(model)
 	nVocab := llama.NVocab(vocab)
-	fmt.Printf("  ✅ vocabulary            %6d tokens  (gollama reports 32)\n", nVocab)
+	fmt.Printf("  ✅ vocabulary            %6d tokens\n", nVocab)
 
 	// ---- context ----
-	cp := gollama.Context_default_params()
+	cp := llama.DefaultContextParams()
 	cp.NCtx = uint32(*nCtx)
 
-	lctx, err := gollama.Init_from_model(model, cp)
-	if err != nil {
-		fatal("Init_from_model failed: %v", err)
+	lctx := llama.NewContext(model, cp)
+	if lctx == 0 {
+		fatal("llama_init_from_model failed")
 	}
-	defer gollama.Free(lctx)
+	if got := llama.NCtx(lctx); got != *nCtx {
+		fatal("asked for n_ctx=%d but llama.cpp allocated %d", *nCtx, got)
+	}
+	defer llama.FreeContext(lctx)
 
 	// ---- build the prompt ----
 	// Without the template this is text continuation, not conversation: the
 	// system prompt would be ignored and the soul would never take effect.
-	tpl := chat.Detect(*modelPath)
+	tpl := chat.FromModel(model, *modelPath)
+	if *forceTpl != "" {
+		t, err := chat.Get(*forceTpl)
+		if err != nil {
+			fatal("%v", err)
+		}
+		tpl = t
+	}
 	promptText := *prompt
 	if !*raw {
 		var msgs []chat.Message
@@ -116,12 +118,20 @@ func main() {
 			msgs = append(msgs, chat.Message{Role: "system", Content: *system})
 		}
 		msgs = append(msgs, chat.Message{Role: "user", Content: *prompt})
-		promptText = tpl.Render(msgs)
+		promptText = tpl.Render(msgs, nil)
 		fmt.Printf("  ✅ chat template          %s\n", tpl.Name)
+		// Apple Silicon steers low-QoS threads onto efficiency cores, where
+		// llama_decode's CPU half takes roughly twice as long (measured: 2035
+		// µs/token clamped to background against 719 at the default). Worth
+		// printing, because it is invisible otherwise and explains an otherwise
+		// baffling halving of throughput.
+		initQoS()
+		fmt.Printf("  thread QoS     : %s\n", qosReport())
+
 	}
 
 	// ---- tokenize ----
-	tokens, err := gollama.Tokenize(model, promptText, true, true)
+	tokens, err := llama.Tokenize(vocab, promptText, true, true)
 	if err != nil {
 		fatal("Tokenize failed: %v", err)
 	}
@@ -137,7 +147,7 @@ func main() {
 		RepeatLastN:   64,
 		Seed:          *seed,
 	})
-	cands := make([]sampling.Candidate, nVocab)
+	defer sampler.Close()
 
 	fmt.Printf("── output ────────────────────────────────────\n  ")
 
@@ -146,44 +156,56 @@ func main() {
 	var firstTokenAt time.Duration
 	generated := 0
 
+	// Time decode+sample apart from the wall clock.
+	//
+	// Ollama reports eval_count/eval_duration, which is llama.cpp's own timer
+	// around the forward pass. Comparing that against kinfer's wall clock would
+	// flatter Ollama by whatever detokenisation and string handling cost here,
+	// so measure both and say which is which.
+	var decodeTime, syncTime, sampleTime, pieceTime time.Duration
+
 	// Streaming detokenization.
 	//
-	// gollama's Token_to_piece returns the RAW byte-level-BPE vocab entry
-	// ("ĠMerkle"), so every piece has to go through bpe.Decode. But decoding
-	// pieces one at a time breaks multi-byte characters: a single CJK rune is
-	// commonly split across 2-3 tokens, and each fragment on its own is invalid
-	// UTF-8. So accumulate the raw pieces, decode the whole prefix each step,
-	// and only emit the part that has become valid.
+	// llama_token_to_piece already returns decoded text, but emitting each
+	// piece as it arrives still breaks multi-byte characters: a single CJK rune
+	// is commonly split across 2-3 tokens, and each fragment on its own is
+	// invalid UTF-8. So accumulate the pieces and emit only the prefix that has
+	// become valid.
 	var pieces []string
 	emitted := 0
 	stopped := false
 
 	for i := 0; i < *maxTokens; i++ {
-		batch := gollama.Batch_get_one(cur)
-		if err := gollama.Decode(lctx, batch); err != nil {
+		tStep := time.Now()
+		if err := llama.DecodeTokens(lctx, cur); err != nil {
 			fmt.Println()
 			fatal("Decode failed at token %d: %v", i, err)
 		}
+		tAfterDecode := time.Now()
+		decodeTime += tAfterDecode.Sub(tStep)
 
-		// Read the full logits row — nVocab entries, indexed by token id.
-		logits := gollama.Get_logits_ith(lctx, -1)
-		if logits == nil {
-			fmt.Println()
-			fatal("no logits at token %d", i)
+		// Touch the logits before sampling. On Metal llama_decode may only
+		// enqueue the forward pass, in which case the wait for the GPU happens
+		// at the first read — and would otherwise be charged to the sampler.
+		if row := llama.Logits(lctx, -1, nVocab); row != nil {
+			_ = row[0]
 		}
-		row := unsafe.Slice(logits, nVocab)
-		for j := range row {
-			cands[j] = sampling.Candidate{ID: int32(j), Logit: row[j]}
-		}
+		tAfterSync := time.Now()
+		syncTime += tAfterSync.Sub(tAfterDecode)
 
-		tok := sampler.Sample(cands)
+		// Sampling runs inside llama.cpp over its own logit buffer — no copy
+		// of the 151,936-entry row crosses into Go.
+		tok := sampler.Sample(lctx, -1)
+		sampleTime += time.Since(tAfterSync)
 		if llama.IsEOG(vocab, tok) {
 			stopped = true
 			break
 		}
 
 		// The real detokenizer — no byte-level post-processing needed.
+		tPiece := time.Now()
 		piece := llama.TokenToPiece(vocab, tok, false)
+		pieceTime += time.Since(tPiece)
 		if generated == 0 {
 			firstTokenAt = time.Since(tGen)
 		}
@@ -209,7 +231,7 @@ func main() {
 			stopped = true
 			break
 		}
-		cur = []gollama.LlamaToken{gollama.LlamaToken(tok)}
+		cur = []llama.Token{tok}
 	}
 
 	genSec := time.Since(tGen).Seconds()
@@ -217,7 +239,16 @@ func main() {
 	fmt.Printf("  generated      : %d tokens%s\n", generated,
 		map[bool]string{true: " (hit stop marker)", false: " (hit -n limit)"}[stopped])
 	fmt.Printf("  time to first  : %.2fs\n", firstTokenAt.Seconds())
-	fmt.Printf("  throughput     : %.1f tok/s\n", float64(generated)/genSec)
+	fmt.Printf("  throughput     : %.1f tok/s  (wall clock, everything included)\n", float64(generated)/genSec)
+	if decodeTime > 0 {
+		n := float64(generated)
+		fmt.Printf("  decode+sample  : %.1f tok/s  (comparable to Ollama's eval_duration)\n",
+			n/(decodeTime+syncTime+sampleTime).Seconds())
+		fmt.Printf("  llama_decode   : %5.0f µs/token\n", float64(decodeTime.Microseconds())/n)
+		fmt.Printf("  first logit read:%5.0f µs/token  (GPU wait, if decode is async)\n", float64(syncTime.Microseconds())/n)
+		fmt.Printf("  sampler        : %5.0f µs/token  (after the GPU is known to be done)\n", float64(sampleTime.Microseconds())/n)
+		fmt.Printf("  token_to_piece : %.0f µs/token\n", float64(pieceTime.Microseconds())/n)
+	}
 	fmt.Printf("  model load     : %.2fs\n", loadSec)
 	if generated > 0 {
 		fmt.Printf("\n  ✅ PHASE 0 PASS — pure-Go inference works end to end.\n")

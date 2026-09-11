@@ -1,28 +1,24 @@
 // Package sampling picks the next token from a model's logits.
 //
-// It exists because gollama.cpp binds exactly one sampler — greedy — and greedy
-// decoding degenerates. Observed on Qwen2.5-0.5B: "财是人的命根，是人的命脉，
-// 是人的命关。" repeated until the token budget ran out. Always taking the
-// highest-probability token means that once the model enters a loop, nothing can
-// break it out. A usable runtime needs temperature, nucleus sampling, and a
-// repetition penalty, so kinfer implements them over the raw logits.
+// It used to implement the whole pipeline in Go, because gollama.cpp bound only
+// a greedy sampler and greedy decoding degenerates — observed on Qwen2.5-0.5B:
+// "财是人的命根，是人的命脉，是人的命关。" repeated until the token budget ran
+// out. That worked, but cost most of the throughput: picking the best 40 of
+// 151,936 candidates meant sorting all of them, once per token, and copying
+// every logit into Go first. Measured 44.7 tok/s against 134 for greedy on the
+// same model.
 //
-// The pipeline order matches llama.cpp's default:
+// Now that llama.cpp is bound directly (internal/llama), this is a thin builder
+// over llama_sampler_chain_*. llama.cpp does a partial selection rather than a
+// full sort, in C, over its own logit buffer — nothing crosses into Go until a
+// token has been chosen.
 //
-//	repetition penalty → temperature → top-k → top-p → softmax → draw
+// The chain order is llama.cpp's own:
+//
+//	repetition penalty → top-k → top-p → temperature → draw
 package sampling
 
-import (
-	"math"
-	"math/rand"
-	"sort"
-)
-
-// Candidate is one token under consideration.
-type Candidate struct {
-	ID    int32
-	Logit float32
-}
+import "github.com/LocalKinAI/kinfer/internal/llama"
 
 // Params configures a Sampler. The zero value is not useful; start from
 // DefaultParams.
@@ -63,170 +59,81 @@ func DefaultParams() Params {
 }
 
 // Sampler draws tokens and remembers what it has drawn, so the repetition
-// penalty has history to work with. It is not safe for concurrent use; give
-// each generation its own.
-type Sampler struct {
-	params Params
-	rng    *rand.Rand
-	recent []int32
-}
-
-// New creates a Sampler.
-func New(p Params) *Sampler {
-	seed := p.Seed
-	if seed == 0 {
-		seed = rand.Int63()
-	}
-	return &Sampler{
-		params: p,
-		rng:    rand.New(rand.NewSource(seed)),
-		recent: make([]int32, 0, max(p.RepeatLastN, 1)),
-	}
-}
-
-// Sample returns the chosen token id. It mutates cands in place (sorting and
-// rescaling), so pass a slice the caller does not need afterwards.
-func (s *Sampler) Sample(cands []Candidate) int32 {
-	if len(cands) == 0 {
-		return -1
-	}
-
-	s.applyRepeatPenalty(cands)
-
-	// Temperature 0 means greedy — no distribution to draw from.
-	if s.params.Temperature <= 0 {
-		best := 0
-		for i := 1; i < len(cands); i++ {
-			if cands[i].Logit > cands[best].Logit {
-				best = i
-			}
-		}
-		return s.remember(cands[best].ID)
-	}
-
-	for i := range cands {
-		cands[i].Logit /= s.params.Temperature
-	}
-
-	// Sort once, descending. Both top-k and top-p need ordered candidates, and
-	// softmax below relies on cands[0] being the maximum for numeric stability.
-	sort.Slice(cands, func(i, j int) bool { return cands[i].Logit > cands[j].Logit })
-
-	if k := s.params.TopK; k > 0 && k < len(cands) {
-		cands = cands[:k]
-	}
-
-	probs := softmax(cands)
-
-	if p := s.params.TopP; p > 0 && p < 1 {
-		cands, probs = nucleus(cands, probs, p)
-	}
-
-	return s.remember(cands[s.draw(probs)].ID)
-}
-
-// applyRepeatPenalty pushes down the logits of tokens seen recently.
+// penalty has history to work with.
 //
-// Positive and negative logits are handled differently on purpose: dividing a
-// negative logit would make it LARGER (less negative), rewarding repetition
-// instead of punishing it. This asymmetry is what llama.cpp does.
-func (s *Sampler) applyRepeatPenalty(cands []Candidate) {
-	penalty := s.params.RepeatPenalty
-	if penalty == 1 || penalty <= 0 || len(s.recent) == 0 {
-		return
+// Not safe for concurrent use; give each generation its own. Close it when the
+// generation ends — the chain is C memory, which the Go collector will not
+// reclaim.
+type Sampler struct {
+	chain llama.Sampler
+}
+
+// New builds a sampler chain for p.
+func New(p Params) *Sampler {
+	chain := llama.NewSamplerChain()
+
+	// Penalties first, so later stages see the adjusted logits.
+	if p.RepeatPenalty != 1 && p.RepeatPenalty > 0 && p.RepeatLastN != 0 {
+		llama.SamplerChainAdd(chain, llama.SamplerPenalties(
+			int32(p.RepeatLastN), p.RepeatPenalty,
+			0, // frequency penalty: off, as it is in Ollama's defaults
+			0, // presence penalty: likewise
+		))
 	}
 
-	seen := make(map[int32]struct{}, len(s.recent))
-	for _, id := range s.recent {
-		seen[id] = struct{}{}
+	// Temperature 0 means greedy, and a greedy chain wants no narrowing stages
+	// in front of it: taking the most likely token is the same decision whether
+	// or not the field was trimmed first.
+	if p.Temperature <= 0 {
+		llama.SamplerChainAdd(chain, llama.SamplerGreedy())
+		return &Sampler{chain: chain}
 	}
 
-	for i := range cands {
-		if _, ok := seen[cands[i].ID]; !ok {
-			continue
-		}
-		if cands[i].Logit > 0 {
-			cands[i].Logit /= penalty
-		} else {
-			cands[i].Logit *= penalty
-		}
+	if p.TopK > 0 {
+		llama.SamplerChainAdd(chain, llama.SamplerTopK(int32(p.TopK)))
+	}
+	if p.TopP > 0 && p.TopP < 1 {
+		// min_keep 1: never narrow the field to nothing.
+		llama.SamplerChainAdd(chain, llama.SamplerTopP(p.TopP, 1))
+	}
+	llama.SamplerChainAdd(chain, llama.SamplerTemp(p.Temperature))
+
+	// A chain must end in something that selects. Dist draws from whatever
+	// distribution the stages above left behind.
+	llama.SamplerChainAdd(chain, llama.SamplerDist(seedOf(p.Seed)))
+
+	return &Sampler{chain: chain}
+}
+
+// Sample returns the next token for ctx, reading the logits at index idx of the
+// most recent decode. It also records the token for the repetition penalty.
+//
+// idx matters once a batch carries several sequences: each one's logits live at
+// the position its last token occupied, and -1 (the last row) would hand every
+// slot the same token.
+func (s *Sampler) Sample(ctx llama.Context, idx int32) llama.Token {
+	return llama.SamplerSample(s.chain, ctx, idx)
+}
+
+// Reset forgets the penalty history, as if the sampler were new.
+func (s *Sampler) Reset() {
+	if s.chain != 0 {
+		llama.SamplerReset(s.chain)
 	}
 }
 
-// softmax converts logits to probabilities. cands must be sorted descending so
-// that subtracting the first element keeps exp() from overflowing.
-func softmax(cands []Candidate) []float64 {
-	maxLogit := float64(cands[0].Logit)
-
-	probs := make([]float64, len(cands))
-	var sum float64
-	for i, c := range cands {
-		e := math.Exp(float64(c.Logit) - maxLogit)
-		probs[i] = e
-		sum += e
+// Close frees the chain. Safe to call twice.
+func (s *Sampler) Close() {
+	if s.chain != 0 {
+		llama.SamplerFree(s.chain)
+		s.chain = 0
 	}
-	if sum == 0 {
-		// Degenerate distribution; fall back to uniform rather than dividing by
-		// zero and producing NaNs.
-		for i := range probs {
-			probs[i] = 1 / float64(len(probs))
-		}
-		return probs
-	}
-	for i := range probs {
-		probs[i] /= sum
-	}
-	return probs
 }
 
-// nucleus keeps the shortest prefix whose probabilities reach p.
-func nucleus(cands []Candidate, probs []float64, p float32) ([]Candidate, []float64) {
-	var cum float64
-	for i, pr := range probs {
-		cum += pr
-		if cum >= float64(p) {
-			return cands[:i+1], probs[:i+1]
-		}
+// seedOf maps kinfer's "0 means random" onto llama.cpp's sentinel.
+func seedOf(seed int64) uint32 {
+	if seed == 0 {
+		return llama.DefaultSeed
 	}
-	return cands, probs
-}
-
-// draw picks an index with probability proportional to probs. probs need not
-// sum to exactly 1 — after nucleus truncation it sums to slightly more than p.
-func (s *Sampler) draw(probs []float64) int {
-	var total float64
-	for _, p := range probs {
-		total += p
-	}
-
-	r := s.rng.Float64() * total
-	var cum float64
-	for i, p := range probs {
-		cum += p
-		if r < cum {
-			return i
-		}
-	}
-	return len(probs) - 1 // float rounding
-}
-
-// remember records a token for the repetition penalty and returns it unchanged,
-// so callers can write `return s.remember(id)`.
-func (s *Sampler) remember(id int32) int32 {
-	n := s.params.RepeatLastN
-	if n <= 0 {
-		return id
-	}
-	s.recent = append(s.recent, id)
-	if len(s.recent) > n {
-		s.recent = s.recent[len(s.recent)-n:]
-	}
-	return id
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+	return uint32(seed)
 }

@@ -14,7 +14,8 @@
 //
 // Populate libs/ before building:
 //
-//	go run github.com/dianlight/gollama.cpp/cmd/gollama-download -download -copy-libs
+//	see README's Build section — the libraries come straight from a llama.cpp
+//	release tarball, copied under their versioned sonames
 package nativelib
 
 import (
@@ -28,8 +29,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-
-	gollama "github.com/dianlight/gollama.cpp"
 )
 
 // all: is required — without it, Go's embed skips files beginning with "." or
@@ -64,7 +63,7 @@ func prepare() (string, error) {
 
 	files, err := fs.ReadDir(embedded, path("libs", platform))
 	if err != nil {
-		return "", fmt.Errorf("no embedded libraries for %s/%s: run `gollama-download -download -copy-libs` and rebuild: %w",
+		return "", fmt.Errorf("no embedded libraries for %s/%s: see the Build section of README.md and rebuild: %w",
 			runtime.GOOS, runtime.GOARCH, err)
 	}
 
@@ -88,52 +87,17 @@ func prepare() (string, error) {
 	return dest, nil
 }
 
-// Load unpacks the embedded libraries and initialises the llama.cpp backend
-// from them. Call this instead of gollama.Backend_init.
+// Loading used to need a process-wide chdir.
 //
-// Getting the loader to use OUR copy took some doing, because two obvious
-// routes are both dead ends in gollama.cpp v0.2.2:
+// gollama.cpp called dlopen with a BARE name ("libllama.dylib"), which resolves
+// against the current working directory, and its Config.LibraryPath was
+// accepted and then discarded. The only way to point it at kinfer's unpacked
+// copy was to chdir into that directory for the duration of Backend_init and
+// chdir back — process-wide state, changed underneath every other goroutine.
 //
-//   - Config.LibraryPath is accepted and then ignored: ApplyConfig unloads the
-//     current library but never stores the path, so the next load falls back to
-//     the default search. (Worth a PR upstream.)
-//   - Setting DYLD_LIBRARY_PATH from inside the process is too late — the
-//     dynamic linker reads it at exec time, so os.Setenv has no effect on a
-//     later dlopen.
-//
-// What does work: the loader calls dlopen with a BARE name ("libllama.dylib"),
-// and a bare name resolves against the current working directory. So chdir into
-// the unpacked directory for the duration of Backend_init, then restore.
-//
-// The chdir is process-wide, so this must not race with other goroutines doing
-// relative-path I/O. In practice Backend_init happens once during startup,
-// before anything else runs, and the directory is restored before returning.
-func Load() error {
-	dir, err := Prepare()
-	if err != nil {
-		return err
-	}
-
-	prev, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("record working directory: %w", err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		return fmt.Errorf("enter library directory %s: %w", dir, err)
-	}
-	defer func() {
-		// A failure to restore would silently break every relative path the
-		// program uses afterwards, so it is worth surfacing loudly.
-		if cerr := os.Chdir(prev); cerr != nil {
-			panic(fmt.Sprintf("kinfer: could not restore working directory %s: %v", prev, cerr))
-		}
-	}()
-
-	if err := gollama.Backend_init(); err != nil {
-		return fmt.Errorf("initialise llama.cpp backend from %s: %w", dir, err)
-	}
-	return nil
-}
+// internal/llama dlopens an absolute path instead, and libllama's LC_RPATH is
+// @loader_path, so its seven ggml siblings resolve from the same directory with
+// no help. The hack is gone; Prepare alone is enough.
 
 // extract writes one embedded library to disk, skipping the write when an
 // identical file is already there. Content is hashed rather than trusting

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
@@ -24,16 +25,24 @@ import (
 const usage = `kinfer — a single-file local inference runtime
 
   kinfer pull <repo>[:quant]   download a model from Hugging Face
-  kinfer list                  show installed models
+  kinfer list                  show models kinfer can load, including Ollama's
   kinfer rm <model>            delete a model
-  kinfer run <model> [prompt]  generate once from the command line
+  kinfer run <model> [prompt]  chat with a model (no prompt = interactive)
+  kinfer ps                    show which model is loaded right now
+  kinfer plan <model>          what -slots and -ctx to serve it with
   kinfer serve                 serve models over HTTP
   kinfer fit                   what this machine can actually run
+  kinfer can-run <hf-repo>     whether a model on Hugging Face will run here
 
 Examples:
   kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
-  kinfer run qwen "explain merkle trees"
+  kinfer run qwen                        # interactive, model stays warm
+  kinfer run qwen "explain merkle trees" # one shot, same warm model
   kinfer serve -addr :11500
+
+run starts a background daemon on first use and reuses it afterwards, so the
+model is loaded once rather than once per command. kinfer ps shows what it is
+holding; -local skips the daemon and loads in-process instead.
 `
 
 func main() {
@@ -52,10 +61,16 @@ func main() {
 		err = cmdRemove(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "ps":
+		err = cmdPS(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
 	case "fit":
 		err = cmdFit(os.Args[2:])
+	case "plan":
+		err = cmdPlan(os.Args[2:])
+	case "can-run":
+		err = cmdCanRun(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -126,22 +141,40 @@ func cmdPull(args []string) error {
 }
 
 func cmdList(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	own := fs.Bool("own", false, "only models in kinfer's own directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
 	st, err := store.Open()
 	if err != nil {
 		return err
 	}
-	models, err := st.List()
+
+	list := st.All
+	if *own {
+		list = st.List
+	}
+	models, err := list()
 	if err != nil {
 		return err
 	}
 	if len(models) == 0 {
-		fmt.Printf("no models in %s\n\ntry: kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M\n", st.Root())
+		fmt.Println("no models yet — kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M")
 		return nil
 	}
 
-	fmt.Printf("%-46s %10s  %s\n", "NAME", "SIZE", "MODIFIED")
+	fmt.Printf("%-44s %10s  %-12s %s\n", "NAME", "SIZE", "MODIFIED", "SOURCE")
 	for _, m := range models {
-		fmt.Printf("%-46s %10s  %s\n", m.Name, store.HumanSize(m.Size), humanTime(m.Modified))
+		size, when := store.HumanSize(m.Size), humanTime(m.Modified)
+		if m.Remote() {
+			// There is no file, so there is no size and no mtime. Printing the
+			// zero values gives "0 B" and an age counted from year one, which
+			// reads as a corrupt local model rather than a hosted one.
+			size, when = "—", "—"
+		}
+		fmt.Printf("%-44s %10s  %-12s %s\n", m.Name, size, when, m.Source)
 	}
 	return nil
 }
@@ -169,6 +202,9 @@ func cmdRun(args []string) error {
 	nCtx := fs.Int("ctx", 4096, "context size in tokens")
 	system := fs.String("system", "", "system prompt")
 	maxTok := fs.Int("n", 512, "maximum tokens to generate")
+	addr := fs.String("addr", defaultAddr, "daemon address")
+	keepAlive := fs.Duration("keepalive", 5*time.Minute, "how long the daemon keeps an idle model loaded")
+	local := fs.Bool("local", false, "load the model in this process instead of using a daemon")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -176,48 +212,173 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("usage: kinfer run <model> [prompt]")
 	}
 
-	st, err := store.Open()
-	if err != nil {
-		return err
+	model := fs.Arg(0)
+	rest := fs.Args()[1:]
+
+	// Everything after the model name is the prompt, verbatim — a prompt is
+	// allowed to contain anything, including text that looks like a flag. The
+	// cost is that trailing flags are NOT parsed: Go's flag package stops at
+	// the first positional argument, so `run qwen "hi" -n 20` would quietly ask
+	// the model about "-n 20". Refuse that instead of asking a question nobody
+	// typed. Quoted prompts are unaffected: "what does -n mean" is one argument
+	// and never equals "-n".
+	if bad := strayFlag(fs, rest); bad != "" {
+		return fmt.Errorf("%s looks like a flag but comes after the model name, "+
+			"so it would be sent to the model as text\n"+
+			"       put flags first: kinfer run %s <model> [prompt]", bad, bad)
 	}
-	path, err := st.Resolve(fs.Arg(0))
+	prompt := strings.Join(rest, " ")
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	if *local {
+		return runLocal(ctx, model, prompt, *system, *ngl, *nCtx, *maxTok)
+	}
+
+	base, err := ensureDaemon(*addr, *ngl, *nCtx, *keepAlive)
 	if err != nil {
 		return err
 	}
 
-	eng, err := engine.Open(path, engine.Options{GPULayers: *ngl, ContextSize: *nCtx})
+	if prompt == "" {
+		return repl(ctx, base, model, *system, *maxTok)
+	}
+
+	var msgs []clientMsg
+	if *system != "" {
+		msgs = append(msgs, clientMsg{Role: "system", Content: *system})
+	}
+	msgs = append(msgs, clientMsg{Role: "user", Content: prompt})
+
+	_, err = streamChat(ctx, base, model, msgs, *maxTok, os.Stdout)
+	fmt.Println()
+	return err
+}
+
+// strayFlag returns the first argument that names a flag this command defines.
+func strayFlag(fs *flag.FlagSet, args []string) string {
+	defined := map[string]bool{}
+	fs.VisitAll(func(f *flag.Flag) { defined[f.Name] = true })
+	for _, a := range args {
+		name := strings.TrimLeft(a, "-")
+		if name == a || name == "" {
+			continue // not flag-shaped
+		}
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		if defined[name] {
+			return a
+		}
+	}
+	return ""
+}
+
+// runLocal loads the model in this process — no daemon, nothing left running.
+//
+// Kept because it is the only way to get llama.cpp's own stderr in front of
+// you, which is what you want when the question is "why did this model fail to
+// load" rather than "what does this model say".
+func runLocal(ctx context.Context, model, prompt, system string, ngl, nCtx, maxTok int) error {
+	if prompt == "" {
+		return fmt.Errorf("-local needs a prompt (interactive mode requires the daemon)")
+	}
+
+	st, err := store.Open()
+	if err != nil {
+		return err
+	}
+	path, err := st.Resolve(model)
+	if err != nil {
+		return err
+	}
+
+	eng, err := engine.Open(path, engine.Options{GPULayers: ngl, ContextSize: nCtx})
 	if err != nil {
 		return err
 	}
 	defer eng.Close()
 
-	prompt := strings.Join(fs.Args()[1:], " ")
-	if prompt == "" {
-		return fmt.Errorf("no prompt given")
-	}
-
 	var msgs []chat.Message
-	if *system != "" {
-		msgs = append(msgs, chat.Message{Role: "system", Content: *system})
+	if system != "" {
+		msgs = append(msgs, chat.Message{Role: "system", Content: system})
 	}
 	msgs = append(msgs, chat.Message{Role: "user", Content: prompt})
 
 	params := engine.DefaultGenParams()
-	params.MaxTokens = *maxTok
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	params.MaxTokens = maxTok
 
 	_, err = eng.Chat(ctx, msgs, params, func(frag string) { fmt.Print(frag) })
 	fmt.Println()
 	return err
 }
 
+// cmdPS reports what the daemon currently holds. It never starts one: "nothing
+// is loaded" and "no daemon is running" are different answers, and conflating
+// them would hide the case where a daemon died.
+func cmdPS(args []string) error {
+	fs := flag.NewFlagSet("ps", flag.ExitOnError)
+	addr := fs.String("addr", defaultAddr, "daemon address")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	base := daemonURL(*addr)
+	if !daemonAlive(base) {
+		fmt.Printf("no kinfer daemon on %s\n", *addr)
+		return nil
+	}
+
+	resp, err := http.Get(base + "/api/ps")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Models []struct {
+			Name      string     `json:"name"`
+			Size      int64      `json:"size"`
+			ExpiresAt *time.Time `json:"expires_at"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	if len(out.Models) == 0 {
+		fmt.Printf("daemon on %s — no model loaded\n", *addr)
+		return nil
+	}
+
+	fmt.Printf("%-44s %10s  %s\n", "NAME", "SIZE", "UNTIL")
+	for _, m := range out.Models {
+		until := "no expiry"
+		if m.ExpiresAt != nil {
+			if d := time.Until(*m.ExpiresAt); d > 0 {
+				until = d.Round(time.Second).String()
+			} else {
+				until = "expiring"
+			}
+		}
+		fmt.Printf("%-44s %10s  %s\n", m.Name, store.HumanSize(m.Size), until)
+	}
+	return nil
+}
+
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", ":11500", "listen address")
 	ngl := fs.Int("ngl", 99, "layers to offload to GPU (0 = CPU only)")
-	nCtx := fs.Int("ctx", 4096, "context size in tokens")
+	nCtx := fs.Int("ctx", 4096, "context size per conversation, in tokens")
+	slots := fs.Int("slots", engine.DefaultSlots, "conversations served at once (use 8, 32, 64 or 128 — never 12-16)")
+	prefix := fs.Int("prefix", engine.DefaultPrefixSlots, "prompt prefixes kept resident so repeat requests skip prefilling them (-1 disables)")
+	queue := fs.Int("queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
+	upstream := fs.String("upstream", server.Upstream(),
+		"where cloud models are served from (default: $OLLAMA_HOST, else Ollama's own address)")
+	maxGen := fs.Duration("max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
+	maxWait := fs.Duration("max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
+	keepAlive := fs.Duration("keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -226,11 +387,19 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	srv := server.New(st, engine.Options{GPULayers: *ngl, ContextSize: *nCtx})
+	srv := server.New(st, engine.Options{
+		GPULayers: *ngl, ContextSize: *nCtx, Slots: *slots, PrefixSlots: *prefix,
+		MaxQueue: *queue, MaxGenerate: noLimit(*maxGen), MaxWait: noLimit(*maxWait),
+	})
+	srv.SetKeepAlive(*keepAlive)
 	defer srv.Close()
 
 	models, _ := st.List()
 	fmt.Printf("kinfer serving on %s — %d model(s) in %s\n", *addr, len(models), st.Root())
+	fmt.Printf("  %d slots × %d tokens — conversations share one forward pass\n", *slots, *nCtx)
+	if *prefix > 0 {
+		fmt.Printf("  %d prefix slots — a repeated system prompt is prefilled once\n", *prefix)
+	}
 	fmt.Printf("  Ollama API : POST %s/api/chat        GET %s/api/tags\n", *addr, *addr)
 	fmt.Printf("  OpenAI API : POST %s/v1/chat/completions\n\n", *addr)
 	fmt.Printf("  point LocalKin at it by setting a soul's brain.endpoint to %s\n\n", *addr)
@@ -242,6 +411,8 @@ func cmdServe(args []string) error {
 		// deadline here would sever a reply mid-sentence.
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	srv.SetUpstream(*upstream)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -326,4 +497,24 @@ func humanTime(t time.Time) string {
 	default:
 		return fmt.Sprintf("%d days ago", int(d.Hours()/24))
 	}
+}
+
+// noLimit translates the command line's way of removing a limit into the
+// package's.
+//
+// They differ because they answer different questions. engine.Options is a Go
+// struct whose zero value has to mean "I did not set this", so a limit is
+// removed there with a negative. A flag always has a value — its default is
+// already the default — so on the command line 0 can mean what an operator
+// expects it to mean, and "-max-gen 0" is how you say no limit.
+//
+// Writing "-max-gen -1" would not have worked in any case: Go parses a duration
+// and "-1" has no unit, so the flag package prints an error and exits. Which it
+// did, into a log nobody was reading, and cost an afternoon's confusion over a
+// server that would not start.
+func noLimit(d time.Duration) time.Duration {
+	if d == 0 {
+		return -1
+	}
+	return d
 }

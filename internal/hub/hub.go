@@ -110,7 +110,10 @@ type Progress func(downloaded, total int64)
 
 // List returns the GGUF files in a repo, smallest first.
 func List(ctx context.Context, repo string) ([]File, error) {
-	url := fmt.Sprintf("%s/api/models/%s", endpoint(), repo)
+	// blobs=true is what makes Hugging Face report file sizes; without it every
+	// file comes back as zero bytes, and a size-based decision silently becomes
+	// a decision about nothing.
+	url := fmt.Sprintf("%s/api/models/%s?blobs=true", endpoint(), repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

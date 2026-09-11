@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"github.com/LocalKinAI/kinfer/internal/tools"
 	"strings"
 	"testing"
 )
@@ -18,7 +19,7 @@ func TestRender_EndsAtAssistantTurn(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get(%q): %v", name, err)
 		}
-		got := tpl.Render(msgs)
+		got := tpl.Render(msgs, nil)
 
 		if !strings.Contains(got, "什么是施舍？") {
 			t.Errorf("%s: user content missing from prompt", name)
@@ -40,7 +41,7 @@ func TestRender_ChatMLExact(t *testing.T) {
 	got := tpl.Render([]Message{
 		{Role: "system", Content: "S"},
 		{Role: "user", Content: "U"},
-	})
+	}, nil)
 	want := "<|im_start|>system\nS<|im_end|>\n" +
 		"<|im_start|>user\nU<|im_end|>\n" +
 		"<|im_start|>assistant\n"
@@ -56,7 +57,7 @@ func TestRender_MultiTurnOrder(t *testing.T) {
 		{Role: "user", Content: "first"},
 		{Role: "assistant", Content: "reply"},
 		{Role: "user", Content: "second"},
-	})
+	}, nil)
 	iFirst := strings.Index(got, "first")
 	iReply := strings.Index(got, "reply")
 	iSecond := strings.Index(got, "second")
@@ -116,5 +117,93 @@ func TestDetect(t *testing.T) {
 func TestGet_Unknown(t *testing.T) {
 	if _, err := Get("no-such-template"); err == nil {
 		t.Error("Get on unknown template should error")
+	}
+}
+
+// FromModel needs a loaded model, so what is unit-testable is the fallback:
+// a file whose metadata carries no template must still get a sensible guess
+// rather than a nil template and a panic on the first request. The path that
+// matters — a real GGUF template rendering the format the model was trained
+// on — is exercised end to end, and the difference is stark: Gemma 3 rendered
+// through its own template stops cleanly, while the same model rendered as
+// ChatML leaks "<|im_end" into the reply, because ChatML's marker is not what
+// this model was taught to stop at.
+func TestFromModelFallsBackWithoutAModel(t *testing.T) {
+	cases := []struct{ path, want string }{
+		{"/models/llama-3-8b-instruct.gguf", "llama3"},
+		{"/models/mistral-7b-instruct.gguf", "mistral"},
+		{"/models/qwen2.5-0.5b-instruct.gguf", "chatml"},
+	}
+	for _, c := range cases {
+		got := FromModel(0, c.path)
+		if got == nil {
+			t.Fatalf("FromModel(0, %q) returned nil", c.path)
+		}
+		if got.Name != c.want {
+			t.Errorf("FromModel(0, %q) = %q, want the filename guess %q", c.path, got.Name, c.want)
+		}
+		if got.Render(nil, nil) == "" && len(got.Stops) == 0 {
+			t.Errorf("%q fell back to something unusable", c.path)
+		}
+	}
+}
+
+func TestFoldDeclaresToolsInTheSystemTurn(t *testing.T) {
+	ts := []tools.Tool{{Type: "function", Function: tools.Function{Name: "get_weather"}}}
+
+	// With a system turn, the declaration joins it rather than adding another.
+	got := fold([]Message{
+		{Role: "system", Content: "You are terse."},
+		{Role: "user", Content: "Weather?"},
+	}, ts, tools.Hermes)
+	if len(got) != 2 {
+		t.Fatalf("fold produced %d messages, want 2", len(got))
+	}
+	if !strings.HasPrefix(got[0].Content, "You are terse.") {
+		t.Errorf("the system prompt was replaced rather than extended: %q", got[0].Content)
+	}
+	if !strings.Contains(got[0].Content, "get_weather") {
+		t.Errorf("the tool never reached the prompt: %q", got[0].Content)
+	}
+
+	// Without one, a system turn is created — the declaration has nowhere else
+	// to go, and a model that never sees it will never call anything.
+	got = fold([]Message{{Role: "user", Content: "Weather?"}}, ts, tools.Hermes)
+	if len(got) != 2 || got[0].Role != "system" {
+		t.Fatalf("fold did not add a system turn: %+v", got)
+	}
+	if strings.HasPrefix(got[0].Content, "\n") {
+		t.Errorf("a synthesised system turn starts with blank lines: %q", got[0].Content)
+	}
+}
+
+func TestFoldRewritesToolResultsAsUserTurns(t *testing.T) {
+	// No instruct model has a "tool" role; Qwen's own template turns results
+	// into a user turn wrapped in <tool_response>.
+	got := fold([]Message{
+		{Role: "user", Content: "Weather?"},
+		{Role: "assistant", ToolCalls: []tools.Call{{Name: "get_weather", Arguments: []byte(`{"city":"Berlin"}`)}}},
+		{Role: "tool", Content: `{"temp": 7}`},
+	}, nil, tools.Hermes)
+
+	if got[1].Role != "assistant" || !strings.Contains(got[1].Content, "<tool_call>") {
+		t.Errorf("the assistant's call did not become text: %+v", got[1])
+	}
+	if len(got[1].ToolCalls) != 0 {
+		t.Error("tool calls were left on the message as well as rendered into it")
+	}
+	if got[2].Role != "user" {
+		t.Errorf("a tool result kept role %q; no model knows that role", got[2].Role)
+	}
+	if !strings.Contains(got[2].Content, "<tool_response>") || !strings.Contains(got[2].Content, `"temp": 7`) {
+		t.Errorf("the tool result was not wrapped: %q", got[2].Content)
+	}
+}
+
+func TestFoldWithoutToolsChangesNothing(t *testing.T) {
+	in := []Message{{Role: "system", Content: "s"}, {Role: "user", Content: "u"}}
+	got := fold(in, nil, tools.Hermes)
+	if len(got) != 2 || got[0].Content != "s" || got[1].Content != "u" {
+		t.Errorf("fold altered a plain conversation: %+v", got)
 	}
 }
