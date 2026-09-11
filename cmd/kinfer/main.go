@@ -31,6 +31,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer ps                    show which model is loaded right now
   kinfer serve                 serve models over HTTP
   kinfer fit                   what this machine can actually run
+  kinfer can-run <hf-repo>     whether a model on Hugging Face will run here
 
 Examples:
   kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
@@ -65,6 +66,8 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "fit":
 		err = cmdFit(os.Args[2:])
+	case "can-run":
+		err = cmdCanRun(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
