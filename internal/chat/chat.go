@@ -23,12 +23,16 @@ import (
 	"strings"
 
 	"github.com/LocalKinAI/kinfer/internal/llama"
+	"github.com/LocalKinAI/kinfer/internal/tools"
 )
 
-// Message is one turn. Role is "system", "user", or "assistant".
+// Message is one turn. Role is "system", "user", "assistant" or "tool".
 type Message struct {
 	Role    string
 	Content string
+
+	// ToolCalls are the functions an assistant turn asked to have run.
+	ToolCalls []tools.Call
 }
 
 // Template renders a conversation and reports the model's stop markers.
@@ -46,12 +50,63 @@ type Template struct {
 	// so there is no marker to match.
 	Stops []string
 
-	render func(msgs []Message) string
+	render  func(msgs []Message) string
+	toolsOK bool
 }
 
 // Render builds the prompt, ending in the assistant's opening so the model
 // continues as the assistant rather than inventing another user turn.
-func (t *Template) Render(msgs []Message) string { return t.render(msgs) }
+//
+// Available functions are folded into the conversation before it reaches the
+// template. llama_chat_apply_template takes only {role, content}, with no tools
+// parameter, so the tool branches of a model's Jinja template cannot be reached
+// through the C API — but the convention they encode can be reproduced, and
+// then the template has nothing unusual left to render.
+func (t *Template) Render(msgs []Message, ts []tools.Tool) string {
+	return t.render(fold(msgs, ts))
+}
+
+// fold rewrites a conversation into plain {role, content} turns.
+//
+// Three transformations, each one exactly what Qwen's own template does:
+//
+//   - the function signatures join the end of the system prompt, adding one if
+//     the conversation has none
+//   - an assistant turn's tool calls become <tool_call> blocks in its text,
+//     which is the form the model itself produced them in
+//   - a tool result becomes a user turn wrapped in <tool_response>, because no
+//     instruct model has a "tool" role of its own
+func fold(msgs []Message, ts []tools.Tool) []Message {
+	decl := tools.Declare(ts)
+	out := make([]Message, 0, len(msgs)+1)
+
+	if decl != "" && (len(msgs) == 0 || msgs[0].Role != "system") {
+		out = append(out, Message{Role: "system", Content: strings.TrimPrefix(decl, "\n\n")})
+		decl = ""
+	}
+
+	for _, m := range msgs {
+		switch {
+		case m.Role == "system" && decl != "":
+			m.Content += decl
+			decl = ""
+		case m.Role == "assistant" && len(m.ToolCalls) > 0:
+			m.Content += tools.RenderCalls(m.ToolCalls)
+			m.ToolCalls = nil
+		case m.Role == "tool":
+			m.Role = "user"
+			m.Content = "<tool_response>\n" + m.Content + "\n</tool_response>"
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// SupportsTools reports whether this model was trained on the <tool_call>
+// convention. A model that was not will answer in prose however the functions
+// are declared, so a caller expecting a function call should be told rather
+// than left waiting.
+func (t *Template) SupportsTools() bool { return t.toolsOK }
 
 // TrimStop cuts the output at the first stop marker and reports whether one was
 // found. Generation loops call this every step: stop markers arrive as ordinary
@@ -73,6 +128,9 @@ func (t *Template) TrimStop(s string) (string, bool) {
 var chatml = &Template{
 	Name:  "chatml",
 	Stops: []string{"<|im_end|>", "<|endoftext|>"},
+	// The ChatML fallback is reached mainly for Qwen-lineage models, which is
+	// where this convention comes from.
+	toolsOK: true,
 	render: func(msgs []Message) string {
 		var b strings.Builder
 		for _, m := range msgs {
@@ -171,7 +229,8 @@ func FromModel(model llama.Model, path string) *Template {
 	}
 
 	return &Template{
-		Name: "gguf",
+		Name:    "gguf",
+		toolsOK: tools.Supported(tmpl),
 		// No stop strings. Generation ends on an end-of-generation token, which
 		// llama_vocab_is_eog reports for whatever terminator this model uses —
 		// a surer signal than matching text, and the only one available when

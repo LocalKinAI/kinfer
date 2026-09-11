@@ -27,6 +27,8 @@ type fakeEngine struct {
 	frags   []string
 	release chan struct{}
 
+	tools bool
+
 	mu     sync.Mutex
 	closed bool
 	inChat bool
@@ -74,6 +76,8 @@ func (f *fakeEngine) Chat(ctx context.Context, _ []chat.Message, _ engine.GenPar
 	}
 	return out.String(), f.err
 }
+
+func (f *fakeEngine) SupportsTools() bool { return f.tools }
 
 func (f *fakeEngine) Close() {
 	f.mu.Lock()

@@ -470,6 +470,48 @@ stop strings of its own. The three hand-written families remain as a fallback
 for a file that carries no template, or one llama.cpp does not implement, and
 `-template` still forces one.
 
+## Tool calls
+
+A model can ask for a function to be run, in both dialects:
+
+```
+POST /api/chat   {"tools": [{"type":"function","function":{"name":"get_current_weather", …}}]}
+
+{"message": {"role":"assistant", "content":"",
+             "tool_calls":[{"function":{"name":"get_current_weather",
+                                        "arguments":{"city":"Berlin","unit":"celsius"}}}]},
+ "done": true, "done_reason": "tool_calls"}
+```
+
+Send the result back as a `tool` message and the model answers from it — *"The
+current weather in Berlin is light rain with a temperature of 7 degrees
+Celsius."*
+
+`llama_chat_apply_template` takes only `{role, content}` — it has no tools
+parameter — so the tool branches of a model's Jinja template are unreachable
+through the C API. What is reachable is the convention those branches encode,
+and kinfer reproduces it exactly as Qwen's own template writes it: the
+signatures join the end of the system prompt, an assistant's calls become
+`<tool_call>` blocks in its text, and a result becomes a user turn wrapped in
+`<tool_response>`, because no instruct model has a `tool` role of its own. The
+template then has nothing unusual left to render.
+
+**That convention is not universal.** Llama 3.1 emits `<|python_tag|>`, Mistral
+emits `[TOOL_CALLS]`, and a model trained on either will answer in prose no
+matter how the functions are declared. kinfer checks the model's own template
+for the `<tool_call>` marker and refuses rather than answering uselessly:
+
+```
+$ curl … -d '{"model":"gemma","tools":[…]}'
+{"error":"this model's chat template does not use the <tool_call> convention,
+          so it cannot answer with tool calls"}
+```
+
+A reply carrying functions is not streamed. A tool call is JSON spread over many
+tokens, and streaming it would hand the client fragments of syntax; with
+functions on the table the reply is buffered and delivered once, parsed. Without
+them, streaming is unchanged.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary

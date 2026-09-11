@@ -16,6 +16,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/llama"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
 	"github.com/LocalKinAI/kinfer/internal/sampling"
+	"github.com/LocalKinAI/kinfer/internal/tools"
 )
 
 // Options configure how a model is loaded.
@@ -59,6 +60,11 @@ type GenParams struct {
 
 	// MaxTokens caps the reply. 0 means "until the model stops".
 	MaxTokens int
+
+	// Tools are the functions the model may ask to have run. They are folded
+	// into the prompt in the form the model was trained on; whether it knows
+	// that form at all is SupportsTools.
+	Tools []tools.Tool
 }
 
 // Defaults for a machine nobody has measured yet.
@@ -235,6 +241,11 @@ func (e *Engine) Path() string { return e.path }
 
 // Template reports the chat family in use.
 func (e *Engine) Template() string { return e.tpl.Name }
+
+// SupportsTools reports whether this model was trained on the tool-call
+// convention kinfer speaks. A model that was not will answer in prose no matter
+// how the functions are declared.
+func (e *Engine) SupportsTools() bool { return e.tpl.SupportsTools() }
 
 // VocabSize is the model's true vocabulary size.
 func (e *Engine) VocabSize() int { return int(llama.NVocab(e.vocab)) }

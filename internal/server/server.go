@@ -26,6 +26,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/engine"
 	"github.com/LocalKinAI/kinfer/internal/store"
+	"github.com/LocalKinAI/kinfer/internal/tools"
 )
 
 // Server holds the model store and whatever is currently loaded.
@@ -85,6 +86,7 @@ type lease struct {
 // generating, which segfaulted the process.
 type generator interface {
 	Chat(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, error)
+	SupportsTools() bool
 	Close()
 }
 
@@ -259,11 +261,43 @@ type ollamaChatRequest struct {
 	Messages []ollamaMsg    `json:"messages"`
 	Stream   *bool          `json:"stream"`
 	Options  *ollamaOptions `json:"options"`
+	Tools    []tools.Tool   `json:"tools"`
 }
 
 type ollamaMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string       `json:"role"`
+	Content   string       `json:"content"`
+	ToolCalls []ollamaCall `json:"tool_calls,omitempty"`
+}
+
+// ollamaCall is a tool call on the wire. Both dialects nest the call under a
+// "function" key; kinfer's own tools.Call is the flat form.
+type ollamaCall struct {
+	Function tools.Call `json:"function"`
+}
+
+func wireCalls(calls []tools.Call) []ollamaCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]ollamaCall, len(calls))
+	for i, c := range calls {
+		out[i] = ollamaCall{Function: c}
+	}
+	return out
+}
+
+// toChatMessages converts wire messages, keeping tool calls and tool results
+// so a conversation can be replayed with its function round trips intact.
+func toChatMessages(in []ollamaMsg) []chat.Message {
+	out := make([]chat.Message, len(in))
+	for i, m := range in {
+		out[i] = chat.Message{Role: m.Role, Content: m.Content}
+		for _, c := range m.ToolCalls {
+			out[i].ToolCalls = append(out[i].ToolCalls, c.Function)
+		}
+	}
+	return out
 }
 
 type ollamaOptions struct {
@@ -311,11 +345,43 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	msgs := make([]chat.Message, len(req.Messages))
-	for i, m := range req.Messages {
-		msgs[i] = chat.Message{Role: m.Role, Content: m.Content}
-	}
+	msgs := toChatMessages(req.Messages)
 	params := applyOllamaOptions(engine.DefaultGenParams(), req.Options)
+	params.Tools = req.Tools
+
+	if len(req.Tools) > 0 && !eng.SupportsTools() {
+		// Declaring functions to a model that was never trained on this
+		// convention produces prose where the caller is waiting for a call.
+		// Saying so beats answering something useless.
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "this model's chat template does not use the <tool_call> convention, so it cannot answer with tool calls",
+		})
+		return
+	}
+
+	// A tool call is JSON split across many tokens; streaming it would hand the
+	// client fragments of syntax. With functions on the table the reply is
+	// buffered and delivered once, parsed.
+	if len(req.Tools) > 0 {
+		text, err := eng.Chat(r.Context(), msgs, params, nil)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		content, calls := tools.Parse(text)
+		reason := "stop"
+		if len(calls) > 0 {
+			reason = "tool_calls"
+		}
+		writeJSON(w, http.StatusOK, ollamaChatResponse{
+			Model:      req.Model,
+			CreatedAt:  time.Now(),
+			Message:    ollamaMsg{Role: "assistant", Content: content, ToolCalls: wireCalls(calls)},
+			Done:       true,
+			DoneReason: reason,
+		})
+		return
+	}
 
 	// Ollama streams unless told otherwise — the opposite of OpenAI.
 	stream := req.Stream == nil || *req.Stream
@@ -464,13 +530,14 @@ func modelName(path string) string {
 // ─── OpenAI dialect ──────────────────────────────────────────────────────────
 
 type openAIChatRequest struct {
-	Model       string      `json:"model"`
-	Messages    []ollamaMsg `json:"messages"`
-	Stream      bool        `json:"stream"`
-	Temperature *float64    `json:"temperature"`
-	TopP        *float64    `json:"top_p"`
-	MaxTokens   *int        `json:"max_tokens"`
-	Seed        *int64      `json:"seed"`
+	Model       string       `json:"model"`
+	Messages    []ollamaMsg  `json:"messages"`
+	Stream      bool         `json:"stream"`
+	Temperature *float64     `json:"temperature"`
+	TopP        *float64     `json:"top_p"`
+	MaxTokens   *int         `json:"max_tokens"`
+	Seed        *int64       `json:"seed"`
+	Tools       []tools.Tool `json:"tools"`
 }
 
 func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
@@ -492,12 +559,10 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	msgs := make([]chat.Message, len(req.Messages))
-	for i, m := range req.Messages {
-		msgs[i] = chat.Message{Role: m.Role, Content: m.Content}
-	}
+	msgs := toChatMessages(req.Messages)
 
 	params := engine.DefaultGenParams()
+	params.Tools = req.Tools
 	if req.Temperature != nil {
 		params.Temperature = float32(*req.Temperature)
 	}
@@ -513,6 +578,43 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
+
+	if len(req.Tools) > 0 && !eng.SupportsTools() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{
+			"message": "this model's chat template does not use the <tool_call> convention, so it cannot answer with tool calls",
+		}})
+		return
+	}
+
+	// As in the Ollama dialect: a tool call arrives as JSON across many tokens,
+	// so with functions on the table the reply is buffered and parsed.
+	if len(req.Tools) > 0 {
+		text, err := eng.Chat(r.Context(), msgs, params, nil)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
+			return
+		}
+		content, calls := tools.Parse(text)
+
+		msg := map[string]any{"role": "assistant", "content": content}
+		finish := "stop"
+		if len(calls) > 0 {
+			finish = "tool_calls"
+			wire := make([]any, len(calls))
+			for i, c := range calls {
+				wire[i] = map[string]any{
+					"id": fmt.Sprintf("call_%d_%d", created, i), "type": "function",
+					"function": map[string]any{"name": c.Name, "arguments": string(c.Arguments)},
+				}
+			}
+			msg["tool_calls"] = wire
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": id, "object": "chat.completion", "created": created, "model": req.Model,
+			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
+		})
+		return
+	}
 
 	if !req.Stream {
 		text, err := eng.Chat(r.Context(), msgs, params, nil)

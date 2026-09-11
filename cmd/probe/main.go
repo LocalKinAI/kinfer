@@ -118,7 +118,7 @@ func main() {
 			msgs = append(msgs, chat.Message{Role: "system", Content: *system})
 		}
 		msgs = append(msgs, chat.Message{Role: "user", Content: *prompt})
-		promptText = tpl.Render(msgs)
+		promptText = tpl.Render(msgs, nil)
 		fmt.Printf("  ✅ chat template          %s\n", tpl.Name)
 		// Apple Silicon steers low-QoS threads onto efficiency cores, where
 		// llama_decode's CPU half takes roughly twice as long (measured: 2035

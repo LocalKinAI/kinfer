@@ -224,7 +224,7 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 		return
 	}
 
-	prompt := s.tpl.Render(j.msgs)
+	prompt := s.tpl.Render(j.msgs, j.params.Tools)
 	tokens, err := llama.Tokenize(s.vocab, prompt, true, true)
 	if err != nil {
 		j.finish(fmt.Errorf("tokenize: %w", err))
