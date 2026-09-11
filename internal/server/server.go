@@ -47,6 +47,9 @@ type Server struct {
 	// has decided it is.
 	fallback string
 
+	// stats are what /metrics reports.
+	stats counters
+
 	// Exactly one model stays resident. A 7B model is several GB, so keeping a
 	// map of them would exhaust memory on the laptops kinfer targets; loading is
 	// fast enough (0.5s for a 0.5B, a few seconds for a 7B) that swapping on
@@ -102,6 +105,9 @@ type generator interface {
 	ChatFull(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, engine.Stats, error)
 	Broken() bool
 	ToolFormat() tools.Format
+	Load() (waiting, busy, slots int)
+	PromptTokens() int64
+	EvalTokens() int64
 	Close()
 }
 
@@ -145,11 +151,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", s.handleOpenAIChat)
 	mux.HandleFunc("/v1/models", s.handleOpenAIModels)
 
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	return mux
+	// Counting wraps everything, so an endpoint added later cannot forget to
+	// report itself.
+	return s.count(mux)
 }
 
 // Close releases the resident model.
@@ -458,6 +467,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		// substitution this project refuses to make, and the reply's model
 		// field is where it gets told.
 		log.Printf("%s unavailable upstream; answering with %s instead", req.Model, s.fallback)
+		s.stats.fellBack.Add(1)
 		req.Model = s.fallback
 	}
 
@@ -761,6 +771,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		// substitution this project refuses to make, and the reply's model
 		// field is where it gets told.
 		log.Printf("%s unavailable upstream; answering with %s instead", req.Model, s.fallback)
+		s.stats.fellBack.Add(1)
 		req.Model = s.fallback
 	}
 

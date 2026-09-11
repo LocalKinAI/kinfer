@@ -124,8 +124,11 @@ func (rt *retrying) Chat(ctx context.Context, msgs []chat.Message, p engine.GenP
 	return text, err
 }
 
-func (rt *retrying) Broken() bool             { return rt.current().Broken() }
-func (rt *retrying) ToolFormat() tools.Format { return rt.current().ToolFormat() }
+func (rt *retrying) Broken() bool                     { return rt.current().Broken() }
+func (rt *retrying) Load() (waiting, busy, slots int) { return rt.current().Load() }
+func (rt *retrying) PromptTokens() int64              { return rt.current().PromptTokens() }
+func (rt *retrying) EvalTokens() int64                { return rt.current().EvalTokens() }
+func (rt *retrying) ToolFormat() tools.Format         { return rt.current().ToolFormat() }
 
 // Close is the model's lifecycle, not one request's. The server closes engines
 // when it retires them; a handler holding this wrapper must not.

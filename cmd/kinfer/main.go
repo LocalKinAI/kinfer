@@ -29,6 +29,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer rm <model>            delete a model
   kinfer run <model> [prompt]  chat with a model (no prompt = interactive)
   kinfer ps                    show which model is loaded right now
+  kinfer plan <model>          what -slots and -ctx to serve it with
   kinfer serve                 serve models over HTTP
   kinfer fit                   what this machine can actually run
   kinfer can-run <hf-repo>     whether a model on Hugging Face will run here
@@ -66,6 +67,8 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "fit":
 		err = cmdFit(os.Args[2:])
+	case "plan":
+		err = cmdPlan(os.Args[2:])
 	case "can-run":
 		err = cmdCanRun(os.Args[2:])
 	case "-h", "--help", "help":

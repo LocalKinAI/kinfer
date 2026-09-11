@@ -71,6 +71,11 @@ import (
 // a shared machine is the thing that decides it.
 const thinHeadroom = 2 << 30 // 2 GiB
 
+// ThinHeadroom is the same number, for tools that plan a configuration the
+// server will then judge. They must use one number or fit will recommend
+// something serve immediately complains about.
+func ThinHeadroom() int64 { return thinHeadroom }
+
 // budget tracks the accelerator's free memory across the stages of a load.
 type budget struct {
 	dev   llama.Device

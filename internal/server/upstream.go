@@ -132,6 +132,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, mo
 		req.Header.Set("Authorization", a)
 	}
 
+	s.stats.forwarded.Add(1)
 	log.Printf("→ %s for %s, forwarded to %s", r.URL.Path, model, s.upstream)
 	resp, err := s.upstreamClient.Do(req)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -111,6 +112,12 @@ type scheduler struct {
 	// limits bound the two ways a request can occupy the server without
 	// finishing: holding a slot, and holding a place in the queue.
 	limits deadlines
+
+	// Live counters, atomic because /metrics reads them from an HTTP goroutine
+	// while run() owns everything else here.
+	busy       atomic.Int64
+	promptSeen atomic.Int64
+	evalSeen   atomic.Int64
 
 	// debug counters, printed when KINFER_DEBUG_SCHED is set. Batch
 	// composition is the thing worth watching: if steps mostly carry one token
@@ -382,6 +389,7 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	}
 
 	sl.job = j
+	s.busy.Add(1)
 	sl.prompt = tokens
 	sl.nPast = int32(reused)
 	sl.reused = reused
@@ -648,6 +656,9 @@ func (s *scheduler) release(sl *slot, err error) {
 
 	sl.job.finish(err)
 	s.rate.done()
+	s.busy.Add(-1)
+	s.promptSeen.Add(int64(len(sl.prompt)))
+	s.evalSeen.Add(int64(sl.nGen))
 	sl.job = nil
 	sl.prompt = nil
 	sl.logitIdx = -1

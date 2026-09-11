@@ -1040,3 +1040,7 @@ func (e *staleEngine) ChatFull(context.Context, []chat.Message, engine.GenParams
 func (e *staleEngine) Chat(context.Context, []chat.Message, engine.GenParams, func(string)) (string, error) {
 	return "", &engine.TimeoutError{After: 90 * time.Second, Stage: engine.StageQueued}
 }
+
+func (f *fakeEngine) Load() (waiting, busy, slots int) { return 0, 0, 1 }
+func (f *fakeEngine) PromptTokens() int64              { return 0 }
+func (f *fakeEngine) EvalTokens() int64                { return 0 }

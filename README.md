@@ -610,6 +610,99 @@ Two honest surprises remain in the numbers:
   `prompt_eval_duration` collapses. The tokens really were in the prompt; they
   just did not have to be prefilled again.
 
+## Staying up under load
+
+The outage this exists for was a hang, not an error: `kimi-k2.5:cloud` stopped
+answering on 2026-07-23 and ~150 agents waited half a day. Everything here is
+aimed at the same shape of failure — a server that is not working but does not
+say so.
+
+**A bounded queue that refuses.** `-queue` (default 128, sixteen per slot) caps
+what may wait. Past it the answer is `503`, not a held connection. Measured with
+four slots and a queue of eight, flooded with 64 requests: 12 answered at a 3.2s
+median, 52 refused at 0.06s. A `Retry-After` is sent only when the server has
+measured its own completion rate — a guessed interval brings every refused
+caller back at the same invented moment.
+
+**A clock on every request.** `-max-gen` (default 5m) bounds one reply;
+`-max-wait` (same) bounds how long it may queue before being refused rather than
+given a slot. Without them a caller could pass `num_predict` meaning "keep
+going" and hold a slot for over 400 seconds — eight of those is the whole
+server. A reply cut off by the clock returns its text with
+`done_reason: "timeout"`, because `"stop"` would claim the model finished and
+`"length"` would claim it hit the budget it was given.
+
+**Cloud models go through kinfer too.** Ollama's cloud entries carry no weights;
+kinfer used to drop them, which left it out of the path of the only model class
+that has actually taken a fleet down. Now they are forwarded verbatim on the
+same path in the same dialect, with the deadline applied. Nothing listening is
+`503` and says so; silence past `-max-gen` is `504`. A typo is still a `404` in
+under three milliseconds, because a cloud model is recognised by its manifest
+having no weights layer and never by its `:cloud` suffix.
+
+**And a fallback, off by default.** `-fallback <local model>` answers locally
+when the upstream says *not now* — `429`, `502`, `503`, `504`, or unreachable —
+and only before a single byte has been written. Never on `400`, `401` or `404`:
+those are wrong requests, and running one on another model produces a confident
+answer to a question that was already wrong. The reply's `model` field names
+whichever model actually answered.
+
+**A queued request survives a backend failure.** llama.cpp reports a fatal
+decode for the whole context, so kinfer retires the model — and used to fail
+every request it held. Measured: 32 concurrent requests against a dying backend,
+0 answered before, 28 after. The four that had already streamed text are still
+failed, because re-running them would repeat it.
+
+## Seeing what it is doing
+
+```
+curl localhost:11500/metrics
+```
+
+```
+kinfer_queue_depth 0
+kinfer_slots_busy 0
+kinfer_slots_total 2
+kinfer_prompt_tokens_total 9
+kinfer_eval_tokens_total 16
+kinfer_model_loaded{model="…/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf"} 1
+kinfer_requests_total{outcome="ok"} 2
+kinfer_requests_total{outcome="refused"} 0
+kinfer_requests_total{outcome="failed"} 0
+kinfer_upstream_forwarded_total 0
+kinfer_upstream_fallback_total 0
+```
+
+Prometheus text format. The three that matter together: a deep queue beside idle
+slots is a different problem from slots that are always full, and `refused` is
+how you know which.
+
+## Sizing a model before loading it
+
+```
+kinfer plan Qwen3.8-Flash-Next-UD-Q2_K_XL -ctx 16384
+```
+
+```
+  weights           73.5 GB
+  GPU budget        77.8 GB   (this process's share, not the machine's RAM)
+  left for cache     4.3 GB
+
+  -slots   total tokens   largest -ctx that fits
+  1        32768          32768
+  2        32768          16384
+  4        32768          8192
+  …
+  For -ctx 16384: kinfer serve -ctx 16384 -slots 2
+```
+
+`-ctx` is per conversation and gets multiplied by the slot count, which is the
+part that surprises people — raising `-slots` from 2 to 4 doubles the cache. The
+figure kinfer prints at load time is the measurement; `plan` is an estimate, and
+says so, because a hybrid architecture holds per-sequence state that does not
+scale with context and costs more than the arithmetic predicts at high slot
+counts.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary

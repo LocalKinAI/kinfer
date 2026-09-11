@@ -368,6 +368,39 @@ func (e *Engine) Close() {
 // Path is the file this engine was loaded from.
 func (e *Engine) Path() string { return e.path }
 
+// Load is what the server is doing right now: requests waiting for a slot,
+// slots generating, and slots in total. A deep queue beside idle slots is a
+// different problem from slots that are always full, and telling them apart is
+// the whole reason these are reported.
+func (e *Engine) Load() (waiting, busy, slots int) {
+	e.mu.Lock()
+	sched := e.sched
+	e.mu.Unlock()
+	if sched == nil {
+		return 0, 0, e.slots
+	}
+	return sched.Waiting(), int(sched.busy.Load()), len(sched.slots)
+}
+
+// PromptTokens and EvalTokens are what this engine has processed since it
+// loaded. Counters, not rates: a scraper takes the difference.
+func (e *Engine) PromptTokens() int64 {
+	return e.counter(func(s *scheduler) int64 { return s.promptSeen.Load() })
+}
+func (e *Engine) EvalTokens() int64 {
+	return e.counter(func(s *scheduler) int64 { return s.evalSeen.Load() })
+}
+
+func (e *Engine) counter(read func(*scheduler) int64) int64 {
+	e.mu.Lock()
+	sched := e.sched
+	e.mu.Unlock()
+	if sched == nil {
+		return 0
+	}
+	return read(sched)
+}
+
 // Template reports the chat family in use.
 func (e *Engine) Template() string { return e.tpl.Name }
 
