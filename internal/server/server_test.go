@@ -693,3 +693,101 @@ func decodeTimings(t *testing.T, body []byte) wireTimings {
 	}
 	return w
 }
+
+// A request that was still queued when the backend died must come back as a
+// complete reply, not as an error.
+//
+// This is the recoverable half of a fatal failure. The engine that died had
+// never touched the request — no tokens reached the client, no KV state exists
+// — so the only correct outcome is to run it on the replacement. Before this,
+// every queued request died alongside the one batch that actually failed; on a
+// load test that was 26 at once, most of which had never started.
+func TestQueuedRequestSurvivesAFatalBackendFailure(t *testing.T) {
+	srv, reg := newTestServer(t, "alpha")
+
+	var opened int
+	srv.open = func(path string, _ engine.Options) (generator, error) {
+		opened++
+		f := &fakeEngine{path: path, frags: []string{"real", " answer"}}
+		if opened == 1 {
+			// The first engine dies before this request is picked up.
+			f.err = engine.ErrNotStarted
+			f.frags = nil
+			f.broken = true
+		}
+		reg.put(f)
+		return f, nil
+	}
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(body)))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 — a request that never started was failed instead of retried:\n%s",
+			w.Code, w.Body.String())
+	}
+	var got ollamaChatResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if got.Error != "" {
+		t.Fatalf("reply carries error %q", got.Error)
+	}
+	if got.Message.Content != "real answer" {
+		t.Errorf("content = %q, want the reply from the replacement engine", got.Message.Content)
+	}
+	if opened != 2 {
+		t.Errorf("opened %d engines, want 2 — the dead one and its replacement", opened)
+	}
+}
+
+// A request that had already started must NOT be retried: its client has seen
+// part of the answer, and running it again would repeat that text.
+func TestInFlightRequestIsNotRetried(t *testing.T) {
+	srv, reg := newTestServer(t, "alpha")
+
+	var opened int
+	srv.open = func(path string, _ engine.Options) (generator, error) {
+		opened++
+		f := &fakeEngine{path: path, frags: []string{"half"}, err: errors.New("engine is closing")}
+		reg.put(f)
+		return f, nil
+	}
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(body)))
+
+	if opened != 1 {
+		t.Errorf("opened %d engines — a request that had already streamed text was re-run", opened)
+	}
+	if w.Code == http.StatusOK {
+		t.Errorf("a failed in-flight request reported 200; the caller cannot tell it was cut short")
+	}
+}
+
+// The retry must not loop: a replacement that is itself down has to surface,
+// not spin.
+func TestRetryHappensOnceOnly(t *testing.T) {
+	srv, reg := newTestServer(t, "alpha")
+
+	var opened int
+	srv.open = func(path string, _ engine.Options) (generator, error) {
+		opened++
+		f := &fakeEngine{path: path, err: engine.ErrNotStarted, broken: true}
+		reg.put(f)
+		return f, nil
+	}
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(body)))
+
+	if opened > 2 {
+		t.Errorf("opened %d engines — the retry is looping", opened)
+	}
+	if w.Code == http.StatusOK {
+		t.Error("a request that never ran twice reported success")
+	}
+}

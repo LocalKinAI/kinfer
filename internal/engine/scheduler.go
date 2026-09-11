@@ -163,7 +163,9 @@ func (s *scheduler) submit(j *job) error {
 	case s.incoming <- j:
 		return nil
 	case <-s.stop:
-		return errors.New("engine is closed")
+		// Same case as a job drained from the queue: nothing of this request
+		// happened, so a caller able to reload can simply run it again.
+		return ErrNotStarted
 	}
 }
 
@@ -563,16 +565,34 @@ func (s *scheduler) release(sl *slot, err error) {
 	sl.out.Reset()
 }
 
+// ErrNotStarted means a request was still queued when the engine went down, so
+// nothing of it ever reached llama.cpp or the client.
+//
+// It exists to separate the two halves of a shutdown. A slot that was mid-batch
+// has already streamed part of an answer, and re-running it would repeat that
+// text; there is nothing to do but fail it. A job still in the queue holds only
+// its messages and parameters — no KV state, no emitted tokens, no tie to the
+// context that died — and can simply be run again on the replacement.
+//
+// That distinction is most of the blast radius. When a backend failure retired
+// a model mid-load-test, 26 requests failed at once and the majority of them
+// had never started. Callers that can reload a model should retry this; callers
+// that cannot should report it. Engine cannot reload itself, so it reports.
+var ErrNotStarted = errors.New("the engine went down before this request started")
+
 // drain ends every in-flight and queued request on shutdown.
+//
+// The two loops fail their jobs with different errors on purpose — see
+// ErrNotStarted.
 func (s *scheduler) drain() {
-	err := errors.New("engine is closing")
+	closing := errors.New("engine is closing")
 	for _, sl := range s.slots {
-		s.release(sl, err)
+		s.release(sl, closing)
 	}
 	for {
 		select {
 		case j := <-s.incoming:
-			j.finish(err)
+			j.finish(ErrNotStarted)
 		default:
 			return
 		}

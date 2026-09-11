@@ -200,14 +200,19 @@ func (s *Server) stopIdleLocked() {
 	s.expiry = time.Time{}
 }
 
-// acquire returns an engine for the named model, loading it if necessary, plus
-// a release function the caller MUST call when it is done generating.
+// acquireOnce returns an engine for the named model, loading it if necessary,
+// plus a release function the caller MUST call when it is done generating.
 //
 // The engine stays alive for as long as the reference is held. Swapping to a
 // different model retires the current one and waits for its in-flight requests
 // to finish before loading the replacement — only one model fits in memory, and
 // freeing one that is still generating crashes the process.
-func (s *Server) acquire(name string) (generator, func(), error) {
+//
+// Handlers call acquire, not this: a model can be retired while a request is
+// still queued against it, and acquire wraps that case. Callers of this one
+// hold a reference to a specific engine and must let go of it before asking
+// for another, or retireLocked will wait for them.
+func (s *Server) acquireOnce(name string) (generator, func(), error) {
 	path, err := s.store.Resolve(name)
 	if err != nil {
 		return nil, nil, err
