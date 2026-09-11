@@ -21,7 +21,7 @@ kinfer serving on :11500 — 1 model(s) in ~/.kinfer/models
 
 ```
 $ ls -lh $(which kinfer)
--rwxr-xr-x  14M   # llama.cpp is inside — nothing else to install
+-rwxr-xr-x  17M   # llama.cpp is inside — nothing else to install
 ```
 
 > **Status: early but usable.** The inference core is done and the CLI works:
@@ -159,7 +159,7 @@ silently loading the wrong 7B model is worse than a message.
             │
       purego                    no CGO, so cross-compilation survives
             │
-      libllama.dylib + 7 ggml libraries   (4.6 MB, embedded)
+      libllama + 7 ggml libraries   (llama.cpp b10901, 8.2 MB, embedded)
 ```
 
 **No CGO anywhere.** The native libraries load at runtime through `purego`,
@@ -175,10 +175,16 @@ onto libffi.
 
 ```bash
 # Fetch the native libraries once, into the package that embeds them.
-# gollama.cpp is no longer a dependency — only its downloader is used, so it is
-# run at a pinned version rather than required by go.mod.
-go run github.com/dianlight/gollama.cpp/cmd/gollama-download@v0.2.2-llamacpp.b6862 \
-    -download -copy-libs -libs-dir internal/nativelib/libs
+# Copy the versioned sonames, not the plain names: llama.cpp's macOS builds
+# reference @rpath/libggml.0.dylib, and //go:embed cannot carry the symlinks
+# that the release tarball uses for the unversioned names.
+V=b10901
+curl -sfL "https://github.com/ggml-org/llama.cpp/releases/download/$V/llama-$V-bin-macos-arm64.tar.gz" \
+    | tar xz -C /tmp
+mkdir -p internal/nativelib/libs/darwin_arm64_$V
+for f in libllama libggml libggml-base libggml-cpu libggml-blas libggml-metal libggml-rpc libmtmd; do
+    cp -L /tmp/llama-$V/$f.0.dylib internal/nativelib/libs/darwin_arm64_$V/
+done
 
 # The libraries end up inside the binary
 go build -o kinfer ./cmd/kinfer
@@ -186,17 +192,41 @@ go build -o kinfer ./cmd/kinfer
 
 ## Measured on M-series (Qwen2.5-0.5B Q4_K_M)
 
-Generation, 200 tokens, Metal, best of five (the machine is noisy — slow runs
-dip by a third):
+This machine's throughput drifts by tens of percent over a session, so a number
+measured on its own says very little. Everything below is measured against
+Ollama 0.34.0 running on the same machine at the same time — same GGUF, same
+prompt, both over HTTP, greedy, 200 tokens, five interleaved rounds.
 
-| | before | after |
+**Sampling used to cost two thirds of the throughput and now costs nothing.**
+The pipeline runs inside llama.cpp over its own logit buffer, doing partial
+selection rather than sorting all 151,936 candidates in Go. Sampled generation
+went from 44.7 tok/s to the same speed as taking the argmax.
+
+**Upgrading llama.cpp b6862 → b10901 bought nothing measurable.** Normalising
+against Ollama to cancel the drift, the net is between −2% (median) and +8%
+(best) — inside the noise. The upgrade is kept for eleven months of upstream
+fixes, and because it proved the struct assertions work, not for speed. An
+earlier +16% claim here was wrong: it compared runs from different sessions,
+which on this machine is not a measurement.
+
+**kinfer decodes 23–32% slower than Ollama, and is far more sensitive to machine
+state:**
+
+| | median | best |
 |---|---|---|
-| sampled (temp 0.7, top-k 40, top-p 0.95, penalty 1.1) | 44.7 tok/s | **150.0 tok/s** |
-| greedy (temp 0) | 145.6 tok/s | 151.1 tok/s |
+| Ollama 0.34.0 | 175.7 | 177.3 tok/s |
+| kinfer | 120.2 | 136.0 tok/s |
 
-Sampling used to cost two thirds of the throughput and now costs nothing: the
-pipeline runs inside llama.cpp over its own logit buffer, doing partial
-selection rather than sorting all 151,936 candidates in Go.
+Ollama holds ±2% across rounds where kinfer swings by a third. That sensitivity
+is unexplained. Ruled out so far: Go's GC, GOMAXPROCS, `n_batch`, and Go-side
+detokenisation and string handling — `cmd/probe` times decode alone as well as
+wall clock, and the two agree to 0.3% — plus the Metal feature flags, which read
+identically on both (`fusion`, `concurrency`, `graph optimize` all on).
+
+**Ollama runs one request at a time.** Eight concurrent requests take eight
+times as long as one, aggregate throughput pinned at 165 tok/s, and its log only
+ever shows `slot id 0`. Still true in 0.34.0. Per-stream speed is the smaller of
+the two opportunities.
 
 Model load is 0.49 s warm. The first Metal run on a machine pays a one-off ~5 s
 for shader compilation, which macOS then caches — every later process, not just

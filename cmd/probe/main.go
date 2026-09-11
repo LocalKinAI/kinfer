@@ -140,6 +140,14 @@ func main() {
 	var firstTokenAt time.Duration
 	generated := 0
 
+	// Time decode+sample apart from the wall clock.
+	//
+	// Ollama reports eval_count/eval_duration, which is llama.cpp's own timer
+	// around the forward pass. Comparing that against kinfer's wall clock would
+	// flatter Ollama by whatever detokenisation and string handling cost here,
+	// so measure both and say which is which.
+	var decodeTime time.Duration
+
 	// Streaming detokenization.
 	//
 	// llama_token_to_piece already returns decoded text, but emitting each
@@ -152,6 +160,7 @@ func main() {
 	stopped := false
 
 	for i := 0; i < *maxTokens; i++ {
+		tStep := time.Now()
 		if err := llama.DecodeTokens(lctx, cur); err != nil {
 			fmt.Println()
 			fatal("Decode failed at token %d: %v", i, err)
@@ -160,6 +169,7 @@ func main() {
 		// Sampling runs inside llama.cpp over its own logit buffer — no copy
 		// of the 151,936-entry row crosses into Go.
 		tok := sampler.Sample(lctx)
+		decodeTime += time.Since(tStep)
 		if llama.IsEOG(vocab, tok) {
 			stopped = true
 			break
@@ -200,7 +210,11 @@ func main() {
 	fmt.Printf("  generated      : %d tokens%s\n", generated,
 		map[bool]string{true: " (hit stop marker)", false: " (hit -n limit)"}[stopped])
 	fmt.Printf("  time to first  : %.2fs\n", firstTokenAt.Seconds())
-	fmt.Printf("  throughput     : %.1f tok/s\n", float64(generated)/genSec)
+	fmt.Printf("  throughput     : %.1f tok/s  (wall clock, everything included)\n", float64(generated)/genSec)
+	if decodeTime > 0 {
+		fmt.Printf("  decode only    : %.1f tok/s  (forward pass + sampling, comparable to Ollama's eval_duration)\n",
+			float64(generated)/decodeTime.Seconds())
+	}
 	fmt.Printf("  model load     : %.2fs\n", loadSec)
 	if generated > 0 {
 		fmt.Printf("\n  ✅ PHASE 0 PASS — pure-Go inference works end to end.\n")

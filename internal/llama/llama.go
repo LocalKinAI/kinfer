@@ -10,10 +10,14 @@
 // llama_vocab_get_text where it meant llama_token_to_piece, and accepted a
 // library path it then discarded.
 //
-// The whole surface kinfer needs is about twenty entry points, so binding them
+// The whole surface kinfer needs is about thirty entry points, so binding them
 // here costs less than working around a mirror that drifts. Every struct below
-// is transcribed from llama.h at the build embedded in internal/nativelib, and
-// Open verifies the layout at runtime rather than trusting this comment.
+// is transcribed from llama.h at the build embedded in internal/nativelib
+// (b10901), and Open verifies the layout at runtime rather than trusting this
+// comment. Both param structs changed shape between b6862 and b10901 — three
+// new fields in one, two removed and two added in the other — and the size
+// assertions in bind caught it before a single call was made. That is the whole
+// point of having them.
 //
 // Still no CGO: purego resolves symbols at runtime, so cross-compilation from a
 // Mac keeps working. Struct arguments and returns go through purego directly —
@@ -58,12 +62,14 @@ type SamplerChainParams struct {
 	NoPerf uint8
 }
 
-// ModelParams mirrors struct llama_model_params (72 bytes).
+// ModelParams mirrors struct llama_model_params (80 bytes).
 type ModelParams struct {
 	Devices              uintptr
 	TensorBuftOverrides  uintptr
 	NGpuLayers           int32
 	SplitMode            int32
+	LoadMode             int32
+	LazyMode             int32
 	MainGpu              int32
 	_                    int32 // padding before the next pointer
 	TensorSplit          uintptr
@@ -71,25 +77,29 @@ type ModelParams struct {
 	ProgressCallbackData uintptr
 	KvOverrides          uintptr
 	VocabOnly            uint8
-	UseMmap              uint8
-	UseMlock             uint8
 	CheckTensors         uint8
 	UseExtraBufts        uint8
 	NoHost               uint8
+	NoAlloc              uint8
+	LoadMtp              uint8
 }
 
-// ContextParams mirrors struct llama_context_params (120 bytes).
+// ContextParams mirrors struct llama_context_params (160 bytes).
 //
 // This is the struct gollama got wrong. The first field is n_ctx — there is no
 // seed here; sampling owns the seed now.
 type ContextParams struct {
-	NCtx          uint32
-	NBatch        uint32
-	NUbatch       uint32
-	NSeqMax       uint32
-	NThreads      int32
-	NThreadsBatch int32
+	NCtx              uint32
+	NBatch            uint32
+	NUbatch           uint32
+	NSeqMax           uint32
+	NRsSeq            uint32
+	NOutputsMax       uint32
+	NOutputsMaxPerSeq uint32
+	NThreads          int32
+	NThreadsBatch     int32
 
+	CtxType         int32
 	RopeScalingType int32
 	PoolingType     int32
 	AttentionType   int32
@@ -119,6 +129,11 @@ type ContextParams struct {
 	OpOffload  uint8
 	SwaFull    uint8
 	KVUnified  uint8
+	_          [2]uint8 // padding before the next pointer
+
+	Samplers  uintptr
+	NSamplers uint64
+	CtxOther  uintptr
 }
 
 // Batch mirrors struct llama_batch (56 bytes): one unit of work for a decode.
@@ -202,8 +217,8 @@ func bind(dir string) error {
 		got  uintptr
 		want uintptr
 	}{
-		{"llama_model_params", unsafe.Sizeof(ModelParams{}), 72},
-		{"llama_context_params", unsafe.Sizeof(ContextParams{}), 120},
+		{"llama_model_params", unsafe.Sizeof(ModelParams{}), 80},
+		{"llama_context_params", unsafe.Sizeof(ContextParams{}), 160},
 		{"llama_batch", unsafe.Sizeof(Batch{}), 56},
 		{"llama_sampler_chain_params", unsafe.Sizeof(SamplerChainParams{}), 1},
 	} {
@@ -493,13 +508,18 @@ func SamplerReset(s Sampler) { samplerReset(s) }
 // SamplerFree releases a sampler and, for a chain, everything in it.
 func SamplerFree(s Sampler) { samplerFree(s) }
 
+// libName is the file to dlopen. It is the versioned soname, not the plain
+// one: llama.cpp's own macOS builds reference @rpath/libggml.0.dylib, so the
+// unpacked directory has to carry the names its DT_NEEDED entries actually ask
+// for. The unversioned libllama.dylib in the release tarball is a symlink, and
+// //go:embed cannot carry symlinks — every file here is a real copy.
 func libName() string {
 	switch runtime.GOOS {
 	case "darwin":
-		return "libllama.dylib"
+		return "libllama.0.dylib"
 	case "windows":
 		return "llama.dll"
 	default:
-		return "libllama.so"
+		return "libllama.so.0"
 	}
 }

@@ -14,7 +14,8 @@
 //
 // Populate libs/ before building:
 //
-//	go run github.com/dianlight/gollama.cpp/cmd/gollama-download@v0.2.2-llamacpp.b6862 -download -copy-libs
+//	see README's Build section — the libraries come straight from a llama.cpp
+//	release tarball, copied under their versioned sonames
 package nativelib
 
 import (
@@ -62,7 +63,7 @@ func prepare() (string, error) {
 
 	files, err := fs.ReadDir(embedded, path("libs", platform))
 	if err != nil {
-		return "", fmt.Errorf("no embedded libraries for %s/%s: run `gollama-download@v0.2.2-llamacpp.b6862 -download -copy-libs` and rebuild: %w",
+		return "", fmt.Errorf("no embedded libraries for %s/%s: see the Build section of README.md and rebuild: %w",
 			runtime.GOOS, runtime.GOARCH, err)
 	}
 
