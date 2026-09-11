@@ -566,6 +566,50 @@ content     ""
 thinking    "The user is asking about the weather in Berlin. I have a tool available…"
 ```
 
+## What a reply cost
+
+Every reply carries the counts and timings Ollama reports, under the same names
+and in the same integer nanoseconds. Everything that measures a local model
+reads these and none of it asks kinfer how it spells them — `ollama run
+--verbose`, benchmark scripts, dashboards. Reporting nothing does not read as
+fast, it reads as unmeasurable, and leaves a stopwatch as the only way to
+compare kinfer against the runtime it stands in for.
+
+```
+POST /api/chat  {"stream": false, …}
+
+{"message": …, "done": true, "done_reason": "stop",
+ "total_duration": 637676958, "load_duration": 507375,
+ "prompt_eval_count": 15,    "prompt_eval_duration": 19558000,
+ "eval_count": 101,          "eval_duration": 617452708}
+```
+
+`eval_count / eval_duration` is the tokens-per-second figure all of those tools
+quote — 163.6 tok/s for the reply above, an M4 running Qwen2.5-0.5B. Streaming
+carries them on the final `done` object only, as Ollama does. The OpenAI dialect
+reports the same counts as `usage`, and on a stream when
+`stream_options: {"include_usage": true}` asks for them.
+
+`prompt_eval_duration` ends at the first sampled token and `eval_duration` starts
+there, which is where Ollama draws the line: prefill is in one and generation in
+the other, never both. Getting that boundary right needs `llama_synchronize`,
+because `llama_decode` queues the forward pass and returns while the GPU is still
+working — llama.cpp waits at the first read of the logits, inside the sampler.
+Timed without it, the same M4 that prefills at 3,400 tok/s reported a 209-token
+prompt processed in 2.9 ms — 71,000 tok/s, which the hardware cannot do — and the
+single token sampled from it as having taken 60 ms. One measurement was short by
+exactly what the other was long.
+
+Two honest surprises remain in the numbers:
+
+- Under concurrency these are wall clock, not exclusive GPU time. A request
+  shares every forward pass with the other busy slots, so its `eval_duration`
+  counts their tokens too. That is what the caller waited, and what Ollama
+  reports as well.
+- A [pooled prefix](#prefix-pool) leaves `prompt_eval_count` unchanged while
+  `prompt_eval_duration` collapses. The tokens really were in the prompt; they
+  just did not have to be prefilled again.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary

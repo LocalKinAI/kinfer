@@ -88,12 +88,9 @@ type job struct {
 	err   error
 	done  chan struct{}
 
-	// truncated records that the reply stopped because it ran out of budget
-	// rather than because the model finished. Reporting the two the same way
-	// tells a caller a cut-off answer is complete — and a reasoning model that
-	// spends its whole budget thinking returns nothing at all, which is
-	// baffling unless the reason is given.
-	truncated bool
+	// stats is what was counted and measured while answering. The scheduler
+	// fills it in before finish, so it is only read after frags is closed.
+	stats Stats
 }
 
 func (j *job) finish(err error) {
@@ -122,6 +119,15 @@ type slot struct {
 	emitted int
 	nGen    int
 	maxGen  int
+
+	// admitted is when this slot took the job and began prefilling; evalStart
+	// is when the first token was sampled, which is the instant prefill ended
+	// and generation began. The gap between them is prompt evaluation, and
+	// everything after evalStart is decoding — the split Ollama reports and
+	// every tokens-per-second figure divides by.
+	admitted   time.Time
+	evalStart  time.Time
+	promptEval time.Duration
 
 	// logitIdx is where this slot's logits landed in the batch just decoded,
 	// or -1 when it contributed no token whose output was requested.
@@ -297,6 +303,9 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	sl.emitted = 0
 	sl.out.Reset()
 	sl.logitIdx = -1
+	sl.admitted = time.Now()
+	sl.evalStart = time.Time{}
+	sl.promptEval = 0
 	sl.sampler = sampling.New(j.params.Params)
 }
 
@@ -358,6 +367,24 @@ func (s *scheduler) step() error {
 		return err
 	}
 
+	// Take the time only when something is about to be sampled. A step that
+	// carried nothing but prompt chunks has no logits to read and no boundary
+	// to record, and making the GPU finish for it would stall a pipeline the
+	// next decode simply continues.
+	var now time.Time
+	if s.harvesting() {
+		// Decode queues the forward pass and returns before the GPU is done;
+		// llama.cpp waits at the first read of the logits, which is inside
+		// Sample. Timing the decode without this charges that wait to the
+		// measurement *after* the one it belongs to — a 509-token prefill
+		// timed at 5 ms and the single token sampled from it at 36, which is
+		// the wrong answer twice. Sampling is about to block on precisely this
+		// wait, so asking for it here costs nothing and gives every slot in the
+		// batch the same instant rather than the order this loop visits them.
+		llama.Synchronize(s.lctx)
+		now = time.Now()
+	}
+
 	for _, sl := range s.slots {
 		if sl.job == nil {
 			continue
@@ -367,10 +394,21 @@ func (s *scheduler) step() error {
 			s.pool.publish(sl.seq, sl.prompt)
 		}
 		if sl.logitIdx >= 0 {
-			s.harvest(sl)
+			s.harvest(sl, now)
 		}
 	}
 	return nil
+}
+
+// harvesting reports whether the batch just decoded produced logits for any
+// slot, which is what makes this step worth timing and synchronising.
+func (s *scheduler) harvesting() bool {
+	for _, sl := range s.slots {
+		if sl.job != nil && sl.logitIdx >= 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // addPrefill queues the next chunk of a slot's prompt.
@@ -418,9 +456,20 @@ func (s *scheduler) addDecode(sl *slot) {
 }
 
 // harvest samples a slot's next token and decides whether it is finished.
-func (s *scheduler) harvest(sl *slot) {
+//
+// now is when the decode these logits came from finished.
+func (s *scheduler) harvest(sl *slot, now time.Time) {
 	idx := sl.logitIdx
 	sl.logitIdx = -1
+
+	if sl.evalStart.IsZero() {
+		// First logits for this slot, so the prompt is fully in the cache and
+		// prefill is over. addPrefill asks for logits only on the prompt's last
+		// token, and the prefix pool never adopts a whole prompt, so this
+		// really is the boundary and not a chunk boundary.
+		sl.promptEval = now.Sub(sl.admitted)
+		sl.evalStart = now
+	}
 
 	tok := sl.sampler.Sample(s.lctx, idx)
 	if llama.IsEOG(s.vocab, tok) {
@@ -462,7 +511,7 @@ func (s *scheduler) harvest(sl *slot) {
 		return
 	}
 	if sl.nGen >= sl.maxGen || int(sl.nPast) >= s.ctxPerSeq {
-		sl.job.truncated = true
+		sl.job.stats.Truncated = true
 		s.finishSlot(sl)
 	}
 }
@@ -493,10 +542,24 @@ func (s *scheduler) release(sl *slot, err error) {
 		sl.sampler.Close()
 		sl.sampler = nil
 	}
+
+	// Every ending comes through here — the model stopping, the budget running
+	// out, a cancelled request, a dead backend — so this is the one place the
+	// measurements have to be handed over. A request that died during prefill
+	// reports its prompt and a zero eval, which is what happened.
+	sl.job.stats.PromptTokens = len(sl.prompt)
+	sl.job.stats.EvalTokens = sl.nGen
+	sl.job.stats.PromptEvalDuration = sl.promptEval
+	if !sl.evalStart.IsZero() {
+		sl.job.stats.EvalDuration = time.Since(sl.evalStart)
+	}
+
 	sl.job.finish(err)
 	sl.job = nil
 	sl.prompt = nil
 	sl.logitIdx = -1
+	sl.admitted = time.Time{}
+	sl.evalStart = time.Time{}
 	sl.out.Reset()
 }
 

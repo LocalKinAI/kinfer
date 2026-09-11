@@ -32,6 +32,14 @@ type fakeEngine struct {
 	truncated bool
 	broken    bool
 
+	// What ChatFull reports as measurements. The eval count is not among them:
+	// it is counted from the fragments actually emitted, so a handler that
+	// invents a number or drops the real one fails here instead of agreeing
+	// with a constant.
+	promptTokens int
+	promptEval   time.Duration
+	evalDur      time.Duration
+
 	mu     sync.Mutex
 	closed bool
 	inChat bool
@@ -86,9 +94,21 @@ func (f *fakeEngine) Broken() bool {
 	return f.broken
 }
 
-func (f *fakeEngine) ChatFull(ctx context.Context, m []chat.Message, p engine.GenParams, onToken func(string)) (string, bool, error) {
-	text, err := f.Chat(ctx, m, p, onToken)
-	return text, f.truncated, err
+func (f *fakeEngine) ChatFull(ctx context.Context, m []chat.Message, p engine.GenParams, onToken func(string)) (string, engine.Stats, error) {
+	generated := 0
+	text, err := f.Chat(ctx, m, p, func(frag string) {
+		generated++
+		if onToken != nil {
+			onToken(frag)
+		}
+	})
+	return text, engine.Stats{
+		Truncated:          f.truncated,
+		PromptTokens:       f.promptTokens,
+		EvalTokens:         generated,
+		PromptEvalDuration: f.promptEval,
+		EvalDuration:       f.evalDur,
+	}, err
 }
 
 func (f *fakeEngine) ToolFormat() tools.Format {
@@ -525,4 +545,151 @@ func TestBrokenEngineIsReplaced(t *testing.T) {
 	if !first.isClosed() {
 		t.Error("the broken engine was retired without being closed")
 	}
+}
+
+// timedFake is the fake engine with measurements attached: four fragments of
+// reply, an eleven-token prompt, and durations far enough apart that a swapped
+// pair of fields shows up as a wrong number rather than a plausible one.
+func timedFake(path string) *fakeEngine {
+	return &fakeEngine{
+		path:         path,
+		frags:        []string{"four", " tokens", " of", " reply"},
+		promptTokens: 11,
+		promptEval:   2 * time.Millisecond,
+		evalDur:      5 * time.Millisecond,
+	}
+}
+
+// TestOllamaChatReportsTimings guards the fields every measurement of a local
+// model reads: `ollama run --verbose`, benchmark scripts, dashboards. All of
+// them divide eval_count by eval_duration, and kinfer answered both as zero —
+// which does not read as fast, it reads as unmeasurable, leaving a stopwatch as
+// the only way to compare kinfer to the runtime it stands in for.
+func TestOllamaChatReportsTimings(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	defer srv.Close()
+
+	fake := timedFake("alpha")
+	srv.open = func(path string, _ engine.Options) (generator, error) { return fake, nil }
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	got := decodeTimings(t, rec.Body.Bytes())
+
+	if got.EvalCount == 0 || got.EvalDuration == 0 {
+		t.Fatalf("reply reports %d tokens in %d ns: a caller computing tokens/s gets nothing\n%s",
+			got.EvalCount, got.EvalDuration, rec.Body)
+	}
+	if want := len(fake.frags); got.EvalCount != want {
+		t.Errorf("eval_count = %d but the model generated %d tokens", got.EvalCount, want)
+	}
+	// Nanoseconds, not milliseconds. Every consumer assumes the unit rather
+	// than asking, so being off by a thousand is a wrong benchmark rather than
+	// a broken one.
+	if want := (5 * time.Millisecond).Nanoseconds(); got.EvalDuration != want {
+		t.Errorf("eval_duration = %d, want %d — Ollama reports integer nanoseconds", got.EvalDuration, want)
+	}
+	if got.PromptEvalCount != 11 {
+		t.Errorf("prompt_eval_count = %d, want 11", got.PromptEvalCount)
+	}
+	if want := (2 * time.Millisecond).Nanoseconds(); got.PromptEvalDuration != want {
+		t.Errorf("prompt_eval_duration = %d, want %d ns", got.PromptEvalDuration, want)
+	}
+	if got.TotalDuration <= 0 {
+		t.Errorf("total_duration = %d; the request took longer than no time at all", got.TotalDuration)
+	}
+}
+
+// TestOllamaStreamReportsTimingsOnDoneChunk covers the path `ollama run`
+// actually uses. Ollama puts the counts on the terminal object only, so a
+// streaming client that never sees them there never sees them at all.
+func TestOllamaStreamReportsTimingsOnDoneChunk(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	defer srv.Close()
+
+	fake := timedFake("alpha")
+	srv.open = func(path string, _ engine.Options) (generator, error) { return fake, nil }
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(body)))
+
+	lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	final := decodeTimings(t, []byte(lines[len(lines)-1]))
+	if !final.Done {
+		t.Fatalf("last streamed object is not the done object:\n%s", rec.Body)
+	}
+	if final.EvalCount != len(fake.frags) || final.EvalDuration == 0 {
+		t.Errorf("done chunk reports %d tokens in %d ns, want %d tokens and a duration:\n%s",
+			final.EvalCount, final.EvalDuration, len(fake.frags), rec.Body)
+	}
+
+	// The per-token objects stay slim, as Ollama's do: counts belong to the end
+	// of the reply, and repeating a running total on every token would be a
+	// different protocol.
+	for i, line := range lines[:len(lines)-1] {
+		if strings.Contains(line, "eval_count") {
+			t.Errorf("streamed object %d carries counts before the reply ended: %s", i, line)
+		}
+	}
+}
+
+// TestOpenAIChatReportsUsage covers the other dialect's name for the same
+// thing. Clients bill, budget and trim context against usage; all-zero tells
+// them the conversation cost nothing, which they believe.
+func TestOpenAIChatReportsUsage(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	defer srv.Close()
+
+	fake := timedFake("alpha")
+	srv.open = func(path string, _ engine.Options) (generator, error) { return fake, nil }
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Usage.PromptTokens != 11 || out.Usage.CompletionTokens != len(fake.frags) {
+		t.Errorf("usage = %+v, want 11 prompt and %d completion tokens:\n%s",
+			out.Usage, len(fake.frags), rec.Body)
+	}
+	if want := out.Usage.PromptTokens + out.Usage.CompletionTokens; out.Usage.TotalTokens != want {
+		t.Errorf("total_tokens = %d but prompt + completion is %d", out.Usage.TotalTokens, want)
+	}
+}
+
+type wireTimings struct {
+	Done               bool  `json:"done"`
+	TotalDuration      int64 `json:"total_duration"`
+	LoadDuration       int64 `json:"load_duration"`
+	PromptEvalCount    int   `json:"prompt_eval_count"`
+	PromptEvalDuration int64 `json:"prompt_eval_duration"`
+	EvalCount          int   `json:"eval_count"`
+	EvalDuration       int64 `json:"eval_duration"`
+}
+
+func decodeTimings(t *testing.T, body []byte) wireTimings {
+	t.Helper()
+	var w wireTimings
+	if err := json.Unmarshal(body, &w); err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	return w
 }

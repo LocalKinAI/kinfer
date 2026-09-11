@@ -165,6 +165,7 @@ var (
 	initFromModel      func(m Model, p ContextParams) Context
 	freeContext        func(c Context)
 	decode             func(c Context, b Batch) int32
+	synchronize        func(c Context)
 	batchGetOne        func(tokens *Token, n int32) Batch
 	getLogitsIth       func(c Context, i int32) *float32
 	getMemory          func(c Context) Memory
@@ -263,6 +264,7 @@ func bind(dir string) error {
 		{&initFromModel, "llama_init_from_model"},
 		{&freeContext, "llama_free"},
 		{&decode, "llama_decode"},
+		{&synchronize, "llama_synchronize"},
 		{&batchGetOne, "llama_batch_get_one"},
 		{&getLogitsIth, "llama_get_logits_ith"},
 		{&getMemory, "llama_get_memory"},
@@ -477,6 +479,17 @@ func Decode(c Context, b Batch) error {
 	}
 	return nil
 }
+
+// Synchronize waits for a queued forward pass to actually finish.
+//
+// Decode does not wait. It builds the graph, hands it to the backend and
+// returns, and on Metal the GPU is still working when it does; llama.cpp settles
+// up at the first read of the results, inside llama_get_logits_ith. That is
+// invisible to a caller who only wants the tokens — the logits are correct
+// either way — and wrong for one holding a stopwatch, because the wait is
+// charged to whatever happens to read the logits rather than to the decode that
+// caused it.
+func Synchronize(c Context) { synchronize(c) }
 
 // Logits returns the logit row for position i (-1 means the last token). The
 // slice aliases llama.cpp's own buffer and is only valid until the next Decode.
