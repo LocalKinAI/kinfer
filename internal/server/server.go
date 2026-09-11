@@ -87,6 +87,7 @@ type lease struct {
 type generator interface {
 	Chat(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, error)
 	ChatFull(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, bool, error)
+	Broken() bool
 	ToolFormat() tools.Format
 	Close()
 }
@@ -216,6 +217,15 @@ func (s *Server) acquire(name string) (generator, func(), error) {
 	defer s.mu.Unlock()
 
 	for {
+		// A model whose backend failed fatally cannot generate again. Handing
+		// it out would answer every request with the same error, which for a
+		// fallback runtime means being down without saying so. Retire it and
+		// load a fresh one.
+		if s.cur != nil && s.cur.eng.Broken() {
+			log.Printf("retiring %s: its llama.cpp backend failed fatally", s.cur.path)
+			s.retireLocked()
+		}
+
 		if s.cur != nil && s.cur.path == path {
 			l := s.cur
 			l.refs++

@@ -442,11 +442,38 @@ func DecodeTokens(c Context, tokens []Token) error {
 	return err
 }
 
+// DecodeError is a failed forward pass, carrying llama.cpp's own code so a
+// caller can tell a bad request from a broken context.
+type DecodeError struct{ Code int32 }
+
+func (e *DecodeError) Error() string {
+	switch {
+	case e.Code == 1:
+		return "no free KV slot for this batch (the context is full)"
+	case e.Code == 2:
+		return "generation was aborted"
+	case e.Code == -1:
+		return "invalid batch"
+	default:
+		return fmt.Sprintf("llama.cpp backend failed (code %d)", e.Code)
+	}
+}
+
+// Fatal reports whether the context is unusable from here on.
+//
+// llama.h draws the line at -1: below it the failure is fatal and the
+// half-processed batch stays in the context's memory. In practice this is a
+// Metal command buffer that ran out of GPU memory, after which every later
+// decode returns the same error — "backend is in error state from a previous
+// command buffer failure - recreate the backend to recover". Nothing short of a
+// new context recovers, so a caller that keeps using this one serves errors
+// forever.
+func (e *DecodeError) Fatal() bool { return e.Code < -1 }
+
 // Decode runs one forward pass.
 func Decode(c Context, b Batch) error {
 	if rc := decode(c, b); rc != 0 {
-		// 1 means "no KV slot"; llama.cpp prints the detail to stderr.
-		return fmt.Errorf("llama_decode failed with code %d", rc)
+		return &DecodeError{Code: rc}
 	}
 	return nil
 }

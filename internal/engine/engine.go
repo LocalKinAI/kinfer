@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/llama"
@@ -115,6 +116,11 @@ type Engine struct {
 	slots int
 
 	sched *scheduler
+
+	// broken is set when llama.cpp reports a fatal decode. The context cannot
+	// be used again, so the server discards this engine rather than serving
+	// the same error to every request that follows.
+	broken atomic.Bool
 }
 
 // Open loads a GGUF file.
@@ -211,11 +217,17 @@ func Open(path string, opts Options) (*Engine, error) {
 		slots: slots,
 	}
 	e.sched = newScheduler(lctx, vocab, tpl, slots, prefix, e.nCtx, batchCapacity)
+	e.sched.onFatal = func() { e.broken.Store(true) }
 	return e, nil
 }
 
 // Slots is how many conversations this engine serves at once.
 func (e *Engine) Slots() int { return e.slots }
+
+// Broken reports that llama.cpp's backend failed fatally and this engine can no
+// longer generate. The usual cause is the GPU running out of memory, after
+// which every decode returns the same error until the context is recreated.
+func (e *Engine) Broken() bool { return e.broken.Load() }
 
 // Close stops the scheduler and releases the model and its context.
 func (e *Engine) Close() {

@@ -55,6 +55,10 @@ type scheduler struct {
 	slots []*slot
 	pool  *prefixPool
 
+	// onFatal is called when llama.cpp's backend fails unrecoverably, so the
+	// engine can be marked unusable and replaced rather than kept in service.
+	onFatal func()
+
 	incoming chan *job
 	stop     chan struct{}
 	stopped  chan struct{}
@@ -196,6 +200,20 @@ func (s *scheduler) run() {
 				if sl.job != nil {
 					s.release(sl, err)
 				}
+			}
+
+			var de *llama.DecodeError
+			if errors.As(err, &de) && de.Fatal() {
+				// The context is finished. Serving from it would return this
+				// same error to every request from now on, which for a fallback
+				// runtime means it is down without saying so.
+				log.Printf("llama.cpp backend failed fatally (%v) — retiring this model; "+
+					"the next request reloads it", err)
+				if s.onFatal != nil {
+					s.onFatal()
+				}
+				s.drain()
+				return
 			}
 		}
 	}

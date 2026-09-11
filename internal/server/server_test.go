@@ -30,6 +30,7 @@ type fakeEngine struct {
 
 	tools     bool
 	truncated bool
+	broken    bool
 
 	mu     sync.Mutex
 	closed bool
@@ -77,6 +78,12 @@ func (f *fakeEngine) Chat(ctx context.Context, _ []chat.Message, _ engine.GenPar
 		out.WriteString(frag)
 	}
 	return out.String(), f.err
+}
+
+func (f *fakeEngine) Broken() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.broken
 }
 
 func (f *fakeEngine) ChatFull(ctx context.Context, m []chat.Message, p engine.GenParams, onToken func(string)) (string, bool, error) {
@@ -460,5 +467,62 @@ func TestCompleteReplyReportsStop(t *testing.T) {
 
 	if !strings.Contains(rec.Body.String(), `"done_reason":"stop"`) {
 		t.Errorf("a complete reply did not report stop:\n%s", rec.Body.String())
+	}
+}
+
+// TestBrokenEngineIsReplaced is the regression test for a GPU that ran out of
+// memory. llama.cpp's Metal backend enters an error state that no later decode
+// recovers from — "recreate the backend to recover" — so a server that keeps
+// the context answers every request from then on with the same error. For a
+// runtime whose job is to be the fallback, that is being down without saying so.
+func TestBrokenEngineIsReplaced(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	defer srv.Close()
+
+	var loads int
+	var mu sync.Mutex
+	first := &fakeEngine{path: "alpha", frags: []string{"ok"}, broken: true}
+
+	srv.open = func(path string, _ engine.Options) (generator, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		loads++
+		if loads == 1 {
+			return first, nil
+		}
+		return &fakeEngine{path: path, frags: []string{"ok"}}, nil
+	}
+
+	// The first acquire loads the engine that is about to break.
+	eng, release, err := srv.acquire("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if !eng.Broken() {
+		t.Fatal("the test engine did not report itself broken")
+	}
+
+	// The next one must not be handed the same dead engine.
+	eng2, release2, err := srv.acquire("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release2()
+
+	if eng2 == generator(first) {
+		t.Error("a broken engine was handed out again; every request would fail identically")
+	}
+	if eng2.Broken() {
+		t.Error("the replacement is broken too")
+	}
+	mu.Lock()
+	got := loads
+	mu.Unlock()
+	if got != 2 {
+		t.Errorf("the model was loaded %d times, want 2 — the broken one should have been replaced", got)
+	}
+	if !first.isClosed() {
+		t.Error("the broken engine was retired without being closed")
 	}
 }
