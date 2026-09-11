@@ -622,8 +622,18 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
+// handleOllamaTags lists everything this server can answer for, which is not the
+// same as everything it can load.
+//
+// It used to be List — kinfer's own directory — and a caller checking the list
+// before choosing a model concluded that cloud models were unavailable and went
+// to its own fallback, while kinfer was in fact forwarding them perfectly well.
+// Observed against a real LocalKin soul: "4 models available", then "fallback
+// mode", for a request kinfer then served. A server that can do a thing and
+// says it cannot is the same class of wrong answer as one that says it can and
+// cannot.
 func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
-	models, err := s.store.List()
+	models, err := s.store.All()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
