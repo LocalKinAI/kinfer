@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
@@ -26,14 +27,20 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer pull <repo>[:quant]   download a model from Hugging Face
   kinfer list                  show installed models
   kinfer rm <model>            delete a model
-  kinfer run <model> [prompt]  generate once from the command line
+  kinfer run <model> [prompt]  chat with a model (no prompt = interactive)
+  kinfer ps                    show which model is loaded right now
   kinfer serve                 serve models over HTTP
   kinfer fit                   what this machine can actually run
 
 Examples:
   kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
-  kinfer run qwen "explain merkle trees"
+  kinfer run qwen                        # interactive, model stays warm
+  kinfer run qwen "explain merkle trees" # one shot, same warm model
   kinfer serve -addr :11500
+
+run starts a background daemon on first use and reuses it afterwards, so the
+model is loaded once rather than once per command. kinfer ps shows what it is
+holding; -local skips the daemon and loads in-process instead.
 `
 
 func main() {
@@ -52,6 +59,8 @@ func main() {
 		err = cmdRemove(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "ps":
+		err = cmdPS(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
 	case "fit":
@@ -169,6 +178,9 @@ func cmdRun(args []string) error {
 	nCtx := fs.Int("ctx", 4096, "context size in tokens")
 	system := fs.String("system", "", "system prompt")
 	maxTok := fs.Int("n", 512, "maximum tokens to generate")
+	addr := fs.String("addr", defaultAddr, "daemon address")
+	keepAlive := fs.Duration("keepalive", 5*time.Minute, "how long the daemon keeps an idle model loaded")
+	local := fs.Bool("local", false, "load the model in this process instead of using a daemon")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -176,41 +188,158 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("usage: kinfer run <model> [prompt]")
 	}
 
-	st, err := store.Open()
-	if err != nil {
-		return err
+	model := fs.Arg(0)
+	rest := fs.Args()[1:]
+
+	// Everything after the model name is the prompt, verbatim — a prompt is
+	// allowed to contain anything, including text that looks like a flag. The
+	// cost is that trailing flags are NOT parsed: Go's flag package stops at
+	// the first positional argument, so `run qwen "hi" -n 20` would quietly ask
+	// the model about "-n 20". Refuse that instead of asking a question nobody
+	// typed. Quoted prompts are unaffected: "what does -n mean" is one argument
+	// and never equals "-n".
+	if bad := strayFlag(fs, rest); bad != "" {
+		return fmt.Errorf("%s looks like a flag but comes after the model name, "+
+			"so it would be sent to the model as text\n"+
+			"       put flags first: kinfer run %s <model> [prompt]", bad, bad)
 	}
-	path, err := st.Resolve(fs.Arg(0))
+	prompt := strings.Join(rest, " ")
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	if *local {
+		return runLocal(ctx, model, prompt, *system, *ngl, *nCtx, *maxTok)
+	}
+
+	base, err := ensureDaemon(*addr, *ngl, *nCtx, *keepAlive)
 	if err != nil {
 		return err
 	}
 
-	eng, err := engine.Open(path, engine.Options{GPULayers: *ngl, ContextSize: *nCtx})
+	if prompt == "" {
+		return repl(ctx, base, model, *system, *maxTok)
+	}
+
+	var msgs []clientMsg
+	if *system != "" {
+		msgs = append(msgs, clientMsg{Role: "system", Content: *system})
+	}
+	msgs = append(msgs, clientMsg{Role: "user", Content: prompt})
+
+	_, err = streamChat(ctx, base, model, msgs, *maxTok, os.Stdout)
+	fmt.Println()
+	return err
+}
+
+// strayFlag returns the first argument that names a flag this command defines.
+func strayFlag(fs *flag.FlagSet, args []string) string {
+	defined := map[string]bool{}
+	fs.VisitAll(func(f *flag.Flag) { defined[f.Name] = true })
+	for _, a := range args {
+		name := strings.TrimLeft(a, "-")
+		if name == a || name == "" {
+			continue // not flag-shaped
+		}
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		if defined[name] {
+			return a
+		}
+	}
+	return ""
+}
+
+// runLocal loads the model in this process — no daemon, nothing left running.
+//
+// Kept because it is the only way to get llama.cpp's own stderr in front of
+// you, which is what you want when the question is "why did this model fail to
+// load" rather than "what does this model say".
+func runLocal(ctx context.Context, model, prompt, system string, ngl, nCtx, maxTok int) error {
+	if prompt == "" {
+		return fmt.Errorf("-local needs a prompt (interactive mode requires the daemon)")
+	}
+
+	st, err := store.Open()
+	if err != nil {
+		return err
+	}
+	path, err := st.Resolve(model)
+	if err != nil {
+		return err
+	}
+
+	eng, err := engine.Open(path, engine.Options{GPULayers: ngl, ContextSize: nCtx})
 	if err != nil {
 		return err
 	}
 	defer eng.Close()
 
-	prompt := strings.Join(fs.Args()[1:], " ")
-	if prompt == "" {
-		return fmt.Errorf("no prompt given")
-	}
-
 	var msgs []chat.Message
-	if *system != "" {
-		msgs = append(msgs, chat.Message{Role: "system", Content: *system})
+	if system != "" {
+		msgs = append(msgs, chat.Message{Role: "system", Content: system})
 	}
 	msgs = append(msgs, chat.Message{Role: "user", Content: prompt})
 
 	params := engine.DefaultGenParams()
-	params.MaxTokens = *maxTok
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	params.MaxTokens = maxTok
 
 	_, err = eng.Chat(ctx, msgs, params, func(frag string) { fmt.Print(frag) })
 	fmt.Println()
 	return err
+}
+
+// cmdPS reports what the daemon currently holds. It never starts one: "nothing
+// is loaded" and "no daemon is running" are different answers, and conflating
+// them would hide the case where a daemon died.
+func cmdPS(args []string) error {
+	fs := flag.NewFlagSet("ps", flag.ExitOnError)
+	addr := fs.String("addr", defaultAddr, "daemon address")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	base := daemonURL(*addr)
+	if !daemonAlive(base) {
+		fmt.Printf("no kinfer daemon on %s\n", *addr)
+		return nil
+	}
+
+	resp, err := http.Get(base + "/api/ps")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Models []struct {
+			Name      string     `json:"name"`
+			Size      int64      `json:"size"`
+			ExpiresAt *time.Time `json:"expires_at"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	if len(out.Models) == 0 {
+		fmt.Printf("daemon on %s — no model loaded\n", *addr)
+		return nil
+	}
+
+	fmt.Printf("%-44s %10s  %s\n", "NAME", "SIZE", "UNTIL")
+	for _, m := range out.Models {
+		until := "no expiry"
+		if m.ExpiresAt != nil {
+			if d := time.Until(*m.ExpiresAt); d > 0 {
+				until = d.Round(time.Second).String()
+			} else {
+				until = "expiring"
+			}
+		}
+		fmt.Printf("%-44s %10s  %s\n", m.Name, store.HumanSize(m.Size), until)
+	}
+	return nil
 }
 
 func cmdServe(args []string) error {
@@ -218,6 +347,7 @@ func cmdServe(args []string) error {
 	addr := fs.String("addr", ":11500", "listen address")
 	ngl := fs.Int("ngl", 99, "layers to offload to GPU (0 = CPU only)")
 	nCtx := fs.Int("ctx", 4096, "context size in tokens")
+	keepAlive := fs.Duration("keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -227,6 +357,7 @@ func cmdServe(args []string) error {
 		return err
 	}
 	srv := server.New(st, engine.Options{GPULayers: *ngl, ContextSize: *nCtx})
+	srv.SetKeepAlive(*keepAlive)
 	defer srv.Close()
 
 	models, _ := st.List()

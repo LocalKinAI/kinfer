@@ -12,10 +12,14 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,14 +37,70 @@ type Server struct {
 	// map of them would exhaust memory on the laptops kinfer targets; loading is
 	// fast enough (0.5s for a 0.5B, a few seconds for a 7B) that swapping on
 	// demand is the better trade.
-	mu      sync.Mutex
-	current *engine.Engine
+	//
+	// The resident model is reference counted. A request that is mid-generation
+	// still holds a llama.cpp context, so freeing it because another request
+	// asked for a different model is a use-after-free: the first request's next
+	// llama_decode lands on a NULL context and takes the whole process down.
+	// cond wakes the swapper when the last in-flight request lets go.
+	mu       sync.Mutex
+	cond     *sync.Cond
+	cur      *lease
+	swapping bool
+
+	// keepAlive is how long an idle model stays resident. The CLI relies on
+	// this: `kinfer run` is only instant the second time if the daemon still
+	// has the weights. Zero keeps a model forever.
+	keepAlive time.Duration
+	idle      *time.Timer
+	expiry    time.Time
+
+	// open loads a model. Tests replace it; nothing else should.
+	open func(path string, opts engine.Options) (generator, error)
+}
+
+// Version is reported by /api/version.
+//
+// It has to parse as a version: Ollama clients compare this string to decide
+// which features to use, and a value like "kinfer" fails that comparison
+// silently, disabling capabilities rather than reporting anything.
+const Version = "0.2.0"
+
+// lease is one loaded model plus the number of users holding it: every
+// in-flight request, plus one for the server itself while the model is
+// resident. The engine is closed when the count reaches zero, which may be
+// after the server has already stopped calling it resident.
+type lease struct {
+	eng  generator
+	path string
+	refs int
+}
+
+// generator is the part of engine.Engine this package uses.
+//
+// It exists as an interface for one reason: the rules this package has to get
+// right — who may free a loaded model, and when — are rules about concurrency,
+// and a test for them must not need a multi-gigabyte GGUF and a GPU. The bug
+// this seam was introduced for freed a model while another request was still
+// generating, which segfaulted the process.
+type generator interface {
+	Chat(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, error)
+	Close()
+}
+
+func openEngine(path string, opts engine.Options) (generator, error) {
+	return engine.Open(path, opts)
 }
 
 // New creates a server over the given store.
 func New(s *store.Store, opts engine.Options) *Server {
-	return &Server{store: s, opts: opts}
+	srv := &Server{store: s, opts: opts, open: openEngine}
+	srv.cond = sync.NewCond(&srv.mu)
+	return srv
 }
+
+// SetKeepAlive sets how long an idle model stays loaded. Call before serving.
+func (s *Server) SetKeepAlive(d time.Duration) { s.keepAlive = d }
 
 // Handler returns the HTTP routes.
 func (s *Server) Handler() http.Handler {
@@ -49,8 +109,10 @@ func (s *Server) Handler() http.Handler {
 	// Ollama dialect.
 	mux.HandleFunc("/api/chat", s.handleOllamaChat)
 	mux.HandleFunc("/api/tags", s.handleOllamaTags)
+	mux.HandleFunc("/api/ps", s.handlePS)
+	mux.HandleFunc("/api/show", s.handleShow)
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"version": "kinfer"})
+		writeJSON(w, http.StatusOK, map[string]string{"version": Version})
 	})
 
 	// OpenAI dialect.
@@ -68,40 +130,126 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.current != nil {
-		s.current.Close()
-		s.current = nil
+	s.retireLocked()
+}
+
+// retireLocked stops treating the resident model as resident and waits for
+// in-flight requests to finish with it. Caller holds s.mu; the wait releases
+// it, so other requests are not blocked meanwhile.
+func (s *Server) retireLocked() {
+	s.stopIdleLocked()
+	old := s.cur
+	if old == nil {
+		return
+	}
+	s.cur = nil
+	s.dropLocked(old)
+	for old.refs > 0 {
+		s.cond.Wait()
 	}
 }
 
-// acquire returns an engine for the named model, loading it if necessary.
+func (s *Server) release(l *lease) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dropLocked(l)
+}
+
+// dropLocked removes one reference, closing the engine when the last one goes.
+func (s *Server) dropLocked(l *lease) {
+	l.refs--
+	if l.refs == 0 {
+		l.eng.Close()
+	}
+	s.armIdleLocked()
+	s.cond.Broadcast()
+}
+
+// armIdleLocked starts the unload countdown once nothing is generating.
 //
-// The returned engine stays valid because Engine.Chat serialises internally and
-// swaps only happen here, under the same lock.
-func (s *Server) acquire(name string) (*engine.Engine, error) {
+// refs == 1 means the server itself is the only holder: the model is resident
+// but nobody is using it. That is the moment the clock should start.
+func (s *Server) armIdleLocked() {
+	s.stopIdleLocked()
+	if s.keepAlive <= 0 || s.cur == nil || s.cur.refs != 1 {
+		return
+	}
+	l := s.cur
+	s.expiry = time.Now().Add(s.keepAlive)
+	s.idle = time.AfterFunc(s.keepAlive, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// Re-check under the lock: a request may have arrived while the timer
+		// was firing, in which case the model is in use again.
+		if s.cur == l && l.refs == 1 {
+			log.Printf("unloading %s after %s idle", l.path, s.keepAlive)
+			s.retireLocked()
+		}
+	})
+}
+
+func (s *Server) stopIdleLocked() {
+	if s.idle != nil {
+		s.idle.Stop()
+		s.idle = nil
+	}
+	s.expiry = time.Time{}
+}
+
+// acquire returns an engine for the named model, loading it if necessary, plus
+// a release function the caller MUST call when it is done generating.
+//
+// The engine stays alive for as long as the reference is held. Swapping to a
+// different model retires the current one and waits for its in-flight requests
+// to finish before loading the replacement — only one model fits in memory, and
+// freeing one that is still generating crashes the process.
+func (s *Server) acquire(name string) (generator, func(), error) {
 	path, err := s.store.Resolve(name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.current != nil && s.current.Path() == path {
-		return s.current, nil
-	}
-	if s.current != nil {
-		s.current.Close()
-		s.current = nil
+	for {
+		if s.cur != nil && s.cur.path == path {
+			l := s.cur
+			l.refs++
+			s.stopIdleLocked()
+			return l.eng, func() { s.release(l) }, nil
+		}
+		// Someone else is already loading. Wait rather than start a second
+		// load of the same multi-gigabyte file.
+		if s.swapping {
+			s.cond.Wait()
+			continue
+		}
+		break
 	}
 
+	s.swapping = true
+	defer func() {
+		s.swapping = false
+		s.cond.Broadcast()
+	}()
+
+	s.retireLocked()
+
+	// Loading takes seconds for a 7B; hold no lock across it so requests for
+	// the model being loaded can queue on cond instead of on the mutex.
+	s.mu.Unlock()
 	log.Printf("loading %s", path)
-	e, err := engine.Open(path, s.opts)
+	e, err := s.open(path, s.opts)
+	s.mu.Lock()
+
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	s.current = e
-	return e, nil
+	l := &lease{eng: e, path: path, refs: 2} // one for the server, one for the caller
+	s.cur = l
+	s.stopIdleLocked()
+	return e, func() { s.release(l) }, nil
 }
 
 // ─── Ollama dialect ──────────────────────────────────────────────────────────
@@ -128,10 +276,17 @@ type ollamaOptions struct {
 }
 
 type ollamaChatResponse struct {
-	Model     string    `json:"model"`
-	CreatedAt time.Time `json:"created_at"`
-	Message   ollamaMsg `json:"message"`
-	Done      bool      `json:"done"`
+	Model      string    `json:"model"`
+	CreatedAt  time.Time `json:"created_at"`
+	Message    ollamaMsg `json:"message"`
+	Done       bool      `json:"done"`
+	DoneReason string    `json:"done_reason,omitempty"`
+
+	// Error travels in-band because the response headers are long gone by the
+	// time generation can fail. Without it a failure is indistinguishable from
+	// an empty reply — which is precisely how a context overflow reached
+	// LocalKin as a silent empty answer over a 200 OK.
+	Error string `json:"error,omitempty"`
 }
 
 func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
@@ -149,11 +304,12 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	eng, err := s.acquire(req.Model)
+	eng, release, err := s.acquire(req.Model)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
+	defer release()
 
 	msgs := make([]chat.Message, len(req.Messages))
 	for i, m := range req.Messages {
@@ -171,10 +327,11 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, ollamaChatResponse{
-			Model:     req.Model,
-			CreatedAt: time.Now(),
-			Message:   ollamaMsg{Role: "assistant", Content: text},
-			Done:      true,
+			Model:      req.Model,
+			CreatedAt:  time.Now(),
+			Message:    ollamaMsg{Role: "assistant", Content: text},
+			Done:       true,
+			DoneReason: "stop",
 		})
 		return
 	}
@@ -197,17 +354,22 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		})
 		flusher.Flush()
 	})
+	final := ollamaChatResponse{
+		Model:      req.Model,
+		CreatedAt:  time.Now(),
+		Message:    ollamaMsg{Role: "assistant"},
+		Done:       true,
+		DoneReason: "stop",
+	}
 	if genErr != nil {
 		// Headers are already out, so the error can only travel as a final
-		// frame. Clients that check `done` will still terminate cleanly.
+		// frame. It MUST travel: a 200 that ends in an empty message is
+		// indistinguishable from the model choosing to say nothing.
 		log.Printf("generation failed: %v", genErr)
+		final.DoneReason = "error"
+		final.Error = genErr.Error()
 	}
-	_ = enc.Encode(ollamaChatResponse{
-		Model:     req.Model,
-		CreatedAt: time.Now(),
-		Message:   ollamaMsg{Role: "assistant"},
-		Done:      true,
-	})
+	_ = enc.Encode(final)
 	flusher.Flush()
 }
 
@@ -229,6 +391,74 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 		tags[i] = tag{Name: m.Name, Model: m.Name, Size: m.Size, ModifiedAt: m.Modified}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": tags})
+}
+
+// handlePS reports what is loaded right now — the question you ask when a
+// request was slower than expected and you want to know whether it paid for a
+// model load.
+func (s *Server) handlePS(w http.ResponseWriter, r *http.Request) {
+	type entry struct {
+		Name      string     `json:"name"`
+		Model     string     `json:"model"`
+		Size      int64      `json:"size"`
+		ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	}
+
+	s.mu.Lock()
+	var loaded []entry
+	if s.cur != nil {
+		e := entry{Name: modelName(s.cur.path), Model: modelName(s.cur.path)}
+		if fi, err := os.Stat(s.cur.path); err == nil {
+			e.Size = fi.Size()
+		}
+		if !s.expiry.IsZero() {
+			t := s.expiry
+			e.ExpiresAt = &t
+		}
+		loaded = append(loaded, e)
+	}
+	s.mu.Unlock()
+
+	if loaded == nil {
+		loaded = []entry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": loaded})
+}
+
+// handleShow answers the capability probe many Ollama clients make before their
+// first chat. Returning 404 here leaves a client to guess, and some of them
+// guess by disabling features.
+func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Model string `json:"model"`
+		Name  string `json:"name"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	name := req.Model
+	if name == "" {
+		name = req.Name
+	}
+
+	path, err := s.store.Resolve(name)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"details": map[string]any{
+			"family":             chat.Detect(path).Name,
+			"format":             "gguf",
+			"parameter_size":     "",
+			"quantization_level": "",
+		},
+		"model_info":   map[string]any{},
+		"capabilities": []string{"completion"},
+	})
+}
+
+func modelName(path string) string {
+	return strings.TrimSuffix(filepath.Base(path), ".gguf")
 }
 
 // ─── OpenAI dialect ──────────────────────────────────────────────────────────
@@ -255,11 +485,12 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	eng, err := s.acquire(req.Model)
+	eng, release, err := s.acquire(req.Model)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{"message": err.Error()}})
 		return
 	}
+	defer release()
 
 	msgs := make([]chat.Message, len(req.Messages))
 	for i, m := range req.Messages {
@@ -322,7 +553,18 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if _, err := eng.Chat(r.Context(), msgs, params, func(frag string) {
 		chunk(map[string]any{"content": frag}, nil)
 	}); err != nil {
+		// Reporting finish_reason "stop" here would claim the model finished
+		// normally. Emit an error event first — the shape OpenAI clients
+		// already understand — then close the stream.
 		log.Printf("generation failed: %v", err)
+		payload, _ := json.Marshal(map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "generation_error"},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", payload)
+		chunk(map[string]any{}, "error")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
 	}
 	chunk(map[string]any{}, "stop")
 	fmt.Fprint(w, "data: [DONE]\n\n")

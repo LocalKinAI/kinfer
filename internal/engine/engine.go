@@ -164,6 +164,15 @@ func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onT
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// A closed engine has a NULL context, and llama.cpp does not check: the
+	// call segfaults the process rather than returning. Callers should hold a
+	// reference that prevents this (see server.acquire); the check is here so a
+	// bookkeeping mistake costs one failed request instead of the whole fleet's
+	// fallback.
+	if e.lctx == 0 {
+		return "", fmt.Errorf("engine for %s is closed", e.path)
+	}
+
 	// Wipe the KV cache. Without this, turn N+1 silently inherits turn N's
 	// state and the model answers a question nobody asked.
 	gollama.Memory_clear(e.lctx, true)

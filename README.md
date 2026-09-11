@@ -25,10 +25,10 @@ $ ls -lh $(which kinfer)
 ```
 
 > **Status: early but usable.** The inference core is done and the CLI works:
-> pull, list, rm, run, and an HTTP server speaking two dialects. What is *not*
-> done is the reason the project exists — health probing, automatic failover,
-> circuit breaking. And one integration is still failing; see
-> [CHANGELOG.md](CHANGELOG.md), which records exactly what works and what does not.
+> pull, list, rm, run, ps, and an HTTP server speaking two dialects. What is
+> *not* done is the reason the project exists — health probing, automatic
+> failover, circuit breaking. See [CHANGELOG.md](CHANGELOG.md), which records
+> exactly what works and what does not.
 
 ---
 
@@ -66,9 +66,39 @@ kinfer fit                   # what this machine can actually run
 kinfer pull <repo>[:quant]   # Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M
 kinfer list                  # what is installed
 kinfer rm <model>            # delete one
-kinfer run <model> [prompt]  # generate once, from the shell
+kinfer run <model> [prompt]  # chat — no prompt means interactive
+kinfer ps                    # what the daemon is holding right now
 kinfer serve [-addr :11500]  # serve over HTTP
 ```
+
+### `kinfer run` keeps the model warm
+
+`run` never loads a model itself. It talks to a background daemon, starting one
+the first time, so the weights are loaded once instead of once per command —
+the same reason `ollama run` feels instant.
+
+```
+$ kinfer run qwen "say hi in three words"    # 0.50s — daemon starts, model loads
+Hi there!
+$ kinfer run qwen "name three colors"        # 0.41s — warm
+$ kinfer run qwen                            # no prompt: interactive
+kinfer · qwen
+  /bye, /exit    leave (the daemon keeps the model warm)
+  /clear         forget this conversation
+> 
+
+$ kinfer ps
+NAME                                               SIZE  UNTIL
+qwen2.5-0.5b-instruct-q4_k_m                   468.6 MB  5m0s
+```
+
+An idle model is unloaded after `-keepalive` (default 5 minutes), because a 7B
+left resident forever owns most of a 16 GB machine. `-local` skips the daemon
+and loads in-process, which is how you see llama.cpp's own stderr when the
+question is why a model failed to load.
+
+Flags go before the model name. A flag after it would otherwise be joined into
+the prompt and silently asked of the model, so `run` refuses instead.
 
 ### `kinfer fit`
 
