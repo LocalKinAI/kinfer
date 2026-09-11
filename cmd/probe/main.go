@@ -131,7 +131,7 @@ func main() {
 		RepeatLastN:   64,
 		Seed:          *seed,
 	})
-	cands := make([]sampling.Candidate, nVocab)
+	defer sampler.Close()
 
 	fmt.Printf("── output ────────────────────────────────────\n  ")
 
@@ -142,12 +142,11 @@ func main() {
 
 	// Streaming detokenization.
 	//
-	// gollama's Token_to_piece returns the RAW byte-level-BPE vocab entry
-	// ("ĠMerkle"), so every piece has to go through bpe.Decode. But decoding
-	// pieces one at a time breaks multi-byte characters: a single CJK rune is
-	// commonly split across 2-3 tokens, and each fragment on its own is invalid
-	// UTF-8. So accumulate the raw pieces, decode the whole prefix each step,
-	// and only emit the part that has become valid.
+	// llama_token_to_piece already returns decoded text, but emitting each
+	// piece as it arrives still breaks multi-byte characters: a single CJK rune
+	// is commonly split across 2-3 tokens, and each fragment on its own is
+	// invalid UTF-8. So accumulate the pieces and emit only the prefix that has
+	// become valid.
 	var pieces []string
 	emitted := 0
 	stopped := false
@@ -158,17 +157,9 @@ func main() {
 			fatal("Decode failed at token %d: %v", i, err)
 		}
 
-		// Read the full logits row — nVocab entries, indexed by token id.
-		row := llama.Logits(lctx, -1, nVocab)
-		if row == nil {
-			fmt.Println()
-			fatal("no logits at token %d", i)
-		}
-		for j := range row {
-			cands[j] = sampling.Candidate{ID: int32(j), Logit: row[j]}
-		}
-
-		tok := sampler.Sample(cands)
+		// Sampling runs inside llama.cpp over its own logit buffer — no copy
+		// of the 151,936-entry row crosses into Go.
+		tok := sampler.Sample(lctx)
 		if llama.IsEOG(vocab, tok) {
 			stopped = true
 			break

@@ -181,8 +181,7 @@ func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onT
 	}
 
 	sampler := sampling.New(p.Params)
-	nVocab := llama.NVocab(e.vocab)
-	cands := make([]sampling.Candidate, nVocab)
+	defer sampler.Close() // a sampler chain is C memory; Go will not reclaim it
 
 	maxTokens := p.MaxTokens
 	if maxTokens <= 0 {
@@ -207,15 +206,10 @@ func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onT
 			return out.String(), fmt.Errorf("decode at token %d: %w", i, err)
 		}
 
-		row := llama.Logits(e.lctx, -1, nVocab)
-		if row == nil {
-			return out.String(), fmt.Errorf("no logits at token %d", i)
-		}
-		for j := range row {
-			cands[j] = sampling.Candidate{ID: int32(j), Logit: row[j]}
-		}
-
-		tok := sampler.Sample(cands)
+		// Sampling happens inside llama.cpp over its own logit buffer. The
+		// previous version copied all 151,936 logits into Go and sorted them
+		// once per token, which cost roughly two thirds of the throughput.
+		tok := sampler.Sample(e.lctx)
 		if llama.IsEOG(e.vocab, tok) {
 			break
 		}

@@ -186,19 +186,25 @@ go build -o kinfer ./cmd/kinfer
 
 ## Measured on M-series (Qwen2.5-0.5B Q4_K_M)
 
-| Backend | Throughput | Model load |
+Generation, 200 tokens, Metal, best of five (the machine is noisy — slow runs
+dip by a third):
+
+| | before | after |
 |---|---|---|
-| CPU (`-ngl 0`) | **123.7 tok/s** | 0.13 s |
-| Metal, first run | 75.8 tok/s | 5.46 s ← one-off kernel compilation |
-| Metal, warm | 114.5 tok/s | **0.14 s** |
+| sampled (temp 0.7, top-k 40, top-p 0.95, penalty 1.1) | 44.7 tok/s | **150.0 tok/s** |
+| greedy (temp 0) | 145.6 tok/s | 151.1 tok/s |
+
+Sampling used to cost two thirds of the throughput and now costs nothing: the
+pipeline runs inside llama.cpp over its own logit buffer, doing partial
+selection rather than sorting all 151,936 candidates in Go.
+
+Model load is 0.49 s warm. The first Metal run on a machine pays a one-off ~5 s
+for shader compilation, which macOS then caches — every later process, not just
+every later request, starts fast.
 
 **CPU beats Metal on a 0.5B model** — transfer overhead outweighs the compute
 win at this size. `kinfer fit` already reports this (it recommends CPU for
 anything at or below 1.5B); acting on it without being asked is Phase 3.
-
-Sampling over the full 151,936-token vocabulary costs throughput (measured 40
-tok/s during generation). `internal/sampling` sorts all candidates when top-k
-only needs the best 40 — partial selection will bring that back.
 
 ## Roadmap
 
@@ -234,9 +240,12 @@ context holds 4096" no matter what `-ctx` said. Transcribing the struct from
 arrived byte-level encoded — `ĠMerkleĠtree` instead of ` Merkle tree`.
 
 **Only a greedy sampler was bound.** No temperature, top-k, top-p or repetition
-penalty — and greedy decoding degenerates into loops. `internal/sampling` fills
-the gap for now; binding `llama_sampler_chain_*` is next, and is worth roughly
-3x on the sampled path.
+penalty — and greedy decoding degenerates into loops. kinfer implemented the
+whole pipeline in Go, which worked and cost two thirds of the throughput:
+picking the best 40 of 151,936 candidates meant sorting all of them, once per
+token, after copying every logit across the boundary. `internal/sampling` is now
+a builder over `llama_sampler_chain_*`, and sampling is free — 44.7 tok/s
+became 150, the same speed as greedy.
 
 **`Config.LibraryPath` was accepted and discarded.** `ApplyConfig` unloaded the
 current library but never stored the new path, and `DYLD_LIBRARY_PATH` is read

@@ -47,7 +47,16 @@ type (
 	Context uintptr
 	Vocab   uintptr
 	Memory  uintptr
+	Sampler uintptr
 )
+
+// DefaultSeed asks llama.cpp for a random seed (LLAMA_DEFAULT_SEED).
+const DefaultSeed uint32 = 0xFFFFFFFF
+
+// SamplerChainParams mirrors struct llama_sampler_chain_params (1 byte).
+type SamplerChainParams struct {
+	NoPerf uint8
+}
 
 // ModelParams mirrors struct llama_model_params (72 bytes).
 type ModelParams struct {
@@ -152,6 +161,19 @@ var (
 	vocabEOS           func(v Vocab) Token
 	tokenToPiece       func(v Vocab, t Token, buf *byte, length, lstrip int32, special bool) int32
 	nCtx               func(c Context) uint32
+
+	samplerChainDefault func() SamplerChainParams
+	samplerChainInit    func(p SamplerChainParams) Sampler
+	samplerChainAdd     func(chain, s Sampler)
+	samplerInitTopK     func(k int32) Sampler
+	samplerInitTopP     func(p float32, minKeep uint64) Sampler
+	samplerInitTemp     func(t float32) Sampler
+	samplerInitPenalty  func(lastN int32, repeat, freq, present float32) Sampler
+	samplerInitDist     func(seed uint32) Sampler
+	samplerInitGreedy   func() Sampler
+	samplerSample       func(s Sampler, c Context, idx int32) Token
+	samplerReset        func(s Sampler)
+	samplerFree         func(s Sampler)
 )
 
 // Bind makes llama.cpp usable: it loads libllama from dir, resolves every entry
@@ -183,6 +205,7 @@ func bind(dir string) error {
 		{"llama_model_params", unsafe.Sizeof(ModelParams{}), 72},
 		{"llama_context_params", unsafe.Sizeof(ContextParams{}), 120},
 		{"llama_batch", unsafe.Sizeof(Batch{}), 56},
+		{"llama_sampler_chain_params", unsafe.Sizeof(SamplerChainParams{}), 1},
 	} {
 		if c.got != c.want {
 			return fmt.Errorf("%s is %d bytes in Go but %d in llama.h — "+
@@ -224,6 +247,18 @@ func bind(dir string) error {
 		{&vocabEOS, "llama_vocab_eos"},
 		{&tokenToPiece, "llama_token_to_piece"},
 		{&nCtx, "llama_n_ctx"},
+		{&samplerChainDefault, "llama_sampler_chain_default_params"},
+		{&samplerChainInit, "llama_sampler_chain_init"},
+		{&samplerChainAdd, "llama_sampler_chain_add"},
+		{&samplerInitTopK, "llama_sampler_init_top_k"},
+		{&samplerInitTopP, "llama_sampler_init_top_p"},
+		{&samplerInitTemp, "llama_sampler_init_temp"},
+		{&samplerInitPenalty, "llama_sampler_init_penalties"},
+		{&samplerInitDist, "llama_sampler_init_dist"},
+		{&samplerInitGreedy, "llama_sampler_init_greedy"},
+		{&samplerSample, "llama_sampler_sample"},
+		{&samplerReset, "llama_sampler_reset"},
+		{&samplerFree, "llama_sampler_free"},
 	} {
 		// RegisterLibFunc panics on a missing symbol, which would abort the
 		// program on an unexpected llama.cpp build. Convert it to an error so
@@ -397,6 +432,66 @@ func Logits(c Context, i int32, nVocab int32) []float32 {
 // ClearMemory wipes the KV cache. Without it, a second conversation on the same
 // context silently inherits the first one's state.
 func ClearMemory(c Context) { memoryClear(getMemory(c), true) }
+
+// ─── sampling ────────────────────────────────────────────────────────────────
+
+// NewSamplerChain creates an empty chain. Add samplers in pipeline order and
+// end with a selector (Dist or Greedy), which is what actually picks a token.
+//
+// The chain owns everything added to it: SamplerFree on the chain frees the
+// children too, so an added sampler must not be freed separately.
+func NewSamplerChain() Sampler {
+	return samplerChainInit(samplerChainDefault())
+}
+
+// SamplerChainAdd appends s to chain, transferring ownership.
+func SamplerChainAdd(chain, s Sampler) { samplerChainAdd(chain, s) }
+
+// SamplerTopK keeps only the k most likely tokens.
+//
+// This is where the throughput went: llama.cpp does a partial selection over
+// the candidates, while doing it in Go meant sorting all 151,936 of them once
+// per token.
+func SamplerTopK(k int32) Sampler { return samplerInitTopK(k) }
+
+// SamplerTopP keeps the smallest set of tokens whose probabilities reach p.
+// minKeep floors how many survive, so an extremely peaked distribution still
+// leaves something to choose from.
+func SamplerTopP(p float32, minKeep uint64) Sampler { return samplerInitTopP(p, minKeep) }
+
+// SamplerTemp flattens (>1) or sharpens (<1) the distribution.
+func SamplerTemp(t float32) Sampler { return samplerInitTemp(t) }
+
+// SamplerPenalties pushes down tokens seen in the last lastN positions.
+// repeat 1.0, freq 0.0 and present 0.0 each disable their term.
+func SamplerPenalties(lastN int32, repeat, freq, present float32) Sampler {
+	return samplerInitPenalty(lastN, repeat, freq, present)
+}
+
+// SamplerDist draws from the distribution the chain produced. Pass DefaultSeed
+// for a random draw.
+func SamplerDist(seed uint32) Sampler { return samplerInitDist(seed) }
+
+// SamplerGreedy always takes the most likely token.
+func SamplerGreedy() Sampler { return samplerInitGreedy() }
+
+// SamplerSample reads the logits for position idx (-1 means the last token),
+// runs the chain, and returns the chosen token.
+//
+// It reads llama.cpp's own logit buffer, so nothing is copied into Go.
+//
+// It also accepts the token internally — llama_sampler_sample calls
+// llama_sampler_accept before returning. The usage example in llama.h still
+// shows an explicit accept after sampling; following it would count every token
+// twice in the penalty ring buffer, weakening the repetition penalty for the
+// exact tokens it is meant to suppress.
+func SamplerSample(s Sampler, c Context, idx int32) Token { return samplerSample(s, c, idx) }
+
+// SamplerReset clears a chain's accumulated state, such as the penalty history.
+func SamplerReset(s Sampler) { samplerReset(s) }
+
+// SamplerFree releases a sampler and, for a chain, everything in it.
+func SamplerFree(s Sampler) { samplerFree(s) }
 
 func libName() string {
 	switch runtime.GOOS {
