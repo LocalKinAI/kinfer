@@ -62,6 +62,10 @@ func (s *Server) SetUpstream(addr string) {
 	}
 }
 
+// SetFallback names the local model to run when the upstream refuses work it
+// would otherwise have done. Empty leaves substitution off.
+func (s *Server) SetFallback(model string) { s.fallback = model }
+
 // remoteModel reports whether this name belongs to something served elsewhere.
 //
 // The test is the manifest's own — a cloud entry has no weights layer — and not

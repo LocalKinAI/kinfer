@@ -376,6 +376,8 @@ func cmdServe(args []string) error {
 	queue := fs.Int("queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
 	upstream := fs.String("upstream", server.Upstream(),
 		"where cloud models are served from (default: $OLLAMA_HOST, else Ollama's own address)")
+	fallback := fs.String("fallback", "",
+		"local model to answer with when a cloud model is rate-limited or unreachable (empty: never substitute)")
 	maxGen := fs.Duration("max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
 	maxWait := fs.Duration("max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
 	keepAlive := fs.Duration("keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
@@ -413,6 +415,7 @@ func cmdServe(args []string) error {
 	}
 
 	srv.SetUpstream(*upstream)
+	srv.SetFallback(*fallback)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
