@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,5 +155,98 @@ func TestHumanSize(t *testing.T) {
 		if got := HumanSize(in); got != want {
 			t.Errorf("HumanSize(%d) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Anything past roughly 50 GB arrives from Hugging Face in pieces, so a store
+// that cannot recognise them cannot hold a large model at all: three files look
+// like three models, each reporting a fraction of the size, and asking for the
+// model by name is ambiguous between its own pieces.
+
+func writeShards(t *testing.T, dir, base string, n int, each int) {
+	t.Helper()
+	for i := 1; i <= n; i++ {
+		name := fmt.Sprintf("%s-%05d-of-%05d.gguf", base, i, n)
+		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, each), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestListCollapsesShardsIntoOneModel(t *testing.T) {
+	dir := t.TempDir()
+	writeShards(t, dir, "Qwen3.8-Flash-Next-UD-Q2_K_XL", 3, 1000)
+	if err := os.WriteFile(filepath.Join(dir, "plain.gguf"), make([]byte, 7), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := OpenAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("List returned %d models, want 2 (one split, one plain): %+v", len(models), models)
+	}
+
+	var split *Model
+	for i := range models {
+		if models[i].Name == "Qwen3.8-Flash-Next-UD-Q2_K_XL" {
+			split = &models[i]
+		}
+	}
+	if split == nil {
+		t.Fatalf("the split model is not listed under its base name: %+v", models)
+	}
+	if split.Size != 3000 {
+		t.Errorf("size = %d, want the sum of all pieces (3000)", split.Size)
+	}
+	if !strings.HasSuffix(split.Path, "-00001-of-00003.gguf") {
+		t.Errorf("path = %q, want the first piece — llama.cpp finds the rest from it", split.Path)
+	}
+}
+
+func TestResolveFindsASplitModelByPrefix(t *testing.T) {
+	dir := t.TempDir()
+	writeShards(t, dir, "Qwen3.8-Flash-Next-UD-Q2_K_XL", 3, 10)
+	s, _ := OpenAt(dir)
+
+	got, err := s.Resolve("qwen3.8")
+	if err != nil {
+		t.Fatalf("Resolve by prefix failed: %v — pieces of one model must not be ambiguous with each other", err)
+	}
+	if !strings.HasSuffix(got, "-00001-of-00003.gguf") {
+		t.Errorf("Resolve returned %q, want the first piece", got)
+	}
+}
+
+func TestListIgnoresASetMissingItsFirstPiece(t *testing.T) {
+	dir := t.TempDir()
+	writeShards(t, dir, "Broken", 3, 10)
+	if err := os.Remove(filepath.Join(dir, "Broken-00001-of-00003.gguf")); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := OpenAt(dir)
+	models, _ := s.List()
+	if len(models) != 0 {
+		t.Errorf("a set with no first piece was listed as loadable: %+v", models)
+	}
+}
+
+func TestRemoveDeletesEveryPiece(t *testing.T) {
+	dir := t.TempDir()
+	writeShards(t, dir, "Big", 3, 10)
+	s, _ := OpenAt(dir)
+
+	if err := s.Remove("Big"); err != nil {
+		t.Fatal(err)
+	}
+	left, _ := os.ReadDir(dir)
+	if len(left) != 0 {
+		// Removing one piece would strand tens of gigabytes that nothing loads.
+		t.Errorf("rm left %d pieces behind", len(left))
 	}
 }

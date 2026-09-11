@@ -11,10 +11,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
+
+// shardSuffix matches the "-00002-of-00005" a split GGUF carries.
+//
+// Anything past roughly 50 GB arrives in pieces, because that is the largest
+// file Hugging Face will serve. llama.cpp handles them — given the first piece
+// it finds the rest by name. What it cannot do is stop a directory of pieces
+// from looking like several separate models, which is this package's job.
+var shardSuffix = regexp.MustCompile(`-(\d{5})-of-(\d{5})\.gguf$`)
+
+// shardOf reports a file's place in a split model: the name the whole set
+// should be known by, and which piece this is. An index of 0 means the file is
+// not a shard.
+func shardOf(filename string) (base string, index int) {
+	m := shardSuffix.FindStringSubmatch(filename)
+	if m == nil {
+		return "", 0
+	}
+	n := 0
+	for _, c := range m[1] {
+		n = n*10 + int(c-'0')
+	}
+	return filename[:len(filename)-len(m[0])], n
+}
 
 // Model is one GGUF file on disk.
 type Model struct {
@@ -61,6 +85,11 @@ func (s *Store) List() ([]Model, error) {
 		return nil, fmt.Errorf("read %s: %w", s.root, err)
 	}
 
+	// A split model is one model. Gather its pieces before building the list,
+	// or it appears once per piece, each showing a fraction of its true size,
+	// and asking for it by name is ambiguous.
+	shards := map[string]*Model{}
+
 	var out []Model
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
@@ -70,12 +99,40 @@ func (s *Store) List() ([]Model, error) {
 		if err != nil {
 			continue // vanished between ReadDir and Info; not worth failing over
 		}
+		path := filepath.Join(s.root, e.Name())
+
+		if base, idx := shardOf(e.Name()); idx > 0 {
+			m := shards[base]
+			if m == nil {
+				m = &Model{Name: base}
+				shards[base] = m
+			}
+			m.Size += info.Size()
+			// The first piece is the handle: llama.cpp opens it and finds the
+			// rest itself.
+			if idx == 1 {
+				m.Path = path
+			}
+			if info.ModTime().After(m.Modified) {
+				m.Modified = info.ModTime()
+			}
+			continue
+		}
+
 		out = append(out, Model{
 			Name:     nameOf(e.Name()),
-			Path:     filepath.Join(s.root, e.Name()),
+			Path:     path,
 			Size:     info.Size(),
 			Modified: info.ModTime(),
 		})
+	}
+
+	for _, m := range shards {
+		// A set missing its first piece cannot be loaded; listing it would only
+		// move the failure to a more confusing place.
+		if m.Path != "" {
+			out = append(out, *m)
+		}
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Modified.After(out[j].Modified) })
@@ -144,7 +201,41 @@ func (s *Store) Remove(name string) error {
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return fmt.Errorf("%s is outside the model directory; delete it yourself", path)
 	}
-	return os.Remove(path)
+
+	// A split model is deleted whole. Removing only the piece that was resolved
+	// would leave tens of gigabytes behind that nothing can load.
+	files, err := s.Shards(path)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		if err := os.Remove(f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Shards lists every file a model is made of — its own path, unless it is
+// split, in which case all the pieces in name order.
+func (s *Store) Shards(path string) ([]string, error) {
+	base, idx := shardOf(filepath.Base(path))
+	if idx == 0 {
+		return []string{path}, nil
+	}
+	dir := filepath.Dir(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if b, i := shardOf(e.Name()); i > 0 && b == base {
+			out = append(out, filepath.Join(dir, e.Name()))
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func nameOf(filename string) string {
