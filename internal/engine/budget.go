@@ -113,7 +113,7 @@ func (b *budget) report(slots, prefix, perSeq int) {
 
 	// The multiplication is spelled out because it is the part that surprises
 	// people: -ctx reads like a total and is per-conversation.
-	log.Printf("memory: %s   model %s + context %s -> %s free of %s\n"+
+	log.Printf("memory: %s   model %s + context %s -> %s free of %s (this process only)\n"+
 		"          context is %d tokens: -ctx %d per conversation x %d sequences (%d slots + %d prefix)",
 		b.dev.Name, gib(model), gib(ctx), gib(free), gib(total),
 		perSeq*(slots+prefix), perSeq, slots+prefix, slots, prefix)
