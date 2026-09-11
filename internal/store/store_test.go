@@ -250,3 +250,43 @@ func TestRemoveDeletesEveryPiece(t *testing.T) {
 		t.Errorf("rm left %d pieces behind", len(left))
 	}
 }
+
+// Linking a model into the store is a reasonable thing to do — it is how one
+// file is shared with another runtime instead of copied. Reading the link's own
+// size instead of the model's reports twenty gigabytes as a hundred bytes, and
+// every size-based decision downstream is then made about nothing.
+func TestListFollowsSymlinks(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "real-model.gguf")
+	if err := os.WriteFile(target, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(dir, "linked.gguf")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	s, _ := OpenAt(dir)
+	models, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 {
+		t.Fatalf("List returned %d models, want 1", len(models))
+	}
+	if models[0].Size != 4096 {
+		t.Errorf("size = %d, want the target's 4096 — a link's own size is not the model's", models[0].Size)
+	}
+}
+
+func TestListSkipsBrokenSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink(filepath.Join(dir, "gone.gguf"), filepath.Join(dir, "dangling.gguf")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	s, _ := OpenAt(dir)
+	models, _ := s.List()
+	if len(models) != 0 {
+		t.Errorf("a link with nothing at the end of it was listed: %+v", models)
+	}
+}

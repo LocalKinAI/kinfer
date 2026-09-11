@@ -95,11 +95,17 @@ func (s *Store) List() ([]Model, error) {
 		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
 			continue
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue // vanished between ReadDir and Info; not worth failing over
-		}
 		path := filepath.Join(s.root, e.Name())
+
+		// os.Stat, not DirEntry.Info: the latter does not follow symlinks, and
+		// a symlinked model would report the size of the link itself — a
+		// hundred bytes where the model is twenty gigabytes. Linking a model
+		// into the store is a reasonable thing to do; it is how one file gets
+		// shared with another runtime instead of copied.
+		info, err := os.Stat(path)
+		if err != nil {
+			continue // vanished, or a link with nothing at the end of it
+		}
 
 		if base, idx := shardOf(e.Name()); idx > 0 {
 			m := shards[base]
