@@ -234,16 +234,36 @@ not the GPU synchronisation. It is that **the GPU sits idle while Go works.**
 between 548 and 1422 µs. Each millisecond spent on the CPU between dispatches is
 a millisecond the GPU is not computing, and kinfer serialises all of it.
 
-That makes the HTTP layer the biggest single loss: a JSON encode, a socket write
-and a flush per token, on the critical path between two GPU dispatches. Moving
-it to a writer goroutine behind a buffered channel should recover most of that
-30%, and the same applies to detokenisation.
+That points at the HTTP layer — a JSON encode, a socket write and a flush per
+token, all on the critical path between two GPU dispatches. **Moving it to a
+writer goroutine behind a buffered channel was tried and made things worse.**
+Measured against Ollama in every round, with the order rotated so no
+configuration is systematically first: writing inline reaches 83% of Ollama,
+writing from a second goroutine reaches 71%.
 
-Ruled out along the way: Go's GC (`GOGC=off`), `GOMAXPROCS`, async preemption,
-`runtime.LockOSThread`, `n_batch`, `go run` versus a prebuilt binary, process
-nice level (native runs at the same one), and thread QoS — kinfer already runs
-at `user-interactive`, though clamping it to `background` does halve throughput,
+The likely reason is that this is not an I/O-bound problem at all. kinfer's
+per-token cost is CPU work, and a second runnable goroutine doing syscalls
+competes for the four performance cores — pushing generation onto an efficiency
+core costs more than the inline write ever did. Whatever fixes this has to
+*remove* CPU work from the token loop rather than move it elsewhere. It is also
+a warning for the scheduler in Phase 2: extra goroutines are not free on this
+hardware, and the assumption has to be measured rather than reasoned about.
+
+Ruled out along the way, each with a measurement: Go's GC (`GOGC=off`),
+`GOMAXPROCS`, async preemption, `runtime.LockOSThread`, `n_batch`, `go run`
+versus a prebuilt binary, process nice level (native runs at the same one),
+Metal residency (`GGML_METAL_NO_RESIDENCY`, `RESIDENCY_KEEP_ALIVE_S`), whether
+Ollama is holding a model at the time, and thread QoS — kinfer already runs at
+`user-interactive`, though clamping it to `background` does halve throughput,
 which is why `cmd/probe` now prints it.
+
+**A note on measuring this at all.** Sustained benchmarking heats the machine,
+and throttling costs kinfer far more than it costs Ollama — over one session
+kinfer fell from 178 to 104 tok/s while Ollama held near 175, which is itself
+evidence that kinfer's critical path is CPU-bound where Ollama's is not. Run to
+run the spread reaches ±40%, wide enough to swallow any change worth making. So
+every comparison here measures Ollama in the same round and reports the ratio.
+A kinfer number on its own, from this machine, means nothing.
 
 **Ollama runs one request at a time.** Eight concurrent requests take eight
 times as long as one, aggregate throughput pinned at 165 tok/s, and its log only
