@@ -51,8 +51,24 @@ const (
 // in itself: a request that did not finish, described as one that did.
 type TimeoutError struct {
 	After time.Duration
-	Stage string // "generating" or "waiting for a slot"
+	Stage string
 }
+
+// The two stages are not interchangeable, and conflating them produces exactly
+// the bug this type exists to prevent. A reply cut off while generating has
+// text to hand back and a reason to attach. A request that expired in the queue
+// produced nothing at all, and dressing that up as a finished reply with an
+// empty body would tell a caller the model had nothing to say.
+const (
+	StageGenerating = "generating"
+	StageQueued     = "waiting for a slot"
+)
+
+// BeforeStarting reports that nothing of the request ever ran, so there is no
+// partial answer and the caller should be refused rather than given an empty
+// one. It is the same situation as a full queue, arrived at by time instead of
+// by depth.
+func (e *TimeoutError) BeforeStarting() bool { return e.Stage == StageQueued }
 
 func (e *TimeoutError) Error() string {
 	return "gave up after " + e.After.Round(time.Second).String() + " " + e.Stage

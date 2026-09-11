@@ -334,7 +334,7 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	// Spending a slot on an answer nobody is left to read costs the requests
 	// behind it, which are the ones still being waited for.
 	if el, expired := s.limits.expiredWaiting(j.queued); expired {
-		j.finish(&TimeoutError{After: el, Stage: "waiting for a slot"})
+		j.finish(&TimeoutError{After: el, Stage: StageQueued})
 		return
 	}
 
@@ -365,6 +365,11 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 		reused = n
 	}
 
+	// A caller that named no budget gets the rest of its slot's context. That
+	// is a real bound, so kinfer does not also impose a ceiling on num_predict:
+	// what a runaway request costs is time, and the wall clock in deadlines
+	// bounds that directly. A token ceiling would be a second knob buying the
+	// same safety, and the number it wanted would be invented.
 	maxGen := j.params.MaxTokens
 	if maxGen <= 0 {
 		maxGen = s.ctxPerSeq - len(tokens)
@@ -416,7 +421,7 @@ func (s *scheduler) step() error {
 			continue
 		}
 		if el, expired := s.limits.expiredGenerating(sl.admitted); expired {
-			s.release(sl, &TimeoutError{After: el, Stage: "generating"})
+			s.release(sl, &TimeoutError{After: el, Stage: StageGenerating})
 			continue
 		}
 

@@ -1006,3 +1006,37 @@ func (e *timedOutEngine) ChatFull(ctx context.Context, m []chat.Message, p engin
 	st.Timeout = true
 	return text, st, err
 }
+
+// A request that aged out of the queue never ran, so it must be refused — not
+// answered with an empty body and a reason, which would say the model had
+// nothing to say.
+func TestQueueExpiryIsRefusedNotAnsweredEmpty(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return &staleEngine{fakeEngine{path: p}}, nil
+	}
+
+	for _, path := range []string{"/api/chat", "/v1/chat/completions"} {
+		for _, stream := range []string{"false", "true"} {
+			w := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(
+				`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":`+stream+`}`)))
+			if w.Code != http.StatusServiceUnavailable {
+				t.Errorf("%s stream=%s: status %d, want 503 — nothing of this request ran:\n%s",
+					path, stream, w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), `"done_reason":"timeout"`) {
+				t.Errorf("%s stream=%s: reported a finish reason for a reply that never started", path, stream)
+			}
+		}
+	}
+}
+
+type staleEngine struct{ fakeEngine }
+
+func (e *staleEngine) ChatFull(context.Context, []chat.Message, engine.GenParams, func(string)) (string, engine.Stats, error) {
+	return "", engine.Stats{}, &engine.TimeoutError{After: 90 * time.Second, Stage: engine.StageQueued}
+}
+func (e *staleEngine) Chat(context.Context, []chat.Message, engine.GenParams, func(string)) (string, error) {
+	return "", &engine.TimeoutError{After: 90 * time.Second, Stage: engine.StageQueued}
+}

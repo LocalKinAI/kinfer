@@ -442,7 +442,7 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p GenParams,
 	// finish reason — see Stats.Timeout — the same way a token budget does.
 	err := j.err
 	var late *TimeoutError
-	if errors.As(err, &late) {
+	if errors.As(err, &late) && !late.BeforeStarting() {
 		j.stats.Timeout, err = true, nil
 	}
 	return out.String(), j.stats, err

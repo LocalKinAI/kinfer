@@ -82,3 +82,18 @@ func TestPickResolvesTheThreeCases(t *testing.T) {
 		t.Errorf("negative = %v, want 0 — the operator turned the limit off", got)
 	}
 }
+
+// The two stages must not be interchangeable. A reply cut off while generating
+// has text to return; one that expired in the queue has nothing, and must be
+// refused rather than handed back as a finished reply with an empty body.
+func TestQueuedAndGeneratingTimeoutsAreDistinct(t *testing.T) {
+	queued := &TimeoutError{After: time.Minute, Stage: StageQueued}
+	running := &TimeoutError{After: time.Minute, Stage: StageGenerating}
+
+	if !queued.BeforeStarting() {
+		t.Error("a queue expiry was treated as a reply that had begun")
+	}
+	if running.BeforeStarting() {
+		t.Error("a reply cut off mid-generation was treated as never having started")
+	}
+}

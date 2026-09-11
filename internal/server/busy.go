@@ -18,6 +18,16 @@ import (
 // broken server; a fleet that gives up on a 503 is abandoning work that would
 // have succeeded. Getting the code right is most of what backpressure is.
 func writeGenError(w http.ResponseWriter, err error) {
+	// A request that aged out of the queue is the same answer as a full one —
+	// the server has more work than it can take — reached by time rather than
+	// by depth. It gets the same status, and no Retry-After, because nothing
+	// was measured about when this one would have run.
+	var stale *engine.TimeoutError
+	if errors.As(err, &stale) && stale.BeforeStarting() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": stale.Error()})
+		return
+	}
+
 	var busy *engine.BusyError
 	if errors.As(err, &busy) {
 		if busy.RetryAfter > 0 {
@@ -35,6 +45,14 @@ func writeGenError(w http.ResponseWriter, err error) {
 
 // writeOpenAIGenError is writeGenError in the OpenAI dialect's error shape.
 func writeOpenAIGenError(w http.ResponseWriter, err error) {
+	var stale *engine.TimeoutError
+	if errors.As(err, &stale) && stale.BeforeStarting() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]string{"message": stale.Error(), "type": "server_busy"},
+		})
+		return
+	}
+
 	var busy *engine.BusyError
 	if errors.As(err, &busy) {
 		if busy.RetryAfter > 0 {
@@ -59,5 +77,10 @@ func writeOpenAIGenError(w http.ResponseWriter, err error) {
 // is the one failure that always happens first, at admission, so it is the one
 // that can still be a 503. Handlers defer their header write for exactly this.
 func refusedBeforeStreaming(err error, streamed bool) bool {
-	return !streamed && errors.Is(err, engine.ErrBusy)
+	if streamed {
+		return false
+	}
+	var stale *engine.TimeoutError
+	return errors.Is(err, engine.ErrBusy) ||
+		(errors.As(err, &stale) && stale.BeforeStarting())
 }
