@@ -456,7 +456,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		// made.
 		thinking, answer := chat.SplitThinking(text)
 		content, calls := eng.ToolFormat().Parse(answer)
-		reason := doneReason(st.Truncated)
+		reason := doneReason(st)
 		if len(calls) > 0 {
 			reason = "tool_calls"
 		}
@@ -493,7 +493,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:  time.Now(),
 			Message:    msg,
 			Done:       true,
-			DoneReason: doneReason(st.Truncated),
+			DoneReason: doneReason(st),
 		}.withTimings(st, load, time.Since(start)))
 		return
 	}
@@ -553,7 +553,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:  time.Now(),
 		Message:    ollamaMsg{Role: "assistant"},
 		Done:       true,
-		DoneReason: doneReason(st.Truncated),
+		DoneReason: doneReason(st),
 	}.withTimings(st, load, time.Since(start))
 	if genErr != nil {
 		// Headers are already out, so the error can only travel as a final
@@ -749,7 +749,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		if wantThinking(req.Think) && thinking != "" {
 			msg["reasoning_content"] = thinking
 		}
-		finish := doneReason(st.Truncated)
+		finish := openAIFinishReason(st)
 		if len(calls) > 0 {
 			finish = "tool_calls"
 			wire := make([]any, len(calls))
@@ -784,7 +784,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id": id, "object": "chat.completion", "created": created, "model": req.Model,
-			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": doneReason(st.Truncated)}},
+			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": openAIFinishReason(st)}},
 			"usage":   usage(st),
 		})
 		return
@@ -859,7 +859,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	emit(split.Flush())
-	chunk(map[string]any{}, doneReason(st.Truncated))
+	chunk(map[string]any{}, openAIFinishReason(st))
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		// OpenAI's shape for this: one last chunk carrying no choices at all,
 		// only the counts.
@@ -920,11 +920,33 @@ func applyOllamaOptions(p engine.GenParams, o *ollamaOptions) engine.GenParams {
 // a reply cut short by the token budget, and it is the only signal a caller has
 // that a reasoning model returned nothing because it spent the whole budget
 // thinking rather than because it had nothing to say.
-func doneReason(truncated bool) string {
-	if truncated {
+// doneReason is why a reply ended, in the Ollama dialect's vocabulary.
+//
+// "timeout" is kinfer's own: Ollama has no word for a reply the server cut off
+// on the clock, and the alternatives both lie. "stop" would say the model
+// finished, and "length" would say it hit the token budget it was given. The
+// whole reason this runtime exists is an incomplete answer that looked complete.
+func doneReason(st engine.Stats) string {
+	switch {
+	case st.Timeout:
+		return "timeout"
+	case st.Truncated:
+		return "length"
+	default:
+		return "stop"
+	}
+}
+
+// openAIFinishReason is the same fact in OpenAI's vocabulary, which is a closed
+// set its clients switch on — "stop", "length", "tool_calls", "content_filter".
+// A timeout is reported as "length": not the whole truth, but true in the part
+// that matters to a caller, which is that the reply is incomplete and was cut
+// off by a limit rather than by the model.
+func openAIFinishReason(st engine.Stats) string {
+	if st.Timeout {
 		return "length"
 	}
-	return "stop"
+	return doneReason(st)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

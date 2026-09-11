@@ -935,3 +935,74 @@ func TestRetryAfterOnlyWhenMeasured(t *testing.T) {
 			"so the caller is not invited back before the work can have finished", got)
 	}
 }
+
+// A reply cut off by the clock must arrive as a reply, with the text it did
+// produce and a reason saying it was cut off. Reporting it as an error would
+// throw away work the caller can use; reporting it as "stop" would be the lie
+// this runtime exists to not tell.
+func TestTimeoutIsAFinishReasonNotAFailure(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return &timedOutEngine{fakeEngine{path: p, frags: []string{"half an ", "answer"}}}, nil
+	}
+
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat",
+		strings.NewReader(`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`)))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 — the partial reply is worth more than an error", w.Code)
+	}
+	var got ollamaChatResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Message.Content != "half an answer" {
+		t.Errorf("content = %q, want the text produced before the deadline", got.Message.Content)
+	}
+	if got.DoneReason != "timeout" {
+		t.Errorf("done_reason = %q, want \"timeout\" — \"stop\" would claim the model finished", got.DoneReason)
+	}
+}
+
+// OpenAI's finish_reason is a closed set its clients switch on, so a timeout
+// travels as "length" there. Still not "stop": the caller must be able to tell
+// an incomplete reply from a complete one.
+func TestOpenAITimeoutUsesAKnownFinishReason(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return &timedOutEngine{fakeEngine{path: p, frags: []string{"partial"}}}, nil
+	}
+
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`)))
+
+	var got struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if len(got.Choices) == 0 {
+		t.Fatalf("no choices: %s", w.Body.String())
+	}
+	switch got.Choices[0].FinishReason {
+	case "length":
+	case "stop":
+		t.Error("finish_reason = \"stop\" for a reply the server cut off")
+	default:
+		t.Errorf("finish_reason = %q, which is outside OpenAI's closed set",
+			got.Choices[0].FinishReason)
+	}
+}
+
+type timedOutEngine struct{ fakeEngine }
+
+func (e *timedOutEngine) ChatFull(ctx context.Context, m []chat.Message, p engine.GenParams, onToken func(string)) (string, engine.Stats, error) {
+	text, st, err := e.fakeEngine.ChatFull(ctx, m, p, onToken)
+	st.Timeout = true
+	return text, st, err
+}

@@ -108,6 +108,10 @@ type scheduler struct {
 	// honest basis for telling a refused caller when to come back.
 	rate completionRate
 
+	// limits bound the two ways a request can occupy the server without
+	// finishing: holding a slot, and holding a place in the queue.
+	limits deadlines
+
 	// debug counters, printed when KINFER_DEBUG_SCHED is set. Batch
 	// composition is the thing worth watching: if steps mostly carry one token
 	// the slots are not filling and the batching is theoretical.
@@ -126,6 +130,10 @@ type job struct {
 	ctx    context.Context
 	msgs   []chat.Message
 	params GenParams
+
+	// queued is when submit accepted it, so a job the fleet has given up on can
+	// be refused rather than handed a slot.
+	queued time.Time
 
 	// frags carries generated text; it is closed when the reply ends. err holds
 	// the failure, if any, and is only read after frags is closed.
@@ -179,7 +187,7 @@ type slot struct {
 	logitIdx int32
 }
 
-func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSlots, nPrefix, ctxPerSeq, batchCap, maxQueue int) *scheduler {
+func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSlots, nPrefix, ctxPerSeq, batchCap, maxQueue int, limits deadlines) *scheduler {
 	s := &scheduler{
 		lctx:      lctx,
 		vocab:     vocab,
@@ -188,6 +196,7 @@ func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSl
 		batch:     llama.NewBatchBuilder(batchCap),
 		slots:     make([]*slot, nSlots),
 		incoming:  make(chan *job, maxQueue),
+		limits:    limits,
 		stop:      make(chan struct{}),
 		stopped:   make(chan struct{}),
 		debug:     os.Getenv("KINFER_DEBUG_SCHED") != "",
@@ -211,6 +220,8 @@ func (s *scheduler) submit(j *job) error {
 		return ErrNotStarted
 	default:
 	}
+
+	j.queued = time.Now()
 
 	select {
 	case s.incoming <- j:
@@ -320,6 +331,12 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 		j.finish(err)
 		return
 	}
+	// Spending a slot on an answer nobody is left to read costs the requests
+	// behind it, which are the ones still being waited for.
+	if el, expired := s.limits.expiredWaiting(j.queued); expired {
+		j.finish(&TimeoutError{After: el, Stage: "waiting for a slot"})
+		return
+	}
 
 	prompt := s.tpl.Render(j.msgs, j.params.Tools)
 	tokens, err := llama.Tokenize(s.vocab, prompt, true, true)
@@ -396,6 +413,10 @@ func (s *scheduler) step() error {
 		}
 		if err := sl.job.ctx.Err(); err != nil {
 			s.release(sl, err)
+			continue
+		}
+		if el, expired := s.limits.expiredGenerating(sl.admitted); expired {
+			s.release(sl, &TimeoutError{After: el, Stage: "generating"})
 			continue
 		}
 

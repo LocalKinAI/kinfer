@@ -365,6 +365,8 @@ func cmdServe(args []string) error {
 	slots := fs.Int("slots", engine.DefaultSlots, "conversations served at once (use 8, 32, 64 or 128 — never 12-16)")
 	prefix := fs.Int("prefix", engine.DefaultPrefixSlots, "prompt prefixes kept resident so repeat requests skip prefilling them (-1 disables)")
 	queue := fs.Int("queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
+	maxGen := fs.Duration("max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (negative disables)")
+	maxWait := fs.Duration("max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (negative disables)")
 	keepAlive := fs.Duration("keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -376,7 +378,7 @@ func cmdServe(args []string) error {
 	}
 	srv := server.New(st, engine.Options{
 		GPULayers: *ngl, ContextSize: *nCtx, Slots: *slots, PrefixSlots: *prefix,
-		MaxQueue: *queue,
+		MaxQueue: *queue, MaxGenerate: *maxGen, MaxWait: *maxWait,
 	})
 	srv.SetKeepAlive(*keepAlive)
 	defer srv.Close()

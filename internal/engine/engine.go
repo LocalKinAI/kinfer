@@ -8,6 +8,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -50,6 +51,20 @@ type Options struct {
 	// Each one costs a sequence's worth of KV cache, the same as a slot, so
 	// this is memory traded for latency. Negative disables the pool.
 	PrefixSlots int
+
+	// MaxGenerate bounds how long one reply may take, in wall-clock time.
+	//
+	// The token budget is not this bound: `num_predict` is whatever the caller
+	// sent, and Ollama's convention for it includes "until the model stops". A
+	// caller's own context deadline is the real authority; this covers the ones
+	// that set none, which is how a single request could hold a slot for half
+	// an hour on the 125B. 0 means DefaultMaxGenerate; negative disables it.
+	MaxGenerate time.Duration
+
+	// MaxWait bounds how long a request may sit in the queue before being
+	// refused instead of given a slot. 0 means DefaultMaxWait; negative
+	// disables it.
+	MaxWait time.Duration
 
 	// MaxQueue is how many requests may wait for a slot before the engine
 	// starts refusing them.
@@ -118,6 +133,12 @@ type Stats struct {
 	// which is the right place for it, since a queue says how busy the server
 	// was rather than how fast the model is.
 	PromptEvalDuration time.Duration
+
+	// Timeout records that the reply stopped because it ran out of wall-clock
+	// time. Like Truncated it is a reason rather than a failure: the text
+	// produced so far is real and is returned, and what a caller must not be
+	// told is that a reply cut short finished normally.
+	Timeout bool
 
 	// ReloadDuration is time spent loading a replacement model in the middle of
 	// this request, after the one it started against died.
@@ -308,7 +329,11 @@ func Open(path string, opts Options) (*Engine, error) {
 	if queue <= 0 {
 		queue = DefaultMaxQueue
 	}
-	e.sched = newScheduler(lctx, vocab, tpl, slots, prefix, e.nCtx, batchCapacity, queue)
+	e.sched = newScheduler(lctx, vocab, tpl, slots, prefix, e.nCtx, batchCapacity, queue,
+		deadlines{
+			generate: pick(opts.MaxGenerate, DefaultMaxGenerate),
+			wait:     pick(opts.MaxWait, DefaultMaxWait),
+		})
 	e.sched.onFatal = func() { e.broken.Store(true) }
 	return e, nil
 }
@@ -411,5 +436,26 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p GenParams,
 		}
 	}
 	<-j.done
-	return out.String(), j.stats, j.err
+
+	// A deadline is not a failure at this boundary. The partial reply is worth
+	// more to a caller than an error with nothing attached, so it travels as a
+	// finish reason — see Stats.Timeout — the same way a token budget does.
+	err := j.err
+	var late *TimeoutError
+	if errors.As(err, &late) {
+		j.stats.Timeout, err = true, nil
+	}
+	return out.String(), j.stats, err
+}
+
+// pick resolves a duration option: zero takes the default, negative means the
+// operator turned the limit off and is respected as such.
+func pick(v, def time.Duration) time.Duration {
+	if v == 0 {
+		return def
+	}
+	if v < 0 {
+		return 0
+	}
+	return v
 }
