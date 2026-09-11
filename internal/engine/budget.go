@@ -9,6 +9,17 @@ import (
 
 // Memory budgeting for the accelerator.
 //
+// One thing to know before reading any number here: ggml-metal computes free as
+// recommendedMaxWorkingSetSize minus currentAllocatedSize, and
+// currentAllocatedSize is a property of this process's MTLDevice. So the
+// headroom below is what THIS process has left of its budget, not what the
+// machine has left. Verified: with a 73.4 GiB model resident in another kinfer,
+// a second one loading a 0.5B still reported 76.9 GiB of 77.8 GiB free.
+//
+// That is the uncomfortable part. Every out-of-memory failure observed on this
+// machine happened while another process held GPU memory, and this reading is
+// blind to exactly that.
+//
 // The failure this exists to prevent: kinfer accepts `-ctx 16384 -slots 4`,
 // spends 34 seconds loading 73.5 GiB, answers a few requests, and then dies
 // under load with
@@ -42,13 +53,15 @@ import (
 // failed. So batch size is not demonstrably the trigger, and 1.6 GiB is not
 // demonstrably too little.
 //
-// What is left is the timing: every observed failure happened while another
-// process was doing large prefills, and none happened afterwards. Free memory
-// counts the whole machine, so a margin this thin is at the mercy of whatever
-// else runs — which is worth saying, and is not the same as a threshold that
-// predicts failure. Hence a notice rather than a refusal, and no guard in the
-// scheduler: a mitigation aimed at an unreproduced mechanism is a guess with
-// a runtime cost.
+// What is left is the company: every observed failure happened while another
+// process held GPU memory, and none happened on an exclusive machine. Two of
+// those were self-inflicted — a second kinfer left running with a 73 GiB model
+// resident makes every configuration here fail, reliably, at any concurrency.
+// Since this reading cannot see that process at all, a thin margin is at the
+// mercy of something invisible from here. Worth saying; not the same as a
+// threshold that predicts failure. Hence a notice rather than a refusal, and no
+// guard in the scheduler: a mitigation aimed at an unreproduced mechanism is a
+// guess with a runtime cost.
 const thinHeadroom = 2 << 30 // 2 GiB
 
 // budget tracks the accelerator's free memory across the stages of a load.
@@ -110,11 +123,13 @@ func (b *budget) report(slots, prefix, perSeq int) {
 	}
 
 	log.Printf("memory: only %s of %s is left after loading.\n"+
-		"          Free memory here counts every process on the machine, and a batch\n"+
-		"          that cannot allocate is not recoverable in place: the Metal backend\n"+
-		"          latches the error, llama.cpp reports it fatally, and kinfer retires\n"+
-		"          the model — ending every in-flight and queued request at once.\n"+
-		"          Configurations this tight have run for hours and have also died.\n"+
+		"          This figure is this process's own budget and cannot see other\n"+
+		"          processes — anything else using the GPU eats into it unseen.\n"+
+		"          A batch that then cannot allocate is not recoverable in place: the\n"+
+		"          Metal backend latches the error, llama.cpp reports it fatally, and\n"+
+		"          kinfer retires the model, ending every in-flight and queued request\n"+
+		"          at once. Configurations this tight have run for hours and have also\n"+
+		"          died, so leave room for whatever else runs here.\n"+
 		"          -ctx %d -slots %d, or -ctx %d -slots %d, would leave more.",
 		gib(free), gib(total),
 		suggestCtx(b, slots, prefix, perSeq), slots,

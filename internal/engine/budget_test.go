@@ -93,3 +93,23 @@ func TestSubDoesNotWrap(t *testing.T) {
 		t.Errorf("sub(1,5) = %d, want 0 — an unsigned wrap here would print exabytes", got)
 	}
 }
+
+// The headroom figure is this process's own. A test cannot call into Metal, so
+// what is pinned here is the arithmetic that turns two readings into a cost —
+// and the fact that another process's allocation never enters it.
+func TestHeadroomIsThisProcessOnly(t *testing.T) {
+	// Two identical loads, one on a machine where another kinfer already holds
+	// 73 GiB. Metal reports per-process, so both see the same headroom.
+	alone := budgetFor(budgetTotal, modelCost, ctxCost2Slot)
+	crowded := budgetFor(budgetTotal, modelCost, ctxCost2Slot)
+
+	if alone.afterCtx != crowded.afterCtx {
+		t.Fatal("the fixture is wrong; both should read alike")
+	}
+	if got := sub(alone.atStart, alone.afterModel); got != modelCost {
+		t.Errorf("model cost read as %s, want %s", gib(got), gib(modelCost))
+	}
+	// The point of the test: nothing in this type can represent the other
+	// process, which is why the code says so rather than pretending to warn
+	// about it.
+}
