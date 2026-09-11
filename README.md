@@ -420,10 +420,25 @@ $ kinfer serve -slots 8 -prefix 4
 ```
 
 Each pooled prefix costs a sequence's worth of KV cache, the same as a slot, so
-this is memory traded for latency; `-prefix -1` turns it off. A match must leave
-at least one token to decode — logits exist only for tokens that went through a
-forward pass, and a prompt adopted whole would have nothing to sample the first
-reply token from.
+this is memory traded for latency. A match must leave at least one token to
+decode — logits exist only for tokens that went through a forward pass, and a
+prompt adopted whole would have nothing to sample the first reply token from.
+
+**Reuse is correct but not bit-exact, and that is worth knowing before turning
+it on.** How much of a prompt gets adopted depends on what the pool happens to
+hold: the first request prefills its question in one batch of a dozen tokens,
+and a repeat decodes a single token instead. Different batch shapes mean
+different floating-point reduction orders, so a logit that was a near-tie can
+land the other way.
+
+Measured: with the pool off, the same question produced one output in ten runs;
+with it on, two. Across twenty varied prompts nineteen were byte-identical and
+one differed — an arithmetic question the model was genuinely torn on, where the
+pooled answer happened to be the better one. Nothing is misaligned: a prompt
+reused in full still lets the model quote the last sentence of its own system
+prompt, which a position error would destroy. What is lost is the guarantee that
+a fixed seed reproduces a previous run exactly, so `-prefix -1` turns the pool
+off for callers who need it.
 
 ## Roadmap
 

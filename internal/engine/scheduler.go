@@ -66,6 +66,9 @@ type scheduler struct {
 	steps     int
 	tokSum    int
 	activeSum int
+	admitted  int
+	promptTok int
+	reusedTok int
 	lastLog   time.Time
 }
 
@@ -253,6 +256,12 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 		maxGen = s.ctxPerSeq - len(tokens)
 	}
 
+	if s.debug {
+		s.admitted++
+		s.promptTok += len(tokens)
+		s.reusedTok += reused
+	}
+
 	sl.job = j
 	sl.prompt = tokens
 	sl.nPast = int32(reused)
@@ -305,11 +314,18 @@ func (s *scheduler) step() error {
 		s.tokSum += s.batch.Len()
 		s.activeSum += s.active()
 		if time.Since(s.lastLog) > time.Second {
-			log.Printf("sched: %4d steps/s   mean batch %5.1f tokens   mean active slots %4.1f",
-				s.steps, float64(s.tokSum)/float64(s.steps), float64(s.activeSum)/float64(s.steps))
+			reuse := ""
+			if s.admitted > 0 {
+				reuse = fmt.Sprintf("   admitted %d, prompt %d tokens of which %d reused (%.0f%%)",
+					s.admitted, s.promptTok, s.reusedTok,
+					100*float64(s.reusedTok)/float64(s.promptTok))
+			}
+			log.Printf("sched: %4d steps/s   mean batch %5.1f tokens   mean active slots %4.1f%s",
+				s.steps, float64(s.tokSum)/float64(s.steps), float64(s.activeSum)/float64(s.steps), reuse)
 			// Interval statistics, not cumulative: a mean diluted by an idle
 			// minute says nothing about what happens under load.
 			s.steps, s.tokSum, s.activeSum = 0, 0, 0
+			s.admitted, s.promptTok, s.reusedTok = 0, 0, 0
 			s.lastLog = time.Now()
 		}
 	}

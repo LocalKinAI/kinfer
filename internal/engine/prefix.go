@@ -20,6 +20,27 @@ import (
 // sequence — see Open.
 //
 // Only the scheduler goroutine touches a pool, so nothing here locks.
+//
+// # What reuse costs
+//
+// Adopted cells are correct — a prompt reused in full still lets the model
+// quote the last sentence of its own system prompt, which a position error
+// would destroy — but reuse is not bit-exact.
+//
+// How much of a prompt is adopted varies with what the pool happens to hold.
+// The first request prefills its question in one batch of a dozen tokens; once
+// that prompt is pooled, a repeat decodes a single token instead. Different
+// batch shapes mean different floating-point reduction orders, so a logit that
+// was a near-tie can land the other way.
+//
+// Measured on an M3 Ultra with a 4,000-token system prompt: with the pool off
+// the same question produced one output in ten runs; with it on, two. Across
+// twenty varied prompts, nineteen were byte-identical to the pooled-off run and
+// one differed — an arithmetic question where the model was genuinely torn
+// between two phrasings, and where the pooled answer happened to be the better
+// one. Replies stay on topic and coherent either way; what is lost is the
+// guarantee that a fixed seed reproduces a previous run exactly. A caller that
+// needs that guarantee should run with -prefix -1.
 type prefixPool struct {
 	entries []*prefixEntry
 
