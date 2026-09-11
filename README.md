@@ -257,18 +257,60 @@ Ollama is holding a model at the time, and thread QoS — kinfer already runs at
 `user-interactive`, though clamping it to `background` does halve throughput,
 which is why `cmd/probe` now prints it.
 
-**A note on measuring this at all.** Sustained benchmarking heats the machine,
-and throttling costs kinfer far more than it costs Ollama — over one session
-kinfer fell from 178 to 104 tok/s while Ollama held near 175, which is itself
-evidence that kinfer's critical path is CPU-bound where Ollama's is not. Run to
-run the spread reaches ±40%, wide enough to swallow any change worth making. So
-every comparison here measures Ollama in the same round and reports the ratio.
-A kinfer number on its own, from this machine, means nothing.
+**A note on measuring this at all.** Sustained benchmarking heats a laptop, and
+throttling costs kinfer far more than it costs Ollama — over one session on the
+M4 kinfer fell from 178 to 104 tok/s while Ollama held near 175. Run to run the
+spread reaches ±40%, wide enough to swallow any change worth making. So every
+comparison here measures Ollama in the same round and reports the ratio. A
+kinfer number on its own, from that machine, means nothing.
 
-**Ollama runs one request at a time.** Eight concurrent requests take eight
-times as long as one, aggregate throughput pinned at 165 tok/s, and its log only
-ever shows `slot id 0`. Still true in 0.34.0. Per-stream speed is the smaller of
-the two opportunities.
+### The same code on a Mac Studio
+
+Repeating the protocol on an M3 Ultra (20 performance cores, 96 GB) settles what
+the M4 could not. Same GGUF, byte for byte; eight rounds, order rotated:
+
+| | median tok/s | spread | of Ollama |
+|---|---|---|---|
+| Ollama 0.34.0 | 293.7 | 291–319 | 100% |
+| `llama-cli` | 288.9 | 267–310 | 98% |
+| kinfer | 282.0 | **278–285** | **96%** |
+
+kinfer is within 4% of Ollama and is the *steadiest* of the three, at ±1.3%. The
+per-token breakdown is the explanation: its CPU work is ~540 µs on both machines
+(448–470 µs in `llama_decode`, 88 µs sampling, 1 µs detokenising), stable here
+and swinging between 548 and 1422 µs on the M4. **kinfer's cost was never the
+work itself — it was whether a four-core laptop under thermal load could give
+that work a performance core.**
+
+The decoupling verdict flips with it: on the M3 Ultra a writer goroutine wins 7
+rounds of 8, for +2.5% (95.5% → 97.9% of Ollama). It stays reverted because a
+14% loss on a constrained laptop outweighs 2.5% on a workstation, but the
+mechanism is confirmed and it should be revisited once Phase 2 has a scheduler —
+by then the writer serves many streams and the generation loop must not block.
+
+### The opportunity, measured
+
+**Ollama runs one request at a time**, and a bigger machine does not change it:
+on the M3 Ultra eight concurrent requests still take eight times as long as one,
+its log still shows only `slot id 0`. kinfer serialises too, for now. What
+continuous batching is worth — `llama-server --parallel 8 -cb`, same machine,
+same model, same rounds:
+
+| concurrent requests | llama-server `-cb` | Ollama | kinfer |
+|---|---|---|---|
+| 1 | 207.8 | 273.2 | 266.9 |
+| 4 | **569.2** (2.74×) | 281.4 (1.03×) | 292.5 (1.10×) |
+| 8 | **988.3** (4.76×) | 291.9 (1.07×) | 297.0 (1.11×) |
+| 16 | **1014.0** (4.88×) | 294.6 (1.08×) | 301.4 (1.13×) |
+
+Aggregate tok/s; the multiplier is scaling against that server's own N=1.
+
+Batching costs about 24% of single-stream speed and returns **3.4× more total
+throughput than Ollama at eight concurrent requests.** For one person typing at
+a model that is a bad trade. For a fleet it is the whole game, and neither
+runtime on this machine is taking it.
+
+That is Phase 2, and it is why per-stream speed is the smaller opportunity.
 
 Model load is 0.49 s warm. The first Metal run on a machine pays a one-off ~5 s
 for shader compilation, which macOS then caches — every later process, not just
