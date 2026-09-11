@@ -12,9 +12,6 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
-	"unsafe"
-
-	gollama "github.com/dianlight/gollama.cpp"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/llama"
@@ -58,9 +55,9 @@ func DefaultGenParams() GenParams {
 // runtime, one at a time is the honest tradeoff.
 type Engine struct {
 	mu    sync.Mutex
-	model gollama.LlamaModel
-	lctx  gollama.LlamaContext
-	vocab uintptr
+	model llama.Model
+	lctx  llama.Context
+	vocab llama.Vocab
 	tpl   *chat.Template
 	path  string
 	nCtx  int
@@ -72,60 +69,57 @@ func Open(path string, opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := nativelib.Load(); err != nil {
-		return nil, err
-	}
-	// Bind the entry points gollama omits or gets wrong — real vocabulary size,
-	// real detokenizer, real end-of-generation test.
 	if err := llama.Bind(libDir); err != nil {
 		return nil, err
 	}
 
-	mp := gollama.Model_default_params()
+	mp := llama.DefaultModelParams()
 	mp.NGpuLayers = int32(opts.GPULayers)
 
-	model, err := gollama.Model_load_from_file(path, mp)
-	if err != nil {
-		return nil, fmt.Errorf("load %s: %w", path, err)
+	model := llama.LoadModel(path, mp)
+	if model == 0 {
+		return nil, fmt.Errorf("load %s: llama.cpp could not read the model (see its output above)", path)
 	}
 
-	cp := gollama.Context_default_params()
+	cp := llama.DefaultContextParams()
 	if opts.ContextSize > 0 {
-		setContextSize(&cp, uint32(opts.ContextSize))
+		cp.NCtx = uint32(opts.ContextSize)
 	}
 
-	lctx, err := gollama.Init_from_model(model, cp)
-	if err != nil {
-		gollama.Model_free(model)
-		return nil, fmt.Errorf("create context: %w", err)
+	lctx := llama.NewContext(model, cp)
+	if lctx == 0 {
+		llama.FreeModel(model)
+		return nil, fmt.Errorf("create context for %s", path)
 	}
 
 	tpl := chat.Detect(path)
 	if opts.Template != "" {
 		t, err := chat.Get(opts.Template)
 		if err != nil {
-			gollama.Free(lctx)
-			gollama.Model_free(model)
+			llama.FreeContext(lctx)
+			llama.FreeModel(model)
 			return nil, err
 		}
 		tpl = t
 	}
 
-	// Trust the library, not the request: see setContextSize for why a requested
-	// size can be silently ignored.
-	actualCtx := llama.NCtx(uintptr(lctx))
+	// Ask the library what it actually allocated rather than assuming the
+	// request took effect. This check caught the bug that made -ctx a no-op for
+	// months, and it stays: a struct that silently drifts out of sync with
+	// llama.h would fail here instead of somewhere unrecognisable.
+	actualCtx := llama.NCtx(lctx)
 	if opts.ContextSize > 0 && actualCtx < opts.ContextSize {
-		gollama.Free(lctx)
-		gollama.Model_free(model)
+		llama.FreeContext(lctx)
+		llama.FreeModel(model)
 		return nil, fmt.Errorf("asked for a %d-token context but llama.cpp allocated %d "+
-			"(gollama's context params may have shifted again — see internal/engine/ctxparams.go)",
+			"(llama_context_params may have changed shape — see internal/llama)",
 			opts.ContextSize, actualCtx)
 	}
 
 	return &Engine{
 		model: model,
 		lctx:  lctx,
-		vocab: llama.Vocab(uintptr(model)),
+		vocab: llama.GetVocab(model),
 		tpl:   tpl,
 		path:  path,
 		nCtx:  actualCtx,
@@ -137,11 +131,11 @@ func (e *Engine) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.lctx != 0 {
-		gollama.Free(e.lctx)
+		llama.FreeContext(e.lctx)
 		e.lctx = 0
 	}
 	if e.model != 0 {
-		gollama.Model_free(e.model)
+		llama.FreeModel(e.model)
 		e.model = 0
 	}
 }
@@ -175,10 +169,10 @@ func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onT
 
 	// Wipe the KV cache. Without this, turn N+1 silently inherits turn N's
 	// state and the model answers a question nobody asked.
-	gollama.Memory_clear(e.lctx, true)
+	llama.ClearMemory(e.lctx)
 
 	prompt := e.tpl.Render(msgs)
-	tokens, err := gollama.Tokenize(e.model, prompt, true, true)
+	tokens, err := llama.Tokenize(e.vocab, prompt, true, true)
 	if err != nil {
 		return "", fmt.Errorf("tokenize: %w", err)
 	}
@@ -209,15 +203,14 @@ func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onT
 			break // context is full
 		}
 
-		if err := gollama.Decode(e.lctx, gollama.Batch_get_one(cur)); err != nil {
+		if err := llama.DecodeTokens(e.lctx, cur); err != nil {
 			return out.String(), fmt.Errorf("decode at token %d: %w", i, err)
 		}
 
-		logits := gollama.Get_logits_ith(e.lctx, -1)
-		if logits == nil {
+		row := llama.Logits(e.lctx, -1, nVocab)
+		if row == nil {
 			return out.String(), fmt.Errorf("no logits at token %d", i)
 		}
-		row := unsafe.Slice(logits, nVocab)
 		for j := range row {
 			cands[j] = sampling.Candidate{ID: int32(j), Logit: row[j]}
 		}
@@ -249,7 +242,7 @@ func (e *Engine) Chat(ctx context.Context, msgs []chat.Message, p GenParams, onT
 		if hitStop {
 			return text, nil
 		}
-		cur = []gollama.LlamaToken{gollama.LlamaToken(tok)}
+		cur = []llama.Token{tok}
 	}
 
 	text, _ := e.tpl.TrimStop(out.String())

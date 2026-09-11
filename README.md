@@ -155,9 +155,9 @@ silently loading the wrong 7B model is worse than a message.
  templates  temp/    ~/.kinfer/   Hugging Face   embeds llama.cpp
             top-k/p  models       downloads      in the binary
             │
-      internal/llama            binds what gollama omits or gets wrong
+      internal/llama            llama.cpp's C API, bound directly
             │
-      gollama.cpp (purego)      no CGO, so cross-compilation survives
+      purego                    no CGO, so cross-compilation survives
             │
       libllama.dylib + 7 ggml libraries   (4.6 MB, embedded)
 ```
@@ -166,11 +166,18 @@ silently loading the wrong 7B model is worse than a message.
 which keeps `GOOS=linux go build` working from a Mac and keeps the binary free
 of a C toolchain dependency.
 
+**One dependency.** `go.mod` requires `purego` and nothing else — the entire
+llama.cpp surface kinfer uses is about twenty entry points bound in
+`internal/llama`, including the by-value structs that usually force a project
+onto libffi.
+
 ## Build
 
 ```bash
-# Fetch the native libraries once, into the package that embeds them
-go run github.com/dianlight/gollama.cpp/cmd/gollama-download \
+# Fetch the native libraries once, into the package that embeds them.
+# gollama.cpp is no longer a dependency — only its downloader is used, so it is
+# run at a pinned version rather than required by go.mod.
+go run github.com/dianlight/gollama.cpp/cmd/gollama-download@v0.2.2-llamacpp.b6862 \
     -download -copy-libs -libs-dir internal/nativelib/libs
 
 # The libraries end up inside the binary
@@ -203,40 +210,48 @@ only needs the best 40 — partial selection will bring that back.
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks
       vs Ollama
 
-## Upstream issues found
+## Why llama.cpp is bound directly
 
-Five bugs in `gollama.cpp` v0.2.2. Four are solved properly — `internal/llama`
-binds the real llama.cpp entry points through purego, so no CGO is introduced.
-All of them deserve patches upstream.
+kinfer started on `gollama.cpp` v0.2.2 and found five bugs in it, every one of
+the kind that does not announce itself. It now binds llama.cpp itself, which
+deleted the dependency and all three workarounds along with it.
 
-**Vocabulary size is hardcoded to 32.** `Token_data_array_from_logits` contains
-`nVocab := int32(32)` with the comment *"to avoid corruption issues"*. Qwen2.5
-has 151,936 tokens, so every candidate list was truncated to the first 32 —
-sampling over that produces garbage no matter how correct the algorithm is.
-Solved by binding `llama_vocab_n_tokens`.
+**Vocabulary size was hardcoded to 32.** `Token_data_array_from_logits`
+contained `nVocab := int32(32)` with the comment *"to avoid corruption issues"*.
+Qwen2.5 has 151,936 tokens, so every candidate list was truncated to the first
+32 — sampling over that produces garbage no matter how correct the algorithm is.
 
-**Context parameters are shifted by one field.** llama.cpp removed `seed` from
-`llama_context_params`, but gollama's Go mirror still declares it first, so
-`NCtx` lands in `n_batch`, `NBatch` in `n_ubatch`, and so on. Nothing errors —
-the settings just do not apply. Demonstrated with
-`cp.Seed = 8192; cp.NCtx = 111` → `n_ctx = 8192`. Worked around in
-`internal/engine/ctxparams.go`, with a self-check that fails loudly if a future
-gollama fixes the layout and quietly re-breaks the workaround.
+**`llama_context_params` was shifted, twice.** The Go mirror still declared a
+`seed` field that llama.cpp removed, and was missing `flash_attn_type`
+entirely — so fields landed one and then two slots early. A size assigned to
+`NCtx` arrived as `n_batch`. Nothing errored; the context simply stayed at
+llama.cpp's 512-token default, which surfaced as "prompt is 8267 tokens but the
+context holds 4096" no matter what `-ctx` said. Transcribing the struct from
+`llama.h` fixed it: asking for 4096 now yields 4096, verified after every load.
 
-**`Token_to_piece` returns raw vocabulary text.** It calls
+**`Token_to_piece` returned raw vocabulary text.** It called
 `llama_vocab_get_text` rather than `llama_token_to_piece`, so generated text
-arrives byte-level encoded — `ĠMerkleĠtree` instead of ` Merkle tree`. Solved by
-binding the real `llama_token_to_piece`.
+arrived byte-level encoded — `ĠMerkleĠtree` instead of ` Merkle tree`.
 
-**Only a greedy sampler is bound.** No temperature, top-k, top-p, or repetition
-penalty — and greedy decoding degenerates into loops. Solved by
-`internal/sampling`, which samples from the raw logits.
+**Only a greedy sampler was bound.** No temperature, top-k, top-p or repetition
+penalty — and greedy decoding degenerates into loops. `internal/sampling` fills
+the gap for now; binding `llama_sampler_chain_*` is next, and is worth roughly
+3x on the sampled path.
 
-**`Config.LibraryPath` is accepted and discarded.** `ApplyConfig` unloads the
-current library but never stores the new path. Setting `DYLD_LIBRARY_PATH`
-in-process does not help either — the dynamic linker reads it at exec time.
-Worked around in `internal/nativelib` by `chdir`-ing into the library directory
-for the duration of `Backend_init`, since `dlopen` is called with a bare name.
+**`Config.LibraryPath` was accepted and discarded.** `ApplyConfig` unloaded the
+current library but never stored the new path, and `DYLD_LIBRARY_PATH` is read
+at exec time so setting it in-process does nothing. kinfer worked around it by
+`chdir`-ing into the library directory — process-wide state, changed underneath
+every other goroutine — because gollama called `dlopen` with a bare name.
+`internal/llama` passes an absolute path, and libllama's `LC_RPATH` is
+`@loader_path`, so its seven ggml siblings resolve from the same directory with
+no help at all.
+
+What replaced all of it is one file of about twenty bound entry points. purego
+handles llama.cpp's by-value structs (`llama_batch` at 56 bytes,
+`llama_context_params` at 120) directly, so libffi is not needed either — `bind`
+asserts each struct's size against `llama.h` at startup, because a silent layout
+drift is exactly the failure mode this package exists to end.
 
 ## License
 

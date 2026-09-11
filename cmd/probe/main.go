@@ -18,14 +18,11 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-	"unsafe"
-
-	gollama "github.com/dianlight/gollama.cpp"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/llama"
-	"github.com/LocalKinAI/kinfer/internal/sampling"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
+	"github.com/LocalKinAI/kinfer/internal/sampling"
 )
 
 func main() {
@@ -50,7 +47,7 @@ func main() {
 	}
 
 	fmt.Printf("── kinfer probe ──────────────────────────────\n")
-	fmt.Printf("  binding : gollama.cpp (purego, no CGO)\n")
+	fmt.Printf("  binding : internal/llama (purego, no CGO)\n")
 	fmt.Printf("  model   : %s\n", *modelPath)
 	fmt.Printf("  ngl     : %d %s\n", *nGpuLayer, backendLabel(*nGpuLayer))
 	fmt.Println()
@@ -66,44 +63,41 @@ func main() {
 	fmt.Printf("  ✅ libs unpacked          %6.2fs  %s\n", time.Since(tLib).Seconds(), libDir)
 
 	tInit := time.Now()
-	if err := nativelib.Load(); err != nil {
-		fatal("could not initialise the embedded llama.cpp: %v", err)
-	}
-	defer gollama.Backend_free()
-	fmt.Printf("  ✅ native lib loaded      %6.2fs\n", time.Since(tInit).Seconds())
-
-	// Bind the entry points gollama gets wrong or omits — real vocabulary size,
-	// real detokenizer, real end-of-generation test.
 	if err := llama.Bind(libDir); err != nil {
 		fatal("could not bind llama.cpp symbols: %v", err)
 	}
+	defer llama.BackendFree()
+	fmt.Printf("  ✅ native lib loaded      %6.2fs\n", time.Since(tInit).Seconds())
 
 	// ---- load model ----
-	mp := gollama.Model_default_params()
+	mp := llama.DefaultModelParams()
 	mp.NGpuLayers = int32(*nGpuLayer)
 
 	tLoad := time.Now()
-	model, err := gollama.Model_load_from_file(*modelPath, mp)
-	if err != nil {
-		fatal("Model_load_from_file failed: %v", err)
+	model := llama.LoadModel(*modelPath, mp)
+	if model == 0 {
+		fatal("llama_model_load_from_file failed for %s", *modelPath)
 	}
-	defer gollama.Model_free(model)
+	defer llama.FreeModel(model)
 	loadSec := time.Since(tLoad).Seconds()
 	fmt.Printf("  ✅ model loaded           %6.2fs\n", loadSec)
 
-	vocab := llama.Vocab(uintptr(model))
+	vocab := llama.GetVocab(model)
 	nVocab := llama.NVocab(vocab)
-	fmt.Printf("  ✅ vocabulary            %6d tokens  (gollama reports 32)\n", nVocab)
+	fmt.Printf("  ✅ vocabulary            %6d tokens\n", nVocab)
 
 	// ---- context ----
-	cp := gollama.Context_default_params()
+	cp := llama.DefaultContextParams()
 	cp.NCtx = uint32(*nCtx)
 
-	lctx, err := gollama.Init_from_model(model, cp)
-	if err != nil {
-		fatal("Init_from_model failed: %v", err)
+	lctx := llama.NewContext(model, cp)
+	if lctx == 0 {
+		fatal("llama_init_from_model failed")
 	}
-	defer gollama.Free(lctx)
+	if got := llama.NCtx(lctx); got != *nCtx {
+		fatal("asked for n_ctx=%d but llama.cpp allocated %d", *nCtx, got)
+	}
+	defer llama.FreeContext(lctx)
 
 	// ---- build the prompt ----
 	// Without the template this is text continuation, not conversation: the
@@ -121,7 +115,7 @@ func main() {
 	}
 
 	// ---- tokenize ----
-	tokens, err := gollama.Tokenize(model, promptText, true, true)
+	tokens, err := llama.Tokenize(vocab, promptText, true, true)
 	if err != nil {
 		fatal("Tokenize failed: %v", err)
 	}
@@ -159,19 +153,17 @@ func main() {
 	stopped := false
 
 	for i := 0; i < *maxTokens; i++ {
-		batch := gollama.Batch_get_one(cur)
-		if err := gollama.Decode(lctx, batch); err != nil {
+		if err := llama.DecodeTokens(lctx, cur); err != nil {
 			fmt.Println()
 			fatal("Decode failed at token %d: %v", i, err)
 		}
 
 		// Read the full logits row — nVocab entries, indexed by token id.
-		logits := gollama.Get_logits_ith(lctx, -1)
-		if logits == nil {
+		row := llama.Logits(lctx, -1, nVocab)
+		if row == nil {
 			fmt.Println()
 			fatal("no logits at token %d", i)
 		}
-		row := unsafe.Slice(logits, nVocab)
 		for j := range row {
 			cands[j] = sampling.Candidate{ID: int32(j), Logit: row[j]}
 		}
@@ -209,7 +201,7 @@ func main() {
 			stopped = true
 			break
 		}
-		cur = []gollama.LlamaToken{gollama.LlamaToken(tok)}
+		cur = []llama.Token{tok}
 	}
 
 	genSec := time.Since(tGen).Seconds()
