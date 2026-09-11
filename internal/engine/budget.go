@@ -38,9 +38,18 @@ import (
 //
 // So the line sits at 2 GiB, between the one that died and the ones that did
 // not. Absolute rather than a fraction of the budget: what fails is a transient
-// allocation for one batch, whose size follows the model and the batch, not the
-// machine's total. Three points on one machine is a rule of thumb, not a law —
-// which is the other reason this only warns.
+// allocation for one batch, and Metal sizes that command buffer by the batch,
+// not by the machine. Three points on one machine is a rule of thumb, not a
+// law — which is the other reason this only warns.
+//
+// The reading is also taken at the wrong moment to be complete. It happens once
+// the context exists, and the allocation most likely to exhaust what is left is
+// the prefill batch, which has not been built yet. A sibling session
+// demonstrated the point cleanly by running two 0.5B models — 1.6 GiB of
+// weights between them — into the same OOM with 3000-token prompts. kinfer
+// chunks prefill at 512 tokens per slot so its batch is bounded, but bounded is
+// not accounted for, and the ceiling rises with -slots. A configuration that
+// clears this check can still be too tight for its own prompts.
 const thinHeadroom = 2 << 30 // 2 GiB
 
 // budget tracks the accelerator's free memory across the stages of a load.
