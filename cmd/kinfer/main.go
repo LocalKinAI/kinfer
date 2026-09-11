@@ -348,6 +348,7 @@ func cmdServe(args []string) error {
 	ngl := fs.Int("ngl", 99, "layers to offload to GPU (0 = CPU only)")
 	nCtx := fs.Int("ctx", 4096, "context size per conversation, in tokens")
 	slots := fs.Int("slots", engine.DefaultSlots, "conversations served at once (use 8, 32, 64 or 128 — never 12-16)")
+	prefix := fs.Int("prefix", engine.DefaultPrefixSlots, "prompt prefixes kept resident so repeat requests skip prefilling them (-1 disables)")
 	keepAlive := fs.Duration("keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -357,13 +358,18 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	srv := server.New(st, engine.Options{GPULayers: *ngl, ContextSize: *nCtx, Slots: *slots})
+	srv := server.New(st, engine.Options{
+		GPULayers: *ngl, ContextSize: *nCtx, Slots: *slots, PrefixSlots: *prefix,
+	})
 	srv.SetKeepAlive(*keepAlive)
 	defer srv.Close()
 
 	models, _ := st.List()
 	fmt.Printf("kinfer serving on %s — %d model(s) in %s\n", *addr, len(models), st.Root())
 	fmt.Printf("  %d slots × %d tokens — conversations share one forward pass\n", *slots, *nCtx)
+	if *prefix > 0 {
+		fmt.Printf("  %d prefix slots — a repeated system prompt is prefilled once\n", *prefix)
+	}
 	fmt.Printf("  Ollama API : POST %s/api/chat        GET %s/api/tags\n", *addr, *addr)
 	fmt.Printf("  OpenAI API : POST %s/v1/chat/completions\n\n", *addr)
 	fmt.Printf("  point LocalKin at it by setting a soul's brain.endpoint to %s\n\n", *addr)

@@ -39,6 +39,15 @@ type Options struct {
 	// returns less. See the table in README. 0 means 8.
 	Slots int
 
+	// PrefixSlots is how many prompt prefixes stay resident so repeat requests
+	// skip prefilling them. An agent's system prompt is identical on every turn
+	// it takes, and pooling it turns thousands of tokens of prefill into a
+	// pointer walk.
+	//
+	// Each one costs a sequence's worth of KV cache, the same as a slot, so
+	// this is memory traded for latency. Negative disables the pool.
+	PrefixSlots int
+
 	// Template forces a chat family ("chatml", "llama3", "mistral").
 	// Empty means guess from the filename.
 	Template string
@@ -61,6 +70,10 @@ const (
 
 	// DefaultContextSize is the context one conversation gets.
 	DefaultContextSize = 4096
+
+	// DefaultPrefixSlots pools a few prefixes by default. Four covers a handful
+	// of distinct system prompts without doubling the KV cache.
+	DefaultPrefixSlots = 4
 
 	// batchCapacity bounds one forward pass: a full prefill chunk plus a token
 	// for every slot, with room to spare.
@@ -124,13 +137,29 @@ func Open(path string, opts Options) (*Engine, error) {
 	if perSeq <= 0 {
 		perSeq = DefaultContextSize
 	}
+	prefix := opts.PrefixSlots
+	if prefix == 0 {
+		prefix = DefaultPrefixSlots
+	}
+	if prefix < 0 {
+		prefix = 0
+	}
 
 	cp := llama.DefaultContextParams()
-	cp.NSeqMax = uint32(slots)
+	// Pooled prefixes live in sequence ids above the slots, and each needs a
+	// sequence's worth of cache.
+	cp.NSeqMax = uint32(slots + prefix)
 	// llama.cpp divides n_ctx between sequences, so ask for the total.
-	cp.NCtx = uint32(perSeq * slots)
+	cp.NCtx = uint32(perSeq * (slots + prefix))
 	if cp.NBatch < uint32(batchCapacity) {
 		cp.NBatch = uint32(batchCapacity)
+	}
+	if prefix > 0 {
+		// A cell can only belong to several sequences in the unified buffer,
+		// and sharing cells is the entire point of the pool. llama.cpp warns
+		// that unified costs performance when sequences do NOT share a large
+		// prefix — here they are chosen precisely because they do.
+		cp.KVUnified = 1
 	}
 
 	lctx := llama.NewContext(model, cp)
@@ -155,12 +184,14 @@ func Open(path string, opts Options) (*Engine, error) {
 	// months, and it stays: a struct that silently drifts out of sync with
 	// llama.h would fail here instead of somewhere unrecognisable.
 	actualCtx := llama.NCtx(lctx)
-	if actualCtx < perSeq*slots {
+	wantCtx := perSeq * (slots + prefix)
+	if actualCtx < wantCtx {
 		llama.FreeContext(lctx)
 		llama.FreeModel(model)
-		return nil, fmt.Errorf("asked for a %d-token context (%d slots x %d) but llama.cpp allocated %d "+
+		return nil, fmt.Errorf("asked for a %d-token context (%d slots + %d prefix slots x %d) "+
+			"but llama.cpp allocated %d "+
 			"(llama_context_params may have changed shape — see internal/llama)",
-			perSeq*slots, slots, perSeq, actualCtx)
+			wantCtx, slots, prefix, perSeq, actualCtx)
 	}
 
 	vocab := llama.GetVocab(model)
@@ -170,10 +201,10 @@ func Open(path string, opts Options) (*Engine, error) {
 		vocab: vocab,
 		tpl:   tpl,
 		path:  path,
-		nCtx:  actualCtx / slots,
+		nCtx:  actualCtx / (slots + prefix),
 		slots: slots,
 	}
-	e.sched = newScheduler(lctx, vocab, tpl, slots, actualCtx, batchCapacity)
+	e.sched = newScheduler(lctx, vocab, tpl, slots, prefix, e.nCtx, batchCapacity)
 	return e, nil
 }
 

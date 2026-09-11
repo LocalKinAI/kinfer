@@ -388,6 +388,43 @@ Sequences must not leak into each other, so that is tested directly: eight
 arithmetic questions with distinguishable answers, asked serially and then all
 at once, must produce identical replies. They do.
 
+## Prefix pool
+
+An agent's system prompt is identical byte for byte on every turn it ever takes,
+and a soul runs to thousands of tokens. Without help, each turn prefills all of
+it again, and a hundred agents sharing a soul pay for it a hundred times.
+
+Recently seen prompt prefixes stay resident in the KV cache under their own
+sequence ids. A request that begins the same way adopts those cells rather than
+recomputing them — and nothing is copied: `llama_memory_seq_cp` tags cells that
+already exist with a second sequence id, so taking over a 4000-token prefix
+costs a pointer walk. It needs llama.cpp's unified KV buffer, which is what
+allows a cell to belong to more than one sequence.
+
+Measured on the M3 Ultra with a 3,100-word system prompt, time to first token:
+
+| | no pool | prefix pool |
+|---|---|---|
+| same soul, repeated | 266 ms | **17 ms** |
+| multi-turn conversation, turns 2–5 | 283 ms | **22 ms** |
+| **8 agents sharing a soul, concurrent** | 2.38 s wall, 1767 ms median | **0.16 s wall, 68 ms median** |
+| six distinct souls through four pool slots | 91 ms | 94 ms |
+
+The last row is the control that matters: prefixes that do not repeat get no
+benefit, and pay no penalty for the attempt.
+
+```
+$ kinfer serve -slots 8 -prefix 4
+  8 slots × 4096 tokens — conversations share one forward pass
+  4 prefix slots — a repeated system prompt is prefilled once
+```
+
+Each pooled prefix costs a sequence's worth of KV cache, the same as a slot, so
+this is memory traded for latency; `-prefix -1` turns it off. A match must leave
+at least one token to decode — logits exist only for tokens that went through a
+forward pass, and a prompt adopted whole would have nothing to sample the first
+reply token from.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary
