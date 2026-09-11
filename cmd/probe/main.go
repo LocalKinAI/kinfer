@@ -135,6 +135,14 @@ func main() {
 
 	fmt.Printf("── output ────────────────────────────────────\n  ")
 
+	// Apple Silicon steers low-QoS threads onto efficiency cores, where
+	// llama_decode's CPU half takes roughly twice as long (measured: 2035
+	// µs/token clamped to background against 719 at the default). Worth
+	// printing, because it is invisible otherwise and explains an otherwise
+	// baffling halving of throughput.
+	initQoS()
+	fmt.Printf("  thread QoS     : %s\n", qosReport())
+
 	cur := tokens
 	tGen := time.Now()
 	var firstTokenAt time.Duration
@@ -146,7 +154,7 @@ func main() {
 	// around the forward pass. Comparing that against kinfer's wall clock would
 	// flatter Ollama by whatever detokenisation and string handling cost here,
 	// so measure both and say which is which.
-	var decodeTime time.Duration
+	var decodeTime, syncTime, sampleTime, pieceTime time.Duration
 
 	// Streaming detokenization.
 	//
@@ -165,18 +173,31 @@ func main() {
 			fmt.Println()
 			fatal("Decode failed at token %d: %v", i, err)
 		}
+		tAfterDecode := time.Now()
+		decodeTime += tAfterDecode.Sub(tStep)
+
+		// Touch the logits before sampling. On Metal llama_decode may only
+		// enqueue the forward pass, in which case the wait for the GPU happens
+		// at the first read — and would otherwise be charged to the sampler.
+		if row := llama.Logits(lctx, -1, nVocab); row != nil {
+			_ = row[0]
+		}
+		tAfterSync := time.Now()
+		syncTime += tAfterSync.Sub(tAfterDecode)
 
 		// Sampling runs inside llama.cpp over its own logit buffer — no copy
 		// of the 151,936-entry row crosses into Go.
 		tok := sampler.Sample(lctx)
-		decodeTime += time.Since(tStep)
+		sampleTime += time.Since(tAfterSync)
 		if llama.IsEOG(vocab, tok) {
 			stopped = true
 			break
 		}
 
 		// The real detokenizer — no byte-level post-processing needed.
+		tPiece := time.Now()
 		piece := llama.TokenToPiece(vocab, tok, false)
+		pieceTime += time.Since(tPiece)
 		if generated == 0 {
 			firstTokenAt = time.Since(tGen)
 		}
@@ -212,8 +233,13 @@ func main() {
 	fmt.Printf("  time to first  : %.2fs\n", firstTokenAt.Seconds())
 	fmt.Printf("  throughput     : %.1f tok/s  (wall clock, everything included)\n", float64(generated)/genSec)
 	if decodeTime > 0 {
-		fmt.Printf("  decode only    : %.1f tok/s  (forward pass + sampling, comparable to Ollama's eval_duration)\n",
-			float64(generated)/decodeTime.Seconds())
+		n := float64(generated)
+		fmt.Printf("  decode+sample  : %.1f tok/s  (comparable to Ollama's eval_duration)\n",
+			n/(decodeTime+syncTime+sampleTime).Seconds())
+		fmt.Printf("  llama_decode   : %5.0f µs/token\n", float64(decodeTime.Microseconds())/n)
+		fmt.Printf("  first logit read:%5.0f µs/token  (GPU wait, if decode is async)\n", float64(syncTime.Microseconds())/n)
+		fmt.Printf("  sampler        : %5.0f µs/token  (after the GPU is known to be done)\n", float64(sampleTime.Microseconds())/n)
+		fmt.Printf("  token_to_piece : %.0f µs/token\n", float64(pieceTime.Microseconds())/n)
 	}
 	fmt.Printf("  model load     : %.2fs\n", loadSec)
 	if generated > 0 {

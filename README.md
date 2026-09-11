@@ -209,19 +209,41 @@ fixes, and because it proved the struct assertions work, not for speed. An
 earlier +16% claim here was wrong: it compared runs from different sessions,
 which on this machine is not a measurement.
 
-**kinfer decodes 23–32% slower than Ollama, and is far more sensitive to machine
-state:**
+**kinfer's own overhead is 46%, and it is all CPU-side work between GPU
+dispatches.** Every layer measured in the same interleaved rounds, same GGUF,
+greedy, 200 tokens:
 
-| | median | best |
+| | median tok/s | of native |
 |---|---|---|
-| Ollama 0.34.0 | 175.7 | 177.3 tok/s |
-| kinfer | 120.2 | 136.0 tok/s |
+| `llama-bench` (pipelined, never samples) | 181.1 | 103% |
+| `llama-cli` (real autoregressive generation) | 176.6 | 100% |
+| Ollama 0.34.0 | 180.2 | 102% |
+| a Go loop that only calls `llama_decode` | 157.2 | 89% |
+| + sampling and detokenisation (`cmd/probe`) | 136.2 | 77% |
+| + HTTP streaming (`kinfer serve`) | 95.0 | 54% |
 
-Ollama holds ±2% across rounds where kinfer swings by a third. That sensitivity
-is unexplained. Ruled out so far: Go's GC, GOMAXPROCS, `n_batch`, and Go-side
-detokenisation and string handling — `cmd/probe` times decode alone as well as
-wall clock, and the two agree to 0.3% — plus the Metal feature flags, which read
-identically on both (`fusion`, `concurrency`, `graph optimize` all on).
+`llama-cli` is the honest ceiling: it generates autoregressively with a sampler,
+exactly as kinfer does, on the same embedded b10901 libraries. `llama-bench` is
+not a fair comparison — its generation loop never reads the logits, so its CPU
+work overlaps the GPU in a way real generation cannot.
+
+Reading the logits is free (164.8 tok/s against 161.9 without), so the cost is
+not the GPU synchronisation. It is that **the GPU sits idle while Go works.**
+`cmd/probe` breaks a token down: the GPU wait is a stable ~5.4 ms, the sampler
+90–219 µs, detokenisation 2–5 µs — and `llama_decode`'s own CPU half swings
+between 548 and 1422 µs. Each millisecond spent on the CPU between dispatches is
+a millisecond the GPU is not computing, and kinfer serialises all of it.
+
+That makes the HTTP layer the biggest single loss: a JSON encode, a socket write
+and a flush per token, on the critical path between two GPU dispatches. Moving
+it to a writer goroutine behind a buffered channel should recover most of that
+30%, and the same applies to detokenisation.
+
+Ruled out along the way: Go's GC (`GOGC=off`), `GOMAXPROCS`, async preemption,
+`runtime.LockOSThread`, `n_batch`, `go run` versus a prebuilt binary, process
+nice level (native runs at the same one), and thread QoS — kinfer already runs
+at `user-interactive`, though clamping it to `background` does halve throughput,
+which is why `cmd/probe` now prints it.
 
 **Ollama runs one request at a time.** Eight concurrent requests take eight
 times as long as one, aggregate throughput pinned at 165 tok/s, and its log only
