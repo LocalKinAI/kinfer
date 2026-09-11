@@ -859,3 +859,79 @@ func TestLoadDurationUnchangedWithoutARetry(t *testing.T) {
 			time.Duration(got.LoadDuration), time.Duration(got.TotalDuration))
 	}
 }
+
+// busyEngine refuses everything, the way a full queue does.
+type busyEngine struct {
+	fakeEngine
+	retryAfter time.Duration
+}
+
+func (b *busyEngine) ChatFull(context.Context, []chat.Message, engine.GenParams, func(string)) (string, engine.Stats, error) {
+	return "", engine.Stats{}, &engine.BusyError{Waiting: 128, Capacity: 128, RetryAfter: b.retryAfter}
+}
+func (b *busyEngine) Chat(context.Context, []chat.Message, engine.GenParams, func(string)) (string, error) {
+	return "", &engine.BusyError{Waiting: 128, Capacity: 128, RetryAfter: b.retryAfter}
+}
+
+func serveBusy(t *testing.T, path, body string, retryAfter time.Duration) *httptest.ResponseRecorder {
+	t.Helper()
+	srv, _ := newTestServer(t, "alpha")
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return &busyEngine{fakeEngine: fakeEngine{path: p}, retryAfter: retryAfter}, nil
+	}
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(body)))
+	return w
+}
+
+// A refused request must come back as 503, not 500. They mean different things
+// to a fleet: retrying a 500 hammers a broken server, giving up on a 503
+// abandons work that would have succeeded.
+func TestFullQueueAnswers503(t *testing.T) {
+	for _, c := range []struct{ name, path, body string }{
+		{"ollama non-streaming", "/api/chat",
+			`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`},
+		{"ollama streaming", "/api/chat",
+			`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":true}`},
+		{"openai non-streaming", "/v1/chat/completions",
+			`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`},
+		{"openai streaming", "/v1/chat/completions",
+			`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":true}`},
+	} {
+		w := serveBusy(t, c.path, c.body, 0)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s: status %d, want 503 — a busy server is not a broken one:\n%s",
+				c.name, w.Code, w.Body.String())
+		}
+	}
+}
+
+// A streaming request that is refused must not have opened a stream first. A
+// 200 whose body says "busy" is the failure mode this project exists to avoid.
+func TestRefusedStreamNeverOpens(t *testing.T) {
+	w := serveBusy(t, "/api/chat",
+		`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":true}`, 0)
+	if ct := w.Header().Get("Content-Type"); strings.Contains(ct, "ndjson") {
+		t.Errorf("Content-Type = %q — the stream header went out before the refusal", ct)
+	}
+	if strings.Contains(w.Body.String(), `"done":true`) {
+		t.Error("a terminal stream object was emitted for a request that never ran")
+	}
+}
+
+// Retry-After is sent only when there is a measurement behind it. A guessed
+// interval brings every refused caller back at the same invented moment.
+func TestRetryAfterOnlyWhenMeasured(t *testing.T) {
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`
+
+	w := serveBusy(t, "/api/chat", body, 0)
+	if got := w.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After = %q with no estimate available, want it absent", got)
+	}
+
+	w = serveBusy(t, "/api/chat", body, 4500*time.Millisecond)
+	if got := w.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("Retry-After = %q for a 4.5s estimate, want \"5\" — whole seconds, rounded up "+
+			"so the caller is not invited back before the work can have finished", got)
+	}
+}

@@ -51,6 +51,19 @@ type Options struct {
 	// this is memory traded for latency. Negative disables the pool.
 	PrefixSlots int
 
+	// MaxQueue is how many requests may wait for a slot before the engine
+	// starts refusing them.
+	//
+	// It is a decision about honesty rather than capacity. Unbounded queueing
+	// does not serve more requests, it only hides how far behind the server is,
+	// and it hides it in the worst possible form — an open connection that
+	// looks like a slow model. A refusal is something a fleet can act on.
+	//
+	// The right depth is roughly how much work you would still want done by the
+	// time the front of the queue is answered; past that the answers are stale
+	// anyway. 0 means DefaultMaxQueue.
+	MaxQueue int
+
 	// Template forces a chat family ("chatml", "llama3", "mistral").
 	// Empty means guess from the filename.
 	Template string
@@ -139,6 +152,16 @@ const (
 	// DefaultPrefixSlots pools a few prefixes by default. Four covers a handful
 	// of distinct system prompts without doubling the KV cache.
 	DefaultPrefixSlots = 4
+
+	// DefaultMaxQueue is sixteen requests of waiting per slot.
+	//
+	// Deep enough that a fleet arriving all at once is absorbed rather than
+	// half-refused — 150 agents against the default 8 slots fits with room to
+	// spare — and shallow enough that the wait at the back is measured in
+	// minutes rather than hours. Past that an answer arrives long after the
+	// agent that asked for it has moved on, and the queue is storing work
+	// nobody still wants.
+	DefaultMaxQueue = 128
 
 	// batchCapacity bounds one forward pass: a full prefill chunk plus a token
 	// for every slot, with room to spare.
@@ -281,7 +304,11 @@ func Open(path string, opts Options) (*Engine, error) {
 		nCtx:  actualCtx / (slots + prefix),
 		slots: slots,
 	}
-	e.sched = newScheduler(lctx, vocab, tpl, slots, prefix, e.nCtx, batchCapacity)
+	queue := opts.MaxQueue
+	if queue <= 0 {
+		queue = DefaultMaxQueue
+	}
+	e.sched = newScheduler(lctx, vocab, tpl, slots, prefix, e.nCtx, batchCapacity, queue)
 	e.sched.onFatal = func() { e.broken.Store(true) }
 	return e, nil
 }

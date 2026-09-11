@@ -63,6 +63,10 @@ type scheduler struct {
 	stop     chan struct{}
 	stopped  chan struct{}
 
+	// rate is how fast requests have actually been finishing, which is the only
+	// honest basis for telling a refused caller when to come back.
+	rate completionRate
+
 	// debug counters, printed when KINFER_DEBUG_SCHED is set. Batch
 	// composition is the thing worth watching: if steps mostly carry one token
 	// the slots are not filling and the batching is theoretical.
@@ -134,7 +138,7 @@ type slot struct {
 	logitIdx int32
 }
 
-func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSlots, nPrefix, ctxPerSeq, batchCap int) *scheduler {
+func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSlots, nPrefix, ctxPerSeq, batchCap, maxQueue int) *scheduler {
 	s := &scheduler{
 		lctx:      lctx,
 		vocab:     vocab,
@@ -142,7 +146,7 @@ func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSl
 		ctxPerSeq: ctxPerSeq,
 		batch:     llama.NewBatchBuilder(batchCap),
 		slots:     make([]*slot, nSlots),
-		incoming:  make(chan *job, 64),
+		incoming:  make(chan *job, maxQueue),
 		stop:      make(chan struct{}),
 		stopped:   make(chan struct{}),
 		debug:     os.Getenv("KINFER_DEBUG_SCHED") != "",
@@ -160,14 +164,33 @@ func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSl
 // closes, then checks err.
 func (s *scheduler) submit(j *job) error {
 	select {
-	case s.incoming <- j:
-		return nil
 	case <-s.stop:
 		// Same case as a job drained from the queue: nothing of this request
 		// happened, so a caller able to reload can simply run it again.
 		return ErrNotStarted
+	default:
+	}
+
+	select {
+	case s.incoming <- j:
+		return nil
+	case <-s.stop:
+		return ErrNotStarted
+	default:
+		// The queue is full. Refuse, rather than block until something times
+		// out: a caller told it is 200 deep can back off, and a caller left
+		// holding an open connection cannot tell that from a slow model.
+		waiting := len(s.incoming)
+		return &BusyError{
+			Waiting:    waiting,
+			Capacity:   cap(s.incoming),
+			RetryAfter: s.rate.wait(waiting),
+		}
 	}
 }
+
+// Waiting is how many requests are queued for a slot.
+func (s *scheduler) Waiting() int { return len(s.incoming) }
 
 func (s *scheduler) close() {
 	close(s.stop)
@@ -557,6 +580,7 @@ func (s *scheduler) release(sl *slot, err error) {
 	}
 
 	sl.job.finish(err)
+	s.rate.done()
 	sl.job = nil
 	sl.prompt = nil
 	sl.logitIdx = -1

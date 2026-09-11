@@ -448,7 +448,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	if len(req.Tools) > 0 {
 		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeGenError(w, err)
 			return
 		}
 		// Thinking first: a reasoning model decides on its tool call inside the
@@ -480,7 +480,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	if !stream {
 		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeGenError(w, err)
 			return
 		}
 		thinking, content := chat.SplitThinking(text)
@@ -504,8 +504,20 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming unsupported"})
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.WriteHeader(http.StatusOK)
+	// The header is written on the first thing actually sent, not here. A full
+	// queue is refused at admission, before any token exists, and deferring
+	// leaves that one case able to answer 503 instead of a 200 whose body
+	// quietly says the server was busy. Go would write an implicit 200 on the
+	// first Write in any case; this only makes the moment explicit.
+	streamed := false
+	begin := func() {
+		if streamed {
+			return
+		}
+		streamed = true
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+	}
 
 	enc := json.NewEncoder(w)
 	showThinking := wantThinking(req.Think)
@@ -515,6 +527,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		if content == "" && (thinking == "" || !showThinking) {
 			return
 		}
+		begin()
 		msg := ollamaMsg{Role: "assistant", Content: content}
 		if showThinking {
 			msg.Thinking = thinking
@@ -527,6 +540,11 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		emit(split.Next(frag))
 	})
 	emit(split.Flush())
+	if refusedBeforeStreaming(genErr, streamed) {
+		writeGenError(w, genErr)
+		return
+	}
+	begin()
 	// The terminal object is the only one that carries counts, and it is the
 	// one a streaming client reads them from — `ollama run` streams, so this is
 	// the path its verbose line is computed from.
@@ -721,7 +739,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if len(req.Tools) > 0 {
 		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
+			writeOpenAIGenError(w, err)
 			return
 		}
 		thinking, answer := chat.SplitThinking(text)
@@ -754,7 +772,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if !req.Stream {
 		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
+			writeOpenAIGenError(w, err)
 			return
 		}
 		thinking, content := chat.SplitThinking(text)
@@ -777,11 +795,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": "streaming unsupported"}})
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-
-	chunk := func(delta map[string]any, finish any) {
+	send := func(delta map[string]any, finish any) {
 		payload, _ := json.Marshal(map[string]any{
 			"id": id, "object": "chat.completion.chunk", "created": created, "model": req.Model,
 			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
@@ -790,7 +804,26 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	chunk(map[string]any{"role": "assistant"}, nil)
+	// Nothing is written until there is something to write, including OpenAI's
+	// opening role chunk. A refused request has produced no tokens, so leaving
+	// the header unwritten is what lets it answer 503 rather than a 200 whose
+	// body reports the server was busy.
+	streamed := false
+	begin := func() {
+		if streamed {
+			return
+		}
+		streamed = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		send(map[string]any{"role": "assistant"}, nil)
+	}
+
+	chunk := func(delta map[string]any, finish any) {
+		begin()
+		send(delta, finish)
+	}
 
 	showThinking := wantThinking(req.Think)
 	var split chat.ThinkSplitter
@@ -807,10 +840,15 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		emit(split.Next(frag))
 	})
 	if err := genErr; err != nil {
+		if refusedBeforeStreaming(err, streamed) {
+			writeOpenAIGenError(w, err)
+			return
+		}
 		// Reporting finish_reason "stop" here would claim the model finished
 		// normally. Emit an error event first — the shape OpenAI clients
 		// already understand — then close the stream.
 		log.Printf("generation failed: %v", err)
+		begin()
 		payload, _ := json.Marshal(map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "generation_error"},
 		})
