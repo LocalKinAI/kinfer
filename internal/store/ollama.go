@@ -28,13 +28,29 @@ const (
 
 	// FromOllama is a blob in Ollama's store, read where it lies.
 	FromOllama Source = "ollama"
+
+	// FromCloud is a model Ollama knows the name of but holds no weights for:
+	// the name resolves to hosted inference. kinfer cannot load one, and routes
+	// requests for it instead.
+	//
+	// Recognising these is not guesswork from the ":cloud" suffix — a cloud
+	// manifest simply has no weights layer, which is exact and is how Ollama
+	// itself tells them apart.
+	FromCloud Source = "cloud"
 )
 
-// OllamaModels lists the local models Ollama has, as kinfer can use them.
+// Remote reports that this model is served somewhere else. There is no file to
+// open and no slot to occupy; a request for it is forwarded.
+func (m Model) Remote() bool { return m.Source == FromCloud }
+
+// OllamaModels lists the models Ollama has, as kinfer can use them.
 //
-// Cloud models are skipped. Ollama lists them like any other, but they hold no
-// weights — the name resolves to hosted inference — and offering one as
-// something to load would fail at a confusing distance from the cause.
+// Cloud models are included and marked FromCloud rather than dropped. They were
+// dropped because kinfer could only load files and offering one as something to
+// load would fail at a confusing distance from the cause. That reason expired
+// when kinfer learned to forward them: the model that took a fleet down for
+// half a day was a cloud model, and a runtime that is not in that request's path
+// cannot apply a single one of its protections to it.
 func OllamaModels() []Model {
 	root := ollamaRoot()
 	if root == "" {
@@ -85,12 +101,19 @@ func readOllamaManifest(root, manifests, path string) (Model, bool) {
 			break
 		}
 	}
-	if blob == "" || size == 0 {
-		return Model{}, false
-	}
-	info, err := os.Stat(blob)
-	if err != nil {
-		return Model{}, false // manifest without its blob
+	// No weights layer at all is a cloud entry. A weights layer of zero bytes is
+	// a broken manifest, and routing that upstream would send a local model's
+	// corruption to a hosted endpoint that never heard of it.
+	cloud := blob == ""
+	var info os.FileInfo
+	if !cloud {
+		if size == 0 {
+			return Model{}, false
+		}
+		var err error
+		if info, err = os.Stat(blob); err != nil {
+			return Model{}, false // manifest without its blob
+		}
 	}
 
 	// manifests/<registry>/<namespace>/<name>/<tag> is Ollama's own name for it,
@@ -108,6 +131,11 @@ func readOllamaManifest(root, manifests, path string) (Model, bool) {
 		name = ns[0] + "/" + name
 	}
 
+	if cloud {
+		// No path, no size: there is no file. Reporting a size would invite a
+		// caller to reason about memory for something that occupies none here.
+		return Model{Name: name, Source: FromCloud}, true
+	}
 	return Model{
 		Name:     name,
 		Path:     blob,

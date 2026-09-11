@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -33,6 +34,12 @@ import (
 type Server struct {
 	store *store.Store
 	opts  engine.Options
+
+	// upstream serves the models kinfer cannot load — Ollama's cloud entries.
+	// Forwarding to it is how kinfer's timeout reaches the one model class that
+	// has actually taken a fleet down. See upstream.go.
+	upstream       string
+	upstreamClient *http.Client
 
 	// Exactly one model stays resident. A 7B model is several GB, so keeping a
 	// map of them would exhaust memory on the laptops kinfer targets; loading is
@@ -98,7 +105,16 @@ func openEngine(path string, opts engine.Options) (generator, error) {
 
 // New creates a server over the given store.
 func New(s *store.Store, opts engine.Options) *Server {
-	srv := &Server{store: s, opts: opts, open: openEngine}
+	srv := &Server{
+		store:    s,
+		opts:     opts,
+		open:     openEngine,
+		upstream: Upstream(),
+		// No client-level timeout: the deadline is per request, applied with a
+		// context in forward, so that a long legitimate reply is not severed
+		// while an unresponsive upstream still is.
+		upstreamClient: &http.Client{},
+	}
 	srv.cond = sync.NewCond(&srv.mu)
 	return srv
 }
@@ -409,10 +425,25 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
+	// Read the body rather than streaming it into the decoder: a request for a
+	// model kinfer cannot load is forwarded verbatim, and re-encoding the parsed
+	// form would be a second place for its shape to drift from what the caller
+	// sent.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
 	var req ollamaChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		log.Printf("  decode failed: %v", err)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	if s.remoteModel(req.Model) {
+		s.forward(w, r, body, req.Model)
 		return
 	}
 
@@ -694,9 +725,20 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req openAIChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": err.Error()}})
+		return
+	}
+
+	var req openAIChatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": err.Error()}})
+		return
+	}
+
+	if s.remoteModel(req.Model) {
+		s.forward(w, r, body, req.Model)
 		return
 	}
 

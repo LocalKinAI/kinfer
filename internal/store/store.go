@@ -96,6 +96,13 @@ func OpenAt(dir string) (*Store, error) {
 // Root is the directory models live in.
 func (s *Store) Root() string { return s.root }
 
+// Borrow turns on offering the models Ollama has on this machine, which Open
+// does and OpenAt does not. Exported so a test can build a store over a fixture
+// directory and still exercise the borrowing path — the alternative is a store
+// that only ever sees its own files, which is not the store anything runs
+// against.
+func (s *Store) Borrow(on bool) { s.borrow = on }
+
 // List returns every model, newest first.
 func (s *Store) List() ([]Model, error) {
 	entries, err := os.ReadDir(s.root)
@@ -193,6 +200,31 @@ func (s *Store) All() ([]Model, error) {
 // what makes `kinfer run qwen` usable; it deliberately fails when ambiguous
 // rather than picking one, because silently loading the wrong 7B model is a
 // worse outcome than an error message.
+// Lookup returns the model a name refers to.
+//
+// Resolve answers "where is its file", which a remote model does not have.
+// Anything that needs to know what kind of thing a name is — before deciding
+// whether to load it or forward it — asks here.
+func (s *Store) Lookup(name string) (Model, error) {
+	models, err := s.All()
+	if err != nil {
+		return Model{}, err
+	}
+	lower := strings.ToLower(name)
+	for _, m := range models {
+		if strings.ToLower(m.Name) == lower {
+			return m, nil
+		}
+	}
+	// Ollama's own clients accept a bare name for a :latest tag.
+	for _, m := range models {
+		if strings.ToLower(m.Name) == lower+":latest" {
+			return m, nil
+		}
+	}
+	return Model{}, fmt.Errorf("no model named %q", name)
+}
+
 func (s *Store) Resolve(name string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("no model specified")

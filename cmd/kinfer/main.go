@@ -164,8 +164,14 @@ func cmdList(args []string) error {
 
 	fmt.Printf("%-44s %10s  %-12s %s\n", "NAME", "SIZE", "MODIFIED", "SOURCE")
 	for _, m := range models {
-		fmt.Printf("%-44s %10s  %-12s %s\n",
-			m.Name, store.HumanSize(m.Size), humanTime(m.Modified), m.Source)
+		size, when := store.HumanSize(m.Size), humanTime(m.Modified)
+		if m.Remote() {
+			// There is no file, so there is no size and no mtime. Printing the
+			// zero values gives "0 B" and an age counted from year one, which
+			// reads as a corrupt local model rather than a hosted one.
+			size, when = "—", "—"
+		}
+		fmt.Printf("%-44s %10s  %-12s %s\n", m.Name, size, when, m.Source)
 	}
 	return nil
 }
