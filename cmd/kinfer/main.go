@@ -167,14 +167,8 @@ func cmdList(args []string) error {
 
 	fmt.Printf("%-44s %10s  %-12s %s\n", "NAME", "SIZE", "MODIFIED", "SOURCE")
 	for _, m := range models {
-		size, when := store.HumanSize(m.Size), humanTime(m.Modified)
-		if m.Remote() {
-			// There is no file, so there is no size and no mtime. Printing the
-			// zero values gives "0 B" and an age counted from year one, which
-			// reads as a corrupt local model rather than a hosted one.
-			size, when = "—", "—"
-		}
-		fmt.Printf("%-44s %10s  %-12s %s\n", m.Name, size, when, m.Source)
+		fmt.Printf("%-44s %10s  %-12s %s\n",
+			m.Name, store.HumanSize(m.Size), humanTime(m.Modified), m.Source)
 	}
 	return nil
 }
@@ -374,10 +368,6 @@ func cmdServe(args []string) error {
 	slots := fs.Int("slots", engine.DefaultSlots, "conversations served at once (use 8, 32, 64 or 128 — never 12-16)")
 	prefix := fs.Int("prefix", engine.DefaultPrefixSlots, "prompt prefixes kept resident so repeat requests skip prefilling them (-1 disables)")
 	queue := fs.Int("queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
-	upstream := fs.String("upstream", server.Upstream(),
-		"where cloud models are served from (default: $OLLAMA_HOST, else Ollama's own address)")
-	fallback := fs.String("fallback", "",
-		"local model to answer with when a cloud model is rate-limited or unreachable (empty: never substitute)")
 	maxGen := fs.Duration("max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
 	maxWait := fs.Duration("max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
 	keepAlive := fs.Duration("keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
@@ -413,9 +403,6 @@ func cmdServe(args []string) error {
 		// deadline here would sever a reply mid-sentence.
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
-	srv.SetUpstream(*upstream)
-	srv.SetFallback(*fallback)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

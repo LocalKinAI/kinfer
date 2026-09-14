@@ -20,17 +20,6 @@ Everything below was built and measured on one 96 GB Mac Studio against a
   instead of failing with it. Measured: 32 concurrent requests against a dying
   backend, 0 answered before, 28 after.
 
-### Cloud models
-
-- **Forwarded rather than refused.** Ollama's cloud entries used to be dropped,
-  which left kinfer out of the path of the model class that caused the outage
-  this project exists for. They are now proxied verbatim with the deadline
-  applied. `-upstream` and `$OLLAMA_HOST` point it somewhere else.
-- **`-fallback <model>`** answers locally when the upstream says *not now* —
-  `429`, `502`, `503`, `504`, unreachable — and only before anything has been
-  written. Never on `400`, `401`, `404`. The reply's `model` field names whichever
-  model actually answered; silent substitution is not offered at any setting.
-
 ### Seeing and sizing
 
 - **`/metrics`** in Prometheus format: queue depth, busy and total slots, prompt
@@ -55,6 +44,20 @@ Everything below was built and measured on one 96 GB Mac Studio against a
   completed reply says the model had nothing to say.
 - `-max-gen 0` removes the limit. `-1` cannot be typed: Go parses a duration and
   it has no unit, so the flag errored and the process exited.
+
+### Tried and withdrawn
+
+- **Routing cloud models through kinfer.** For one day kinfer recognised
+  Ollama's cloud entries, forwarded them, and could fall back to a local model
+  when the upstream said *not now*. It was removed after its first real outage.
+  When the weekly cloud quota ran out, every request fell back to a local model
+  whose per-slot context could not hold most of the fleet's prompts (37% of
+  turns came back empty), the substitution was invisible to the quota sentinel
+  because the reply still carried a `message`, and cloud names absent from the
+  local machine's manifests were answered 404 where Ollama would have resolved
+  them. None of that is a bug in the runtime; it is what happens when a local
+  inference server is put in front of traffic it does not serve. kinfer serves
+  local models. Which endpoint a caller uses, and when, is the caller's policy.
 
 ### Learned, and written into the code
 

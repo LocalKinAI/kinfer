@@ -96,13 +96,6 @@ func OpenAt(dir string) (*Store, error) {
 // Root is the directory models live in.
 func (s *Store) Root() string { return s.root }
 
-// Borrow turns on offering the models Ollama has on this machine, which Open
-// does and OpenAt does not. Exported so a test can build a store over a fixture
-// directory and still exercise the borrowing path — the alternative is a store
-// that only ever sees its own files, which is not the store anything runs
-// against.
-func (s *Store) Borrow(on bool) { s.borrow = on }
-
 // List returns every model, newest first.
 func (s *Store) List() ([]Model, error) {
 	entries, err := os.ReadDir(s.root)

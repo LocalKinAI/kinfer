@@ -26,8 +26,6 @@ type counters struct {
 	// By HTTP status class, recorded by middleware rather than by each handler,
 	// so a new endpoint cannot forget to count itself.
 	ok, refused, failed atomic.Int64
-
-	forwarded, fellBack atomic.Int64
 }
 
 // countingWriter remembers the status so the middleware can classify a request
@@ -111,10 +109,6 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	metric("requests_total", "Requests answered.", "counter", s.stats.ok.Load(), `{outcome="ok"}`)
 	fmt.Fprintf(&b, "kinfer_requests_total{outcome=\"refused\"} %d\n", s.stats.refused.Load())
 	fmt.Fprintf(&b, "kinfer_requests_total{outcome=\"failed\"} %d\n", s.stats.failed.Load())
-	metric("upstream_forwarded_total", "Requests sent to the cloud upstream.",
-		"counter", s.stats.forwarded.Load(), "")
-	metric("upstream_fallback_total", "Cloud requests answered locally instead.",
-		"counter", s.stats.fellBack.Load(), "")
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))

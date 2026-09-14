@@ -15,7 +15,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -34,18 +33,6 @@ import (
 type Server struct {
 	store *store.Store
 	opts  engine.Options
-
-	// upstream serves the models kinfer cannot load — Ollama's cloud entries.
-	// Forwarding to it is how kinfer's timeout reaches the one model class that
-	// has actually taken a fleet down. See upstream.go.
-	upstream       string
-	upstreamClient *http.Client
-
-	// fallback is the local model to run when the upstream says "not now".
-	// Empty means never substitute, which is the default: answering with a
-	// different model than the caller asked for is only acceptable when someone
-	// has decided it is.
-	fallback string
 
 	// stats are what /metrics reports.
 	stats counters
@@ -117,16 +104,7 @@ func openEngine(path string, opts engine.Options) (generator, error) {
 
 // New creates a server over the given store.
 func New(s *store.Store, opts engine.Options) *Server {
-	srv := &Server{
-		store:    s,
-		opts:     opts,
-		open:     openEngine,
-		upstream: Upstream(),
-		// No client-level timeout: the deadline is per request, applied with a
-		// context in forward, so that a long legitimate reply is not severed
-		// while an unresponsive upstream still is.
-		upstreamClient: &http.Client{},
-	}
+	srv := &Server{store: s, opts: opts, open: openEngine}
 	srv.cond = sync.NewCond(&srv.mu)
 	return srv
 }
@@ -440,35 +418,11 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
-	// Read the body rather than streaming it into the decoder: a request for a
-	// model kinfer cannot load is forwarded verbatim, and re-encoding the parsed
-	// form would be a second place for its shape to drift from what the caller
-	// sent.
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-
 	var req ollamaChatRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("  decode failed: %v", err)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
-	}
-
-	if s.remoteModel(req.Model) {
-		if !s.forward(w, r, body, req.Model) {
-			return
-		}
-		// The upstream could not take it and nothing has been written, so this
-		// can still be run locally. Under the local model's own name: a caller
-		// handed a different model's work without being told is exactly the
-		// substitution this project refuses to make, and the reply's model
-		// field is where it gets told.
-		log.Printf("%s unavailable upstream; answering with %s instead", req.Model, s.fallback)
-		s.stats.fellBack.Add(1)
-		req.Model = s.fallback
 	}
 
 	loadStart := time.Now()
@@ -622,16 +576,11 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
-// handleOllamaTags lists everything this server can answer for, which is not the
-// same as everything it can load.
+// handleOllamaTags lists everything this server can answer for.
 //
-// It used to be List — kinfer's own directory — and a caller checking the list
-// before choosing a model concluded that cloud models were unavailable and went
-// to its own fallback, while kinfer was in fact forwarding them perfectly well.
-// Observed against a real LocalKin soul: "4 models available", then "fallback
-// mode", for a request kinfer then served. A server that can do a thing and
-// says it cannot is the same class of wrong answer as one that says it can and
-// cannot.
+// All rather than List: Resolve accepts a model borrowed from Ollama's store,
+// so the list a caller checks before choosing has to offer the same names, or
+// it concludes a model is unavailable that a request for it would have served.
 func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 	models, err := s.store.All()
 	if err != nil {
@@ -759,30 +708,10 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": err.Error()}})
-		return
-	}
-
 	var req openAIChatRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": err.Error()}})
 		return
-	}
-
-	if s.remoteModel(req.Model) {
-		if !s.forward(w, r, body, req.Model) {
-			return
-		}
-		// The upstream could not take it and nothing has been written, so this
-		// can still be run locally. Under the local model's own name: a caller
-		// handed a different model's work without being told is exactly the
-		// substitution this project refuses to make, and the reply's model
-		// field is where it gets told.
-		log.Printf("%s unavailable upstream; answering with %s instead", req.Model, s.fallback)
-		s.stats.fellBack.Add(1)
-		req.Model = s.fallback
 	}
 
 	eng, release, err := s.acquire(req.Model)

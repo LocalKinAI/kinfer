@@ -41,11 +41,6 @@ func cmdPlan(args []string) error {
 	if err != nil {
 		return err
 	}
-	if m.Remote() {
-		fmt.Printf("%s is a cloud model — it is served elsewhere and occupies nothing here.\n", m.Name)
-		return nil
-	}
-
 	budget, err := acceleratorBudget()
 	if err != nil {
 		return err

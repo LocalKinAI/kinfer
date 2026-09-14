@@ -632,21 +632,6 @@ server. A reply cut off by the clock returns its text with
 `done_reason: "timeout"`, because `"stop"` would claim the model finished and
 `"length"` would claim it hit the budget it was given.
 
-**Cloud models go through kinfer too.** Ollama's cloud entries carry no weights;
-kinfer used to drop them, which left it out of the path of the only model class
-that has actually taken a fleet down. Now they are forwarded verbatim on the
-same path in the same dialect, with the deadline applied. Nothing listening is
-`503` and says so; silence past `-max-gen` is `504`. A typo is still a `404` in
-under three milliseconds, because a cloud model is recognised by its manifest
-having no weights layer and never by its `:cloud` suffix.
-
-**And a fallback, off by default.** `-fallback <local model>` answers locally
-when the upstream says *not now* — `429`, `502`, `503`, `504`, or unreachable —
-and only before a single byte has been written. Never on `400`, `401` or `404`:
-those are wrong requests, and running one on another model produces a confident
-answer to a question that was already wrong. The reply's `model` field names
-whichever model actually answered.
-
 **A queued request survives a backend failure.** llama.cpp reports a fatal
 decode for the whole context, so kinfer retires the model — and used to fail
 every request it held. Measured: 32 concurrent requests against a dying backend,
@@ -669,8 +654,6 @@ kinfer_model_loaded{model="…/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf
 kinfer_requests_total{outcome="ok"} 2
 kinfer_requests_total{outcome="refused"} 0
 kinfer_requests_total{outcome="failed"} 0
-kinfer_upstream_forwarded_total 0
-kinfer_upstream_fallback_total 0
 ```
 
 Prometheus text format. The three that matter together: a deep queue beside idle
