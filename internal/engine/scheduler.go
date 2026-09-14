@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,10 +17,25 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/sampling"
 )
 
-// prefillChunk is how many prompt tokens one slot may contribute to a single
-// batch. Bounding it is what keeps an agent arriving with an 8k system prompt
-// from stalling every conversation already generating.
-const prefillChunk = 512
+// Prefill is first-come, first-served, not fair-shared.
+//
+// It used to be shared: every slot with prompt left contributed up to 512
+// tokens per step, so four arrivals filled a 2048-token batch four ways and
+// climbed together. Measured with eight fleet-shaped requests on ornith-1.5-35b
+// (3k to 25k tokens each, 93k in all): every one of them saw its first token
+// between 82 and 87 seconds, the 3k prompt no sooner than the 25k one, and all
+// eight missed the caller's 60-second line. Prefill throughput is fixed by the
+// hardware — about 1000 tokens a second here whatever the batch shape — so the
+// only thing scheduling decides is who waits for whom. Fair sharing makes
+// everyone wait for the largest.
+//
+// Now the oldest prompt takes all the space a step has, then the next. The
+// same eight requests would see first tokens at roughly 3, 6, 13, 20, 34, 48,
+// 71 and 87 seconds — six inside the line instead of none — and a slot that
+// finishes early starts generating in the same batches that prefill the rest,
+// which is the point of continuous batching. Steps are no longer than before:
+// batchCapacity bounds them either way, and generating slots are added first,
+// so a big arrival still cannot stall a conversation already under way.
 
 // minPrefixMatch is the shortest pooled prefix worth adopting. Below it the
 // bookkeeping outweighs a prefill llama.cpp would have done in microseconds —
@@ -424,6 +440,7 @@ func (s *scheduler) active() int {
 func (s *scheduler) step() error {
 	s.batch.Reset()
 
+	var prefilling []*slot
 	for _, sl := range s.slots {
 		if sl.job == nil {
 			continue
@@ -438,10 +455,15 @@ func (s *scheduler) step() error {
 		}
 
 		if int(sl.nPast) < len(sl.prompt) {
-			s.addPrefill(sl)
+			prefilling = append(prefilling, sl)
 		} else {
+			// Generating slots go in first: one token each, never displaced
+			// by however much prompt is waiting behind them.
 			s.addDecode(sl)
 		}
+	}
+	for _, sl := range prefillOrder(prefilling) {
+		s.addPrefill(sl)
 	}
 
 	if s.batch.Len() == 0 {
@@ -515,18 +537,24 @@ func (s *scheduler) harvesting() bool {
 	return false
 }
 
-// addPrefill queues the next chunk of a slot's prompt.
-//
-// Prompts go in in pieces rather than whole so that one agent arriving with an
-// 8k system prompt cannot stall every conversation already generating: its
-// chunk shares the batch with their single tokens, and the step stays bounded.
+// prefillOrder is who gets the batch first: the slot that has been waiting
+// longest. Stable, so two admitted in the same instant keep slot order.
+func prefillOrder(slots []*slot) []*slot {
+	sort.SliceStable(slots, func(i, j int) bool { return slots[i].admitted.Before(slots[j].admitted) })
+	return slots
+}
+
+// addPrefill queues as much of a slot's remaining prompt as the batch has room
+// for. A prompt larger than a step still goes in pieces — batchCapacity bounds
+// the step — but the pieces are consecutive steps of one slot, not one slice of
+// each.
 func (s *scheduler) addPrefill(sl *slot) {
 	space := s.batch.Cap() - s.batch.Len()
 	if space <= 0 {
 		return
 	}
 	remaining := len(sl.prompt) - int(sl.nPast)
-	n := min(remaining, min(space, prefillChunk))
+	n := min(remaining, space)
 
 	for i := 0; i < n; i++ {
 		pos := sl.nPast + int32(i)
