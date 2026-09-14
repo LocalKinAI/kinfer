@@ -1064,3 +1064,46 @@ func TestThinkOffOnlyForAnExplicitFalse(t *testing.T) {
 		}
 	}
 }
+
+// A streamed reply with functions on the table must stream its prose and
+// deliver the call only in the terminal object, never as fragments of JSON.
+// Buffering the whole reply was the alternative, and it cost a fleet agent
+// every sign of progress until the end.
+func TestStreamedToolReplyStreamsProseAndClosesWithCalls(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return &fakeEngine{path: p, tools: true, frags: []string{
+			"Let me ", "look that up.", " <tool_c", "all>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Berlin\"}}\n</tool_call>"}}, nil
+	}
+	body := `{"model":"alpha","stream":true,"messages":[{"role":"user","content":"weather?"}],
+	          "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}`
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var prose strings.Builder
+	var final ollamaChatResponse
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(w.Body.String()), "\n") {
+		var r ollamaChatResponse
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("bad chunk %q: %v", line, err)
+		}
+		if strings.Contains(r.Message.Content, "<tool_call>") {
+			t.Errorf("a chunk leaked call syntax into the stream: %q", r.Message.Content)
+		}
+		if r.Done {
+			final = r
+		} else {
+			prose.WriteString(r.Message.Content)
+			n++
+		}
+	}
+	if n < 2 || prose.String() != "Let me look that up. " {
+		t.Errorf("streamed %d chunks, prose %q; want the prose streamed as it came", n, prose.String())
+	}
+	if final.DoneReason != "tool_calls" || len(final.Message.ToolCalls) != 1 || final.Message.ToolCalls[0].Function.Name != "get_weather" {
+		t.Errorf("terminal object = %+v; want done_reason tool_calls with the parsed call", final)
+	}
+}

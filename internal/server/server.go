@@ -470,10 +470,14 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A tool call is JSON split across many tokens; streaming it would hand the
-	// client fragments of syntax. With functions on the table the reply is
-	// buffered and delivered once, parsed.
-	if len(req.Tools) > 0 {
+	// Ollama streams unless told otherwise — the opposite of OpenAI.
+	stream := req.Stream == nil || *req.Stream
+
+	// A caller that did not ask to stream gets the reply whole, with its calls
+	// parsed out. A caller that did gets the prose as it is written and the
+	// calls in the final object — see tools.CallSplitter for why the calls
+	// cannot stream and why the prose must.
+	if len(req.Tools) > 0 && !stream {
 		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeGenError(w, err)
@@ -501,9 +505,6 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		}.withTimings(st, load, time.Since(start)))
 		return
 	}
-
-	// Ollama streams unless told otherwise — the opposite of OpenAI.
-	stream := req.Stream == nil || *req.Stream
 
 	if !stream {
 		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
@@ -550,8 +551,12 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	showThinking := wantThinking(req.Think)
 	var split chat.ThinkSplitter
+	var calls tools.CallSplitter // only consulted when functions are on the table
 
 	emit := func(thinking, content string) {
+		if len(req.Tools) > 0 {
+			content = calls.Next(content)
+		}
 		if content == "" && (thinking == "" || !showThinking) {
 			return
 		}
@@ -564,10 +569,18 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	_, st, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
+	text, st, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
 		emit(split.Next(frag))
 	})
 	emit(split.Flush())
+	if len(req.Tools) > 0 {
+		if rest := calls.Flush(); rest != "" {
+			begin()
+			_ = enc.Encode(ollamaChatResponse{Model: req.Model, CreatedAt: time.Now(),
+				Message: ollamaMsg{Role: "assistant", Content: rest}})
+			flusher.Flush()
+		}
+	}
 	if refusedBeforeStreaming(genErr, streamed) {
 		writeGenError(w, genErr)
 		return
@@ -575,7 +588,9 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	begin()
 	// The terminal object is the only one that carries counts, and it is the
 	// one a streaming client reads them from — `ollama run` streams, so this is
-	// the path its verbose line is computed from.
+	// the path its verbose line is computed from. It is also where the tool
+	// calls go, parsed from the whole reply once it is complete: Ollama's
+	// shape, and the one a client reading Ollama already handles.
 	final := ollamaChatResponse{
 		Model:      req.Model,
 		CreatedAt:  time.Now(),
@@ -583,6 +598,13 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		Done:       true,
 		DoneReason: doneReason(st),
 	}.withTimings(st, load, time.Since(start))
+	if len(req.Tools) > 0 && genErr == nil {
+		_, answer := chat.SplitThinking(text)
+		if _, cs := eng.ToolFormat().Parse(answer); len(cs) > 0 {
+			final.Message.ToolCalls = wireCalls(cs)
+			final.DoneReason = "tool_calls"
+		}
+	}
 	if genErr != nil {
 		// Headers are already out, so the error can only travel as a final
 		// frame. It MUST travel: a 200 that ends in an empty message is
@@ -768,9 +790,10 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// As in the Ollama dialect: a tool call arrives as JSON across many tokens,
-	// so with functions on the table the reply is buffered and parsed.
-	if len(req.Tools) > 0 {
+	// As in the Ollama dialect: a caller that did not ask to stream gets the
+	// reply whole with its calls parsed; one that did gets prose as it is
+	// written and the calls in the closing chunk.
+	if len(req.Tools) > 0 && !req.Stream {
 		text, st, err := eng.ChatFull(r.Context(), msgs, params, nil)
 		if err != nil {
 			writeOpenAIGenError(w, err)
@@ -861,7 +884,11 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	showThinking := wantThinking(req.Think)
 	var split chat.ThinkSplitter
+	var calls tools.CallSplitter
 	emit := func(thinking, content string) {
+		if len(req.Tools) > 0 {
+			content = calls.Next(content)
+		}
 		if content != "" {
 			chunk(map[string]any{"content": content}, nil)
 		}
@@ -870,7 +897,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, st, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
+	text, st, genErr := eng.ChatFull(r.Context(), msgs, params, func(frag string) {
 		emit(split.Next(frag))
 	})
 	if err := genErr; err != nil {
@@ -893,7 +920,28 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	emit(split.Flush())
+	if len(req.Tools) > 0 {
+		if rest := calls.Flush(); rest != "" {
+			chunk(map[string]any{"content": rest}, nil)
+		}
+		_, answer := chat.SplitThinking(text)
+		if _, cs := eng.ToolFormat().Parse(answer); len(cs) > 0 {
+			// OpenAI streams calls as deltas carrying an index; all of them fit
+			// in one delta here because they are only known once complete.
+			wire := make([]any, len(cs))
+			for i, c := range cs {
+				wire[i] = map[string]any{
+					"index": i, "id": fmt.Sprintf("call_%d_%d", created, i), "type": "function",
+					"function": map[string]any{"name": c.Name, "arguments": string(c.Arguments)},
+				}
+			}
+			chunk(map[string]any{"tool_calls": wire}, nil)
+			chunk(map[string]any{}, "tool_calls")
+			goto usage
+		}
+	}
 	chunk(map[string]any{}, openAIFinishReason(st))
+usage:
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		// OpenAI's shape for this: one last chunk carrying no choices at all,
 		// only the counts.
