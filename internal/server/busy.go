@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -18,6 +19,16 @@ import (
 // broken server; a fleet that gives up on a 503 is abandoning work that would
 // have succeeded. Getting the code right is most of what backpressure is.
 func writeGenError(w http.ResponseWriter, err error) {
+	log.Printf("generation failed: %v", err)
+
+	// A prompt that does not fit is the request's fault and will not fit on a
+	// retry either: 413, which no sane client retries, where 500 invited three.
+	var big *engine.PromptTooLongError
+	if errors.As(err, &big) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": big.Error()})
+		return
+	}
+
 	// A request that aged out of the queue is the same answer as a full one —
 	// the server has more work than it can take — reached by time rather than
 	// by depth. It gets the same status, and no Retry-After, because nothing
@@ -45,6 +56,16 @@ func writeGenError(w http.ResponseWriter, err error) {
 
 // writeOpenAIGenError is writeGenError in the OpenAI dialect's error shape.
 func writeOpenAIGenError(w http.ResponseWriter, err error) {
+	log.Printf("generation failed: %v", err)
+
+	var big *engine.PromptTooLongError
+	if errors.As(err, &big) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+			"error": map[string]string{"message": big.Error(), "type": "invalid_request_error"},
+		})
+		return
+	}
+
 	var stale *engine.TimeoutError
 	if errors.As(err, &stale) && stale.BeforeStarting() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{

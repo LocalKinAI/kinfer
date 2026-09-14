@@ -1107,3 +1107,45 @@ func TestStreamedToolReplyStreamsProseAndClosesWithCalls(t *testing.T) {
 		t.Errorf("terminal object = %+v; want done_reason tool_calls with the parsed call", final)
 	}
 }
+
+// A prompt that cannot fit is 413, not 500. The difference is what the caller
+// does next: LocalKin retries a 500 three times, and the prompt is no shorter
+// the third time.
+func TestPromptTooLongIs413NotRetryable(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return &fakeEngine{path: p, err: &engine.PromptTooLongError{Tokens: 40000, Limit: 32768, Slots: 16}}, nil
+	}
+	for _, path := range []string{"/api/chat", "/v1/chat/completions"} {
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(
+			`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`)))
+		if w.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("%s: status %d, want 413: %s", path, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "40000") {
+			t.Errorf("%s: the error does not say how big the prompt was: %s", path, w.Body.String())
+		}
+	}
+}
+
+// /metrics must file a 503 under refused, not failed. It did the opposite,
+// because 503 is also >= 500 and that case came first.
+func TestMetricsFileA503AsRefused(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return &busyEngine{fakeEngine: fakeEngine{path: p}}, nil
+	}
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(
+		`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`)))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("setup: status %d", w.Code)
+	}
+	if got := srv.stats.refused.Load(); got != 1 {
+		t.Errorf("refused = %d, want 1", got)
+	}
+	if got := srv.stats.failed.Load(); got != 0 {
+		t.Errorf("failed = %d, want 0 — a refusal was counted as a failure", got)
+	}
+}

@@ -1,6 +1,9 @@
 package engine
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Deadlines, on the two places a request can consume the server without
 // finishing: a slot it will not give back, and a place in the queue it no
@@ -105,4 +108,21 @@ func (d deadlines) expiredWaiting(queued time.Time) (time.Duration, bool) {
 		return el, true
 	}
 	return 0, false
+}
+
+// PromptTooLongError is a request that cannot fit the context one slot holds.
+//
+// It is the caller's request that is wrong, not the server's moment — the same
+// prompt will not fit next time either. That distinction is the whole reason
+// this is a type: reported as a plain 500 it read as "something broke, try
+// again", and LocalKin did, three times, before giving up on a request that
+// could never have succeeded.
+type PromptTooLongError struct {
+	Tokens, Limit, Slots int
+}
+
+func (e *PromptTooLongError) Error() string {
+	return fmt.Sprintf("prompt is %d tokens but each slot holds %d "+
+		"(the context is split across %d slots; lower -slots or raise -ctx)",
+		e.Tokens, e.Limit, e.Slots)
 }

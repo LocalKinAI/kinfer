@@ -61,11 +61,13 @@ func (s *Server) count(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cw := &countingWriter{ResponseWriter: w}
 		next.ServeHTTP(cw, r)
+		// Refusals first: 503 is a 5xx, and the general case would swallow it —
+		// it did, and "refused" read zero through an afternoon of refusals.
 		switch {
-		case cw.status >= 500 || cw.status == http.StatusBadGateway:
-			s.stats.failed.Add(1)
 		case cw.status == http.StatusServiceUnavailable || cw.status == http.StatusTooManyRequests:
 			s.stats.refused.Add(1)
+		case cw.status >= 500:
+			s.stats.failed.Add(1)
 		case cw.status >= 200 && cw.status < 400:
 			s.stats.ok.Add(1)
 		}

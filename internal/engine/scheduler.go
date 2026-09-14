@@ -372,9 +372,7 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 		return
 	}
 	if len(tokens) >= s.ctxPerSeq {
-		j.finish(fmt.Errorf("prompt is %d tokens but each slot holds %d "+
-			"(context %d split across %d slots)",
-			len(tokens), s.ctxPerSeq, s.ctxPerSeq*len(s.slots), len(s.slots)))
+		j.finish(&PromptTooLongError{Tokens: len(tokens), Limit: s.ctxPerSeq, Slots: len(s.slots)})
 		return
 	}
 
