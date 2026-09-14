@@ -52,6 +52,22 @@ type Template struct {
 
 	render func(msgs []Message) string
 
+	// noThink is what to append to the prompt to keep a reasoning model out of
+	// its think block, or "" for a model whose template has no such switch.
+	//
+	// llama_chat_apply_template renders Qwen3-family templates as plain ChatML
+	// and ends the prompt at "<|im_start|>assistant\n", reaching neither of the
+	// template's two thinking branches. The model then decides for itself, and
+	// ornith decides to think. Ollama honours think:false by rendering the
+	// template's own disable branch — an empty think block — and so does this.
+	//
+	// The difference is not cosmetic. Hiding the thinking while the model still
+	// produces it spends the token budget on text nobody sees: measured on
+	// ornith-1.5-35b with num_predict 256 and think:false, 256 tokens of
+	// thinking, an empty reply, and a caller whose idle watchdog saw no progress
+	// for the whole of it.
+	noThink string
+
 	// toolFmt is the tool-call convention this model was trained on, read from
 	// its own template. Declaring functions in another one makes the model
 	// fight its training rather than answer.
@@ -68,6 +84,28 @@ type Template struct {
 // then the template has nothing unusual left to render.
 func (t *Template) Render(msgs []Message, ts []tools.Tool) string {
 	return t.render(fold(msgs, ts, t.toolFmt))
+}
+
+// RenderNoThink is Render with the model told not to think first. For a model
+// whose template has no thinking switch it is Render exactly.
+func (t *Template) RenderNoThink(msgs []Message, ts []tools.Tool) string {
+	return t.Render(msgs, ts) + t.noThink
+}
+
+// noThinkSuffix reads the template's own way of disabling thinking.
+//
+// Qwen3-family templates carry `{%- if enable_thinking is defined and
+// enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}`: an empty
+// think block, opened and closed before the model writes anything. That text
+// is the model's own convention, so it is what gets appended — and only for a
+// template that has the switch, because on any other model it would be noise
+// in the prompt.
+func noThinkSuffix(tmpl string) string {
+	if strings.Contains(tmpl, "enable_thinking") &&
+		strings.Contains(tmpl, "<think>") && strings.Contains(tmpl, "</think>") {
+		return "<think>\n\n</think>\n\n"
+	}
+	return ""
 }
 
 // fold rewrites a conversation into plain {role, content} turns.
@@ -235,6 +273,7 @@ func FromModel(model llama.Model, path string) *Template {
 	return &Template{
 		Name:    "gguf",
 		toolFmt: tools.Detect(tmpl),
+		noThink: noThinkSuffix(tmpl),
 		// No stop strings. Generation ends on an end-of-generation token, which
 		// llama_vocab_is_eog reports for whatever terminator this model uses —
 		// a surer signal than matching text, and the only one available when

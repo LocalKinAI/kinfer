@@ -1044,3 +1044,23 @@ func (e *staleEngine) Chat(context.Context, []chat.Message, engine.GenParams, fu
 func (f *fakeEngine) Load() (waiting, busy, slots int) { return 0, 0, 1 }
 func (f *fakeEngine) PromptTokens() int64              { return 0 }
 func (f *fakeEngine) EvalTokens() int64                { return 0 }
+
+// think:false must reach the engine as NoThink; anything else must not. The
+// asymmetry is deliberate — absent means the model's own default, as it does
+// in Ollama — and getting it wrong in either direction is visible: off when it
+// should be on loses the reasoning a caller asked for, on when it should be
+// off spends the whole budget on text nobody sees.
+func TestThinkOffOnlyForAnExplicitFalse(t *testing.T) {
+	for raw, want := range map[string]bool{
+		`false`:   true,
+		`"false"`: true,
+		`true`:    false,
+		`"high"`:  false,
+		`"low"`:   false,
+		``:        false,
+	} {
+		if got := thinkOff(json.RawMessage(raw)); got != want {
+			t.Errorf("thinkOff(%s) = %v, want %v", raw, got, want)
+		}
+	}
+}

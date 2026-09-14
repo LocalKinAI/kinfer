@@ -312,6 +312,24 @@ type ollamaCall struct {
 // working out. Absent or false, it is split off and dropped: it is not the
 // reply, and a client that prints replies verbatim would show the model talking
 // to itself.
+// thinkOff reports that the caller explicitly asked for no thinking — a JSON
+// false, or the string "false" Ollama also accepts.
+//
+// Absent is not off. A reasoning model left to itself thinks, which is what
+// Ollama does when the field is missing, and matching that keeps a caller that
+// never sends the field getting the same model behaviour from both.
+func thinkOff(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var b bool
+	if json.Unmarshal(raw, &b) == nil {
+		return !b
+	}
+	var s string
+	return json.Unmarshal(raw, &s) == nil && s == "false"
+}
+
 func wantThinking(raw json.RawMessage) bool {
 	if len(raw) == 0 {
 		return false
@@ -440,6 +458,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	msgs := toChatMessages(req.Messages)
 	params := applyOllamaOptions(engine.DefaultGenParams(), req.Options)
 	params.Tools = req.Tools
+	params.NoThink = thinkOff(req.Think)
 
 	if len(req.Tools) > 0 && eng.ToolFormat() == tools.None {
 		// Declaring functions to a model that was never trained on this
@@ -725,6 +744,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	params := engine.DefaultGenParams()
 	params.Tools = req.Tools
+	params.NoThink = thinkOff(req.Think)
 	if req.Temperature != nil {
 		params.Temperature = float32(*req.Temperature)
 	}

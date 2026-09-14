@@ -207,3 +207,43 @@ func TestFoldWithoutToolsChangesNothing(t *testing.T) {
 		t.Errorf("fold altered a plain conversation: %+v", got)
 	}
 }
+
+// The Qwen3 family disables thinking with an empty think block written into
+// the prompt. That text has to come from the template — it is the model's own
+// convention — and must not be appended to a model that has no such switch.
+func TestNoThinkSuffixComesFromTheTemplate(t *testing.T) {
+	qwen := `{%- if enable_thinking is defined and enable_thinking is false %}
+    {{- '<think>\n\n</think>\n\n' }}
+{%- else %}
+    {{- '<think>\n' }}
+{%- endif %}`
+	if got := noThinkSuffix(qwen); got != "<think>\n\n</think>\n\n" {
+		t.Errorf("Qwen3 template: suffix = %q", got)
+	}
+	llama3 := "{% for m in messages %}<|start_header_id|>{{ m.role }}<|end_header_id|>{{ m.content }}<|eot_id|>{% endfor %}"
+	if got := noThinkSuffix(llama3); got != "" {
+		t.Errorf("a template with no thinking switch got suffix %q", got)
+	}
+}
+
+// RenderNoThink must change nothing for a model without the switch, and for
+// one with it must end the prompt inside a closed, empty think block — so the
+// model's first token is the answer, not the start of its reasoning.
+func TestRenderNoThinkEndsInAnEmptyThinkBlock(t *testing.T) {
+	msgs := []Message{{Role: "user", Content: "Why do rivers meander?"}}
+
+	plain := &Template{Name: "plain", render: chatml.render}
+	if a, b := plain.Render(msgs, nil), plain.RenderNoThink(msgs, nil); a != b {
+		t.Errorf("a template with no switch rendered differently with NoThink:\n%q\n%q", a, b)
+	}
+
+	thinker := &Template{Name: "thinker", render: chatml.render, noThink: "<think>\n\n</think>\n\n"}
+	got := thinker.RenderNoThink(msgs, nil)
+	want := "<|im_start|>user\nWhy do rivers meander?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+	if got != want {
+		t.Errorf("RenderNoThink:\n got %q\nwant %q", got, want)
+	}
+	if thinker.Render(msgs, nil) == got {
+		t.Error("Render and RenderNoThink are the same on a thinking model — nothing was injected")
+	}
+}

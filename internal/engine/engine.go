@@ -95,6 +95,13 @@ type GenParams struct {
 	// into the prompt in the form the model was trained on; whether it knows
 	// that form at all is SupportsTools.
 	Tools []tools.Tool
+
+	// NoThink asks a reasoning model to answer without a think block, by
+	// rendering the template's own disable switch into the prompt. It is what
+	// a caller's think:false means, and it is different from merely not
+	// showing the thinking: hidden thinking still costs every token and every
+	// second it takes, which with a token budget leaves nothing for the reply.
+	NoThink bool
 }
 
 // Stats are the token counts and timings for one reply.
