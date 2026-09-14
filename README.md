@@ -68,7 +68,7 @@ kinfer list                  # what is installed
 kinfer rm <model>            # delete one
 kinfer run <model> [prompt]  # chat — no prompt means interactive
 kinfer ps                    # what the daemon is holding right now
-kinfer serve [-addr :11500]  # serve over HTTP
+kinfer serve [-addr :11500]  # serve over HTTP; context and slots sized to the model
 kinfer install [serve flags] # keep serve running: at login and after a crash (macOS)
 kinfer uninstall             # stop it and remove the service
 ```
@@ -102,6 +102,36 @@ question is why a model failed to load.
 Flags go before the model name. A flag after it would otherwise be joined into
 the prompt and silently asked of the model, so `run` refuses instead.
 
+### `serve` sizes itself, like Ollama does
+
+`kinfer serve` with no flags reads the context the model was trained for, looks
+at the memory its weights left, and picks a context and a slot count that fit:
+
+```
+sizing: 8 slots + 4 prefix x 65536 tokens each — the model was trained for 262144,
+        the cache should cost about 15.7 GiB of the 45.7 GiB left. -slots and -ctx override this.
+```
+
+The policy: spend at most half of what is left after the weights on the cache
+(the free-memory figure is per process, and a machine serving a fleet is rarely
+running one thing); give each conversation the trained context, rounded down to
+a power of two, as far as that half allows; and when that comes out below what a
+real prompt needs, give up slots before giving up context — one slot of 32768
+answers slowly, eight of 4096 answer nothing an agent sends.
+
+The estimate reads the hybrid geometry from the GGUF header
+(`full_attention_interval`, the `ssm.*` keys): on the Qwen3.5 family only every
+fourth layer holds a KV cache, and the rest hold a per-sequence state that does
+not grow with the context. Counting every layer put the 35B's cache at twice its
+size and sized a server to 32768 tokens on a machine with room for 65536 — which
+refused a 45k-token prompt that Ollama took without comment. That evening is why
+this exists. After the context is built the cost is measured, and if the measure
+leaves under 2 GiB the context is halved and rebuilt: seconds, against the
+weights' half-minute.
+
+`kinfer plan <model>` prints the same decision without loading anything.
+Explicit `-ctx` and `-slots` are never second-guessed.
+
 ### `kinfer install` keeps the server up
 
 The daemon `run` starts is a plain background process: a reboot loses it, and
@@ -109,9 +139,9 @@ so does a crash. A machine that serves a fleet needs `serve` to come back on
 its own, which is the operating system's job. `install` hands it over:
 
 ```
-$ kinfer install -addr :11590 -ctx 32768 -slots 16 -keepalive 0
+$ kinfer install -addr :11590 -keepalive 0
 installed ~/Library/LaunchAgents/ai.localkin.kinfer.plist
-  runs: /usr/local/bin/kinfer serve -addr :11590 -ctx 32768 -slots 16 -keepalive 0
+  runs: /usr/local/bin/kinfer serve -addr :11590 -keepalive 0
   log : ~/.kinfer/serve.log
   starts at login and restarts if it exits; kinfer uninstall removes it
 ```

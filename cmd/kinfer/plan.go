@@ -25,7 +25,7 @@ import (
 
 func cmdPlan(args []string) error {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
-	ctxWant := fs.Int("ctx", engine.DefaultContextSize, "context per conversation to plan for")
+	ctxWant := fs.Int("ctx", 0, "context per conversation to plan for (0 = what serve would choose unasked)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -72,7 +72,7 @@ func cmdPlan(args []string) error {
 	spendable := free - int64(engine.ThinHeadroom())
 	fmt.Printf("  %-8s %-14s %s\n", "-slots", "total tokens", "largest -ctx that fits")
 	for _, slots := range []int{1, 2, 4, 8, 16, 32} {
-		per := largestCtx(sh, spendable, slots)
+		per := engine.LargestCtx(sh, spendable, slots)
 		note := ""
 		if per == 0 {
 			note = "  (no room)"
@@ -82,18 +82,25 @@ func cmdPlan(args []string) error {
 		fmt.Printf("  %-8d %-14d %d%s\n", slots, per*slots, per, note)
 	}
 
-	fmt.Printf("\n  For -ctx %d: ", *ctxWant)
-	best := 0
-	for _, slots := range []int{32, 16, 8, 4, 2, 1} {
-		if largestCtx(sh, spendable, slots) >= *ctxWant {
-			best = slots
-			break
-		}
-	}
-	if best == 0 {
-		fmt.Printf("no slot count fits. Lower -ctx.\n")
+	// The same policy serve applies when given no numbers, so what plan
+	// prints here is what serve would do.
+	if p, err := engine.AutoSize(sh, uint64(free), 0, 0, 0); err != nil {
+		fmt.Printf("\n  Unasked, serve would refuse: %v\n", err)
 	} else {
-		fmt.Printf("kinfer serve -ctx %d -slots %d\n", *ctxWant, best)
+		capped := ""
+		if p.Capped {
+			capped = " (the model's trained maximum)"
+		}
+		fmt.Printf("\n  Unasked, serve picks: %d slots + %d prefix x %d tokens%s, cache about %s\n",
+			p.Slots, p.Prefix, p.PerSeq, capped, store.HumanSize(p.Estimated))
+	}
+	if *ctxWant > 0 {
+		fmt.Printf("  For -ctx %d: ", *ctxWant)
+		if p, err := engine.AutoSize(sh, uint64(free), 0, 0, *ctxWant); err != nil {
+			fmt.Printf("%v\n", err)
+		} else {
+			fmt.Printf("kinfer serve -ctx %d -slots %d\n", *ctxWant, p.Slots)
+		}
 	}
 
 	if sh.Experts > 0 {
@@ -106,20 +113,6 @@ func cmdPlan(args []string) error {
 		"  scale with context, and cost more than this at high slot counts — the\n" +
 		"  memory line printed at load time is the measurement.\n")
 	return nil
-}
-
-// largestCtx is the biggest per-conversation context whose total cache fits,
-// rounded down to a power of two so the answer is one an operator would pick.
-func largestCtx(sh store.Shape, spendable int64, slots int) int {
-	if spendable <= 0 {
-		return 0
-	}
-	for ctx := 1 << 20; ctx >= 512; ctx /= 2 {
-		if sh.CacheBytes(ctx*slots) <= spendable {
-			return ctx
-		}
-	}
-	return 0
 }
 
 func acceleratorBudget() (int64, error) {

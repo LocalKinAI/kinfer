@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/llama"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
 	"github.com/LocalKinAI/kinfer/internal/sampling"
+	"github.com/LocalKinAI/kinfer/internal/store"
 	"github.com/LocalKinAI/kinfer/internal/tools"
 )
 
@@ -31,7 +33,8 @@ type Options struct {
 
 	// ContextSize is the context ONE conversation gets, in tokens. The context
 	// llama.cpp allocates is this times Slots, because it divides a context
-	// between sequences.
+	// between sequences. 0 sizes it to the model and the memory left after
+	// its weights (AutoSize).
 	ContextSize int
 
 	// Slots is how many conversations share the model, each with its own
@@ -40,7 +43,8 @@ type Options struct {
 	//
 	// Pick from {8, 32, 64, 128}: step time roughly doubles between a batch of
 	// 8 and 12 and then stays flat to 32, so 12-16 costs more than 8 and
-	// returns less. See the table in README. 0 means 8.
+	// returns less. See the table in README. 0 means 8, or fewer when the
+	// memory left after the weights cannot give 8 a useful context.
 	Slots int
 
 	// PrefixSlots is how many prompt prefixes stay resident so repeat requests
@@ -174,7 +178,10 @@ const (
 	// worth rather than thirty-two.
 	DefaultSlots = 8
 
-	// DefaultContextSize is the context one conversation gets.
+	// DefaultContextSize is the context one conversation gets when nothing
+	// better is known — no accelerator to budget against, or a GGUF whose
+	// header lacks the attention geometry. With both known, the context is
+	// sized to the model and the memory instead: see AutoSize.
 	DefaultContextSize = 4096
 
 	// DefaultPrefixSlots pools a few prefixes by default. Four covers a handful
@@ -255,45 +262,47 @@ func Open(path string, opts Options) (*Engine, error) {
 	}
 	bud.afterModel = bud.sample()
 
-	slots := opts.Slots
-	if slots <= 0 {
-		slots = DefaultSlots
-	}
-	perSeq := opts.ContextSize
-	if perSeq <= 0 {
-		perSeq = DefaultContextSize
-	}
-	prefix := opts.PrefixSlots
-	if prefix == 0 {
-		prefix = DefaultPrefixSlots
-	}
-	if prefix < 0 {
-		prefix = 0
-	}
-
-	cp := llama.DefaultContextParams()
-	// Pooled prefixes live in sequence ids above the slots, and each needs a
-	// sequence's worth of cache.
-	cp.NSeqMax = uint32(slots + prefix)
-	// llama.cpp divides n_ctx between sequences, so ask for the total.
-	cp.NCtx = uint32(perSeq * (slots + prefix))
-	if cp.NBatch < uint32(batchCapacity) {
-		cp.NBatch = uint32(batchCapacity)
-	}
-	if prefix > 0 {
-		// A cell can only belong to several sequences in the unified buffer,
-		// and sharing cells is the entire point of the pool. llama.cpp warns
-		// that unified costs performance when sequences do NOT share a large
-		// prefix — here they are chosen precisely because they do.
-		cp.KVUnified = 1
-	}
-
-	lctx := llama.NewContext(model, cp)
-	if lctx == 0 {
+	// Whatever the operator left at zero is sized here, from the model's
+	// shape and the memory the weights actually left — see autosize.go.
+	sized := opts.Slots <= 0 || opts.ContextSize <= 0
+	shape, _ := store.ReadShape(path)
+	plan, err := AutoSize(shape, bud.afterModel, opts.Slots, opts.PrefixSlots, opts.ContextSize)
+	if err != nil {
 		llama.FreeModel(model)
-		return nil, fmt.Errorf("create context for %s", path)
+		return nil, err
 	}
-	bud.afterCtx = bud.sample()
+	slots, prefix, perSeq := plan.Slots, plan.Prefix, plan.PerSeq
+	if sized {
+		trained := "unknown"
+		if shape.TrainedCtx > 0 {
+			trained = fmt.Sprint(shape.TrainedCtx)
+		}
+		log.Printf("sizing: %d slots + %d prefix x %d tokens each — the model was trained for %s, "+
+			"the cache should cost about %s of the %s left. -slots and -ctx override this.",
+			slots, prefix, perSeq, trained, gib(uint64(plan.Estimated)), gib(bud.afterModel))
+	}
+
+	var lctx llama.Context
+	for {
+		lctx = newContext(model, slots, prefix, perSeq)
+		if lctx == 0 {
+			llama.FreeModel(model)
+			return nil, fmt.Errorf("create context for %s", path)
+		}
+		bud.afterCtx = bud.sample()
+		// The estimate is for plain attention. A hybrid model's cache holds a
+		// per-sequence state the header does not describe, and on one such
+		// model it cost two and a half times the estimate. When the measured
+		// cost leaves less than the floor, and the size was ours to choose,
+		// choose smaller: a context is seconds to rebuild, the weights stay.
+		if !sized || !bud.known || bud.afterCtx >= thinHeadroom || perSeq/2 < 2048 {
+			break
+		}
+		log.Printf("sizing: %d tokens x %d sequences measured %s, leaving %s — halving the context",
+			perSeq, slots+prefix, gib(sub(bud.afterModel, bud.afterCtx)), gib(bud.afterCtx))
+		llama.FreeContext(lctx)
+		perSeq /= 2
+	}
 	bud.report(slots, prefix, perSeq)
 
 	tpl := chat.FromModel(model, path)
@@ -343,6 +352,28 @@ func Open(path string, opts Options) (*Engine, error) {
 		})
 	e.sched.onFatal = func() { e.broken.Store(true) }
 	return e, nil
+}
+
+// newContext asks llama.cpp for a cache holding slots+prefix sequences of
+// perSeq tokens each.
+func newContext(model llama.Model, slots, prefix, perSeq int) llama.Context {
+	cp := llama.DefaultContextParams()
+	// Pooled prefixes live in sequence ids above the slots, and each needs a
+	// sequence's worth of cache.
+	cp.NSeqMax = uint32(slots + prefix)
+	// llama.cpp divides n_ctx between sequences, so ask for the total.
+	cp.NCtx = uint32(perSeq * (slots + prefix))
+	if cp.NBatch < uint32(batchCapacity) {
+		cp.NBatch = uint32(batchCapacity)
+	}
+	if prefix > 0 {
+		// A cell can only belong to several sequences in the unified buffer,
+		// and sharing cells is the entire point of the pool. llama.cpp warns
+		// that unified costs performance when sequences do NOT share a large
+		// prefix — here they are chosen precisely because they do.
+		cp.KVUnified = 1
+	}
+	return llama.NewContext(model, cp)
 }
 
 // Slots is how many conversations this engine serves at once.

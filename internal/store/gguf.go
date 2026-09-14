@@ -23,38 +23,91 @@ type Shape struct {
 	HeadsKV    int // attention.head_count_kv
 	EmbedDim   int // embedding_length
 	Heads      int // attention.head_count
+	KeyLen     int // attention.key_length, when a head is not EmbedDim/Heads
+	ValLen     int // attention.value_length
 	TrainedCtx int // context_length
+
+	// Hybrid architectures — Qwen3.5, Qwen3-Next and their relatives — put
+	// attention on every AttnInterval-th layer and a recurrent block on the
+	// rest. The recurrent blocks keep a state per sequence that does not grow
+	// with the context: sized from the ssm.* keys below.
+	AttnInterval int // full_attention_interval; 0 means every layer attends
+	SSMConv      int // ssm.conv_kernel
+	SSMState     int // ssm.state_size
+	SSMGroups    int // ssm.group_count
+	SSMInner     int // ssm.inner_size
 
 	// Experts is nonzero for a mixture of experts. It does not change the cache,
 	// but it changes what batching buys, so fit says so.
 	Experts int
 }
 
-// HeadDim is the size of one attention head, which GGUF does not always state.
+// HeadDim is the size of one attention head. GGUF states it outright when it
+// is not EmbedDim/Heads, which on the Qwen3.5 family it is not.
 func (s Shape) HeadDim() int {
+	if s.KeyLen > 0 {
+		return s.KeyLen
+	}
 	if s.Heads > 0 && s.EmbedDim > 0 {
 		return s.EmbedDim / s.Heads
 	}
 	return 0
 }
 
-// CacheBytes estimates the KV cache for a given total token count, at f16.
+// AttnLayers is how many layers hold a KV cache.
+func (s Shape) AttnLayers() int {
+	if s.AttnInterval > 1 {
+		return s.Layers / s.AttnInterval
+	}
+	return s.Layers
+}
+
+// CacheBytes estimates the attention cache for a total token count, at f16:
+// two bytes per element, K and V, one entry per attending layer per KV head.
 //
-// Two bytes per element, two tensors (K and V), one entry per layer per head.
-// That is the standard attention cache and it is what most models have.
-//
-// It is an estimate, and the direction it errs in is known: a hybrid
-// architecture — Qwen3-Next and its relatives — replaces some layers with
-// recurrent state whose size is per sequence rather than per token, and those
-// cost more than this predicts at high sequence counts and less at long
-// contexts. Measured on qwen3.8-flash-next, 32768 tokens cost 1.7 GiB spread
-// over 2 sequences and 4.3 GiB spread over 32.
+// This is the part that grows with the context. A hybrid model also holds a
+// per-sequence state that does not — see CacheBytesFor, which is what sizing
+// uses. Before the header's full_attention_interval and ssm.* keys were read,
+// this counted every layer as attending and put the 35B's cache at twice its
+// measured size, which is how a server was sized to 32768 tokens per
+// conversation on a machine with room for 65536.
 func (s Shape) CacheBytes(tokens int) int64 {
 	d := s.HeadDim()
-	if s.Layers == 0 || s.HeadsKV == 0 || d == 0 {
+	if s.AttnLayers() == 0 || s.HeadsKV == 0 || d == 0 {
 		return 0
 	}
-	return int64(tokens) * int64(s.Layers) * int64(s.HeadsKV) * int64(d) * 2 * 2
+	v := s.ValLen
+	if v == 0 {
+		v = d
+	}
+	return int64(tokens) * int64(s.AttnLayers()) * int64(s.HeadsKV) * int64(d+v) * 2
+}
+
+// RecurrentBytesPerSeq is the state one sequence holds in the recurrent
+// layers of a hybrid model, in f32: the convolution window and the SSM state.
+//
+// Checked against llama.cpp's own report for the 35B (16 sequences, 30
+// recurrent layers): R 45.00 MiB and S 960.00 MiB, which is 96 KiB and 2 MiB
+// per sequence per layer — exactly what these terms give.
+func (s Shape) RecurrentBytesPerSeq() int64 {
+	if s.AttnInterval <= 1 || s.SSMInner == 0 || s.SSMState == 0 {
+		return 0
+	}
+	recurrent := s.Layers - s.AttnLayers()
+	conv := int64(max(s.SSMConv-1, 0)) * int64(s.SSMInner+2*s.SSMGroups*s.SSMState)
+	state := int64(s.SSMInner) * int64(s.SSMState)
+	return int64(recurrent) * (conv + state) * 4
+}
+
+// CacheBytesFor is the whole cache for tokens spread over seqs sequences: the
+// attention part, which scales with tokens, plus the recurrent part, which
+// scales with sequences.
+func (s Shape) CacheBytesFor(tokens, seqs int) int64 {
+	attn := s.CacheBytes(tokens)
+	if attn == 0 {
+		return 0
+	}
+	return attn + int64(seqs)*s.RecurrentBytesPerSeq()
 }
 
 // ReadShape reads a GGUF file's header.
@@ -111,6 +164,20 @@ func ReadShape(path string) (Shape, error) {
 			sh.TrainedCtx = int(n)
 		case strings.HasSuffix(key, ".expert_count"):
 			sh.Experts = int(n)
+		case strings.HasSuffix(key, ".attention.key_length"):
+			sh.KeyLen = int(n)
+		case strings.HasSuffix(key, ".attention.value_length"):
+			sh.ValLen = int(n)
+		case strings.HasSuffix(key, ".full_attention_interval"):
+			sh.AttnInterval = int(n)
+		case strings.HasSuffix(key, ".ssm.conv_kernel"):
+			sh.SSMConv = int(n)
+		case strings.HasSuffix(key, ".ssm.state_size"):
+			sh.SSMState = int(n)
+		case strings.HasSuffix(key, ".ssm.group_count"):
+			sh.SSMGroups = int(n)
+		case strings.HasSuffix(key, ".ssm.inner_size"):
+			sh.SSMInner = int(n)
 		}
 	}
 	return sh, nil

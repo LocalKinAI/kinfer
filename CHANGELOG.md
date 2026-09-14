@@ -7,6 +7,16 @@ Everything below was built and measured on one 96 GB Mac Studio against a
 
 ### Staying up under load
 
+- **`serve` sizes itself.** With no `-ctx`/`-slots`, the context comes from
+  what the model was trained for and the memory its weights left, spending at
+  most half of that on the cache; when that is too small for a real prompt,
+  slots are shed before context is. The hybrid geometry is read from the GGUF
+  header (`full_attention_interval`, `ssm.*`), so the 35B's cache is estimated
+  at its measured size rather than twice it — the error that sized a server to
+  32768 tokens on a machine with room for 65536, and refused a 45k-token
+  prompt Ollama accepted. After building the context the cost is measured and
+  the context halved if under 2 GiB remains. `kinfer plan` prints the same
+  decision; explicit flags are never overridden.
 - **`kinfer install` / `kinfer uninstall`.** A per-user launchd job (no sudo)
   that starts `serve` at login and restarts it after any exit — `kill -9` came
   back in 10s. The serve flags are recorded verbatim after `serve`'s own parser

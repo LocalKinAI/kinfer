@@ -199,7 +199,7 @@ func cmdRemove(args []string) error {
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	ngl := fs.Int("ngl", 99, "layers to offload to GPU (0 = CPU only)")
-	nCtx := fs.Int("ctx", 4096, "context size in tokens")
+	nCtx := fs.Int("ctx", 0, "context size in tokens (0 = sized to the model and this machine)")
 	system := fs.String("system", "", "system prompt")
 	maxTok := fs.Int("n", 512, "maximum tokens to generate")
 	addr := fs.String("addr", defaultAddr, "daemon address")
@@ -382,8 +382,8 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs := flag.NewFlagSet("serve", h)
 	fs.StringVar(&o.addr, "addr", ":11500", "listen address")
 	fs.IntVar(&o.ngl, "ngl", 99, "layers to offload to GPU (0 = CPU only)")
-	fs.IntVar(&o.nCtx, "ctx", 4096, "context size per conversation, in tokens")
-	fs.IntVar(&o.slots, "slots", engine.DefaultSlots, "conversations served at once (use 8, 32, 64 or 128 — never 12-16)")
+	fs.IntVar(&o.nCtx, "ctx", 0, "context size per conversation, in tokens (0 = as much as the model and the memory allow)")
+	fs.IntVar(&o.slots, "slots", 0, "conversations served at once (0 = 8, or fewer if memory is tight; use 8, 32, 64 or 128 — never 12-16)")
 	fs.IntVar(&o.prefix, "prefix", engine.DefaultPrefixSlots, "prompt prefixes kept resident so repeat requests skip prefilling them (-1 disables)")
 	fs.IntVar(&o.queue, "queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
 	fs.DurationVar(&o.maxGen, "max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
@@ -414,9 +414,14 @@ func cmdServe(args []string) error {
 
 	models, _ := st.List()
 	fmt.Printf("kinfer serving on %s — %d model(s) in %s\n", o.addr, len(models), st.Root())
-	fmt.Printf("  %d slots × %d tokens — conversations share one forward pass\n", o.slots, o.nCtx)
+	switch {
+	case o.slots > 0 && o.nCtx > 0:
+		fmt.Printf("  %d slots × %d tokens — conversations share one forward pass\n", o.slots, o.nCtx)
+	default:
+		fmt.Printf("  slots and context are sized to each model as it loads — the sizing line says what it chose\n")
+	}
 	if o.prefix > 0 {
-		fmt.Printf("  %d prefix slots — a repeated system prompt is prefilled once\n", o.prefix)
+		fmt.Printf("  up to %d prefix slots — a repeated system prompt is prefilled once\n", o.prefix)
 	}
 	fmt.Printf("  Ollama API : POST %s/api/chat        GET %s/api/tags\n", o.addr, o.addr)
 	fmt.Printf("  OpenAI API : POST %s/v1/chat/completions\n\n", o.addr)
