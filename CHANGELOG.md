@@ -7,6 +7,11 @@ Everything below was built and measured on one 96 GB Mac Studio against a
 
 ### Staying up under load
 
+- **`kinfer install` / `kinfer uninstall`.** A per-user launchd job (no sudo)
+  that starts `serve` at login and restarts it after any exit — `kill -9` came
+  back in 10s. The serve flags are recorded verbatim after `serve`'s own parser
+  has accepted them, so a mistyped flag is refused now rather than retried
+  forever by launchd. Reinstalling replaces the job. macOS only.
 - **Bounded queue with backpressure.** `-queue` (default 128) caps what may wait;
   past it the answer is `503` in about 60ms rather than a held connection. A
   `Retry-After` is sent only when the server has measured its own completion

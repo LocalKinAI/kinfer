@@ -31,6 +31,8 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer ps                    show which model is loaded right now
   kinfer plan <model>          what -slots and -ctx to serve it with
   kinfer serve                 serve models over HTTP
+  kinfer install [serve flags] keep serve running: at login, and after a crash (macOS)
+  kinfer uninstall             stop it and remove the service
   kinfer fit                   what this machine can actually run
   kinfer can-run <hf-repo>     whether a model on Hugging Face will run here
 
@@ -65,6 +67,10 @@ func main() {
 		err = cmdPS(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "install":
+		err = cmdInstall(os.Args[2:])
+	case "uninstall":
+		err = cmdUninstall(os.Args[2:])
 	case "fit":
 		err = cmdFit(os.Args[2:])
 	case "plan":
@@ -360,19 +366,39 @@ func cmdPS(args []string) error {
 	return nil
 }
 
+// serveOpts is everything `kinfer serve` takes from the command line. It is a
+// struct so that `kinfer install` can run the same flag set over the arguments
+// it is about to record, and refuse a typo before launchd meets it.
+type serveOpts struct {
+	addr                 string
+	ngl, nCtx            int
+	slots, prefix, queue int
+	maxGen, maxWait      time.Duration
+	keepAlive            time.Duration
+}
+
+func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
+	o := &serveOpts{}
+	fs := flag.NewFlagSet("serve", h)
+	fs.StringVar(&o.addr, "addr", ":11500", "listen address")
+	fs.IntVar(&o.ngl, "ngl", 99, "layers to offload to GPU (0 = CPU only)")
+	fs.IntVar(&o.nCtx, "ctx", 4096, "context size per conversation, in tokens")
+	fs.IntVar(&o.slots, "slots", engine.DefaultSlots, "conversations served at once (use 8, 32, 64 or 128 — never 12-16)")
+	fs.IntVar(&o.prefix, "prefix", engine.DefaultPrefixSlots, "prompt prefixes kept resident so repeat requests skip prefilling them (-1 disables)")
+	fs.IntVar(&o.queue, "queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
+	fs.DurationVar(&o.maxGen, "max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
+	fs.DurationVar(&o.maxWait, "max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
+	fs.DurationVar(&o.keepAlive, "keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
+	return fs, o
+}
+
 func cmdServe(args []string) error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := fs.String("addr", ":11500", "listen address")
-	ngl := fs.Int("ngl", 99, "layers to offload to GPU (0 = CPU only)")
-	nCtx := fs.Int("ctx", 4096, "context size per conversation, in tokens")
-	slots := fs.Int("slots", engine.DefaultSlots, "conversations served at once (use 8, 32, 64 or 128 — never 12-16)")
-	prefix := fs.Int("prefix", engine.DefaultPrefixSlots, "prompt prefixes kept resident so repeat requests skip prefilling them (-1 disables)")
-	queue := fs.Int("queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
-	maxGen := fs.Duration("max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
-	maxWait := fs.Duration("max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
-	keepAlive := fs.Duration("keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
+	fs, o := serveFlags(flag.ExitOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("serve takes no arguments; %q was one", fs.Arg(0))
 	}
 
 	st, err := store.Open()
@@ -380,24 +406,24 @@ func cmdServe(args []string) error {
 		return err
 	}
 	srv := server.New(st, engine.Options{
-		GPULayers: *ngl, ContextSize: *nCtx, Slots: *slots, PrefixSlots: *prefix,
-		MaxQueue: *queue, MaxGenerate: noLimit(*maxGen), MaxWait: noLimit(*maxWait),
+		GPULayers: o.ngl, ContextSize: o.nCtx, Slots: o.slots, PrefixSlots: o.prefix,
+		MaxQueue: o.queue, MaxGenerate: noLimit(o.maxGen), MaxWait: noLimit(o.maxWait),
 	})
-	srv.SetKeepAlive(*keepAlive)
+	srv.SetKeepAlive(o.keepAlive)
 	defer srv.Close()
 
 	models, _ := st.List()
-	fmt.Printf("kinfer serving on %s — %d model(s) in %s\n", *addr, len(models), st.Root())
-	fmt.Printf("  %d slots × %d tokens — conversations share one forward pass\n", *slots, *nCtx)
-	if *prefix > 0 {
-		fmt.Printf("  %d prefix slots — a repeated system prompt is prefilled once\n", *prefix)
+	fmt.Printf("kinfer serving on %s — %d model(s) in %s\n", o.addr, len(models), st.Root())
+	fmt.Printf("  %d slots × %d tokens — conversations share one forward pass\n", o.slots, o.nCtx)
+	if o.prefix > 0 {
+		fmt.Printf("  %d prefix slots — a repeated system prompt is prefilled once\n", o.prefix)
 	}
-	fmt.Printf("  Ollama API : POST %s/api/chat        GET %s/api/tags\n", *addr, *addr)
-	fmt.Printf("  OpenAI API : POST %s/v1/chat/completions\n\n", *addr)
-	fmt.Printf("  point LocalKin at it by setting a soul's brain.endpoint to %s\n\n", *addr)
+	fmt.Printf("  Ollama API : POST %s/api/chat        GET %s/api/tags\n", o.addr, o.addr)
+	fmt.Printf("  OpenAI API : POST %s/v1/chat/completions\n\n", o.addr)
+	fmt.Printf("  point LocalKin at it by setting a soul's brain.endpoint to %s\n\n", o.addr)
 
 	httpSrv := &http.Server{
-		Addr:    *addr,
+		Addr:    o.addr,
 		Handler: srv.Handler(),
 		// No write timeout: generation can legitimately run for minutes, and a
 		// deadline here would sever a reply mid-sentence.

@@ -69,6 +69,8 @@ kinfer rm <model>            # delete one
 kinfer run <model> [prompt]  # chat — no prompt means interactive
 kinfer ps                    # what the daemon is holding right now
 kinfer serve [-addr :11500]  # serve over HTTP
+kinfer install [serve flags] # keep serve running: at login and after a crash (macOS)
+kinfer uninstall             # stop it and remove the service
 ```
 
 ### `kinfer run` keeps the model warm
@@ -99,6 +101,27 @@ question is why a model failed to load.
 
 Flags go before the model name. A flag after it would otherwise be joined into
 the prompt and silently asked of the model, so `run` refuses instead.
+
+### `kinfer install` keeps the server up
+
+The daemon `run` starts is a plain background process: a reboot loses it, and
+so does a crash. A machine that serves a fleet needs `serve` to come back on
+its own, which is the operating system's job. `install` hands it over:
+
+```
+$ kinfer install -addr :11590 -ctx 32768 -slots 16 -keepalive 0
+installed ~/Library/LaunchAgents/ai.localkin.kinfer.plist
+  runs: /usr/local/bin/kinfer serve -addr :11590 -ctx 32768 -slots 16 -keepalive 0
+  log : ~/.kinfer/serve.log
+  starts at login and restarts if it exits; kinfer uninstall removes it
+```
+
+It is a per-user launchd job — no sudo, the same arrangement Ollama's app uses —
+started at login and restarted within seconds of any exit (measured: `kill -9`,
+back in 10s). The flags are recorded verbatim, after being run through `serve`'s
+own parser, so a typo is refused at the keyboard instead of by a job that fails
+at every login. Running `install` again replaces the job; `uninstall` stops it
+and removes the file. macOS only for now.
 
 ### `kinfer fit`
 
