@@ -25,7 +25,7 @@ import (
 type counters struct {
 	// By HTTP status class, recorded by middleware rather than by each handler,
 	// so a new endpoint cannot forget to count itself.
-	ok, refused, failed atomic.Int64
+	ok, refused, rejected, failed atomic.Int64
 }
 
 // countingWriter remembers the status so the middleware can classify a request
@@ -68,6 +68,12 @@ func (s *Server) count(next http.Handler) http.Handler {
 			s.stats.refused.Add(1)
 		case cw.status >= 500:
 			s.stats.failed.Add(1)
+		// A 4xx is the caller's request being wrong for this server — a prompt
+		// larger than a slot, an unknown model. It went uncounted, and a client
+		// whose every request was 413 read as "no requests" here while its
+		// operator asked why nothing answered.
+		case cw.status >= 400:
+			s.stats.rejected.Add(1)
 		case cw.status >= 200 && cw.status < 400:
 			s.stats.ok.Add(1)
 		}
@@ -110,6 +116,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	metric("requests_total", "Requests answered.", "counter", s.stats.ok.Load(), `{outcome="ok"}`)
 	fmt.Fprintf(&b, "kinfer_requests_total{outcome=\"refused\"} %d\n", s.stats.refused.Load())
+	fmt.Fprintf(&b, "kinfer_requests_total{outcome=\"rejected\"} %d\n", s.stats.rejected.Load())
 	fmt.Fprintf(&b, "kinfer_requests_total{outcome=\"failed\"} %d\n", s.stats.failed.Load())
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

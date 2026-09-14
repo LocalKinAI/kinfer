@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // The job lives in the user's launchd domain: ~/Library/LaunchAgents, loaded
@@ -36,6 +37,15 @@ func installService(svc service) (string, error) {
 	// new job. bootout of a job that is not loaded fails, and that is fine.
 	_ = launchctl("bootout", launchdDomain()+"/"+serviceLabel)
 
+	// bootout returns before the job is gone: it sends SIGTERM and the process
+	// gets its shutdown grace, which for a server holding a 20 GiB model is
+	// not instant. A bootstrap in that window fails with "Input/output error",
+	// which it did on the first reinstall and left nothing running. Wait for
+	// the old job to disappear before loading the new one.
+	if !waitUntilUnloaded(30 * time.Second) {
+		return "", fmt.Errorf("the previous %s job did not stop within 30s", serviceLabel)
+	}
+
 	if err := os.WriteFile(path, []byte(launchdPlist(svc)), 0o644); err != nil {
 		return "", err
 	}
@@ -43,6 +53,20 @@ func installService(svc service) (string, error) {
 		return "", fmt.Errorf("load %s: %w", path, err)
 	}
 	return path, nil
+}
+
+// waitUntilUnloaded polls launchd until the job is no longer known to it.
+func waitUntilUnloaded(limit time.Duration) bool {
+	deadline := time.Now().Add(limit)
+	for {
+		if launchctl("print", launchdDomain()+"/"+serviceLabel) != nil {
+			return true // "Could not find service": it is gone
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 func uninstallService() (string, error) {

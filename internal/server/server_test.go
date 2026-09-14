@@ -1149,3 +1149,22 @@ func TestMetricsFileA503AsRefused(t *testing.T) {
 		t.Errorf("failed = %d, want 0 — a refusal was counted as a failure", got)
 	}
 }
+
+// A 4xx must be counted. It was not: a client sending prompts too large for a
+// slot got 413 on every request, /metrics showed nothing but zeros, and the
+// operator's question — "why does it not answer" — had no number to point at.
+func TestMetricsCountA4xxAsRejected(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	for _, code := range []int{http.StatusRequestEntityTooLarge, http.StatusNotFound, http.StatusBadRequest} {
+		w := httptest.NewRecorder()
+		srv.count(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "no", code)
+		})).ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", nil))
+	}
+	if got := srv.stats.rejected.Load(); got != 3 {
+		t.Errorf("rejected = %d, want 3", got)
+	}
+	if got := srv.stats.failed.Load() + srv.stats.refused.Load() + srv.stats.ok.Load(); got != 0 {
+		t.Errorf("a 4xx leaked into another outcome: ok+refused+failed = %d", got)
+	}
+}

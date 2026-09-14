@@ -11,7 +11,15 @@ Everything below was built and measured on one 96 GB Mac Studio against a
   that starts `serve` at login and restarts it after any exit — `kill -9` came
   back in 10s. The serve flags are recorded verbatim after `serve`'s own parser
   has accepted them, so a mistyped flag is refused now rather than retried
-  forever by launchd. Reinstalling replaces the job. macOS only.
+  forever by launchd. Reinstalling replaces the job — and waits for the old one
+  to actually stop first: `launchctl bootout` returns while the server is still
+  in its shutdown grace, and a bootstrap in that window fails with an I/O error
+  and leaves nothing running, which is how the first reinstall of a 20 GiB
+  model went. macOS only.
+- **`/metrics` counts 4xx as `rejected`.** A client sending prompts larger
+  than a slot got 413 on every request while the counters read all zeros; the
+  operator's question was "why does it not answer" and there was no number to
+  point at.
 - **Bounded queue with backpressure.** `-queue` (default 128) caps what may wait;
   past it the answer is `503` in about 60ms rather than a held connection. A
   `Retry-After` is sent only when the server has measured its own completion
