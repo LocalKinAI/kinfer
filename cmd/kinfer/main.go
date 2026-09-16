@@ -424,7 +424,9 @@ func cmdServe(args []string) error {
 		fmt.Printf("  up to %d prefix slots — a repeated system prompt is prefilled once\n", o.prefix)
 	}
 	fmt.Printf("  Ollama API : POST %s/api/chat        GET %s/api/tags\n", o.addr, o.addr)
-	fmt.Printf("  OpenAI API : POST %s/v1/chat/completions\n\n", o.addr)
+	fmt.Printf("  OpenAI API : POST %s/v1/chat/completions\n", o.addr)
+	fmt.Printf("  Anthropic  : POST %s/v1/messages          (Claude Code)\n", o.addr)
+	fmt.Printf("  Responses  : POST %s/v1/responses         (Codex)\n\n", o.addr)
 	fmt.Printf("  point LocalKin at it by setting a soul's brain.endpoint to %s\n\n", o.addr)
 
 	httpSrv := &http.Server{

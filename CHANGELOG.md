@@ -5,6 +5,46 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### The dialects coding agents speak
+
+Measured on a 16 GB MacBook against ornith-1.5:9b — a 5.6 GB GGUF symlinked
+out of an Ollama blob store — not on the Studio above.
+
+- **`POST /v1/messages`, Anthropic's Messages API**: what Claude Code speaks to
+  a server named in `ANTHROPIC_BASE_URL`. **`POST /v1/responses`, OpenAI's
+  Responses API**: the only thing Codex speaks to a custom provider since 0.154
+  refused `wire_api = "chat"`. Claude Code finishing a turn that ran one Bash
+  call: 62s. Codex listing a directory through `exec_command`: 49s with a cold
+  prefix cache — its opening prompt is 6,350 tokens — and 15s warm.
+- **Written against captured traffic, not the reference.** Both agents were run
+  through a recording proxy against Ollama 0.34, which each accepts unmodified,
+  and the handlers follow what was on the wire. It differs from the docs in ways
+  that would each have been a 400 or a hang: Claude Code posts to
+  `/v1/messages?beta=true`, puts turns with role `system` inside `messages`, and
+  sends `thinking`, `output_config`, `context_management`, `metadata` and
+  `cache_control` on every turn; Codex sends a 17K-character `instructions`, a
+  `developer` message, `namespace` and hosted `web_search` tools beside its
+  function tools, and history in the order function_call → reasoning →
+  function_call_output. The streams follow Ollama's event order too: no `ping`
+  and no thinking signature in one dialect, reasoning summaries without
+  `summary_part` events in the other.
+- **One split for every dialect.** Thinking, prose and calls are separated by
+  the same `ThinkSplitter` and `CallSplitter` pass the OpenAI dialect streams
+  with, so no dialect can disagree with another about where a think block ends
+  or a call begins.
+- **Failures in each dialect's own envelope.** 413 `request_too_large`, 503
+  `overloaded_error` with `Retry-After`, 404 `not_found_error`. A streamed
+  request that fails before its first token still gets a status; one that fails
+  after gets `event: error` or `response.failed` rather than a stream that just
+  stops. A reply cut off by a limit ends in `stop_reason: max_tokens` or
+  `response.incomplete`, never in a finished turn.
+- **Not done.** No `count_tokens` (Claude Code estimates instead, as it does
+  against Ollama). Namespace, custom and hosted tools are dropped: offered to a
+  local model they can only produce calls nothing here answers.
+  `output_config.format` is stated to the model, not enforced with a grammar —
+  Claude Code uses it for a session title, so a model that ignores it costs a
+  title. Images arrive as a note saying they were omitted.
+
 ### Staying up under load
 
 - **`serve` sizes itself.** With no `-ctx`/`-slots`, the context comes from

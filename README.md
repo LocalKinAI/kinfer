@@ -17,6 +17,8 @@ $ kinfer serve
 kinfer serving on :11500 — 1 model(s) in ~/.kinfer/models
   Ollama API : POST :11500/api/chat        GET :11500/api/tags
   OpenAI API : POST :11500/v1/chat/completions
+  Anthropic  : POST :11500/v1/messages          (Claude Code)
+  Responses  : POST :11500/v1/responses         (Codex)
 ```
 
 ```
@@ -25,7 +27,7 @@ $ ls -lh $(which kinfer)
 ```
 
 > **Status: early but usable.** The inference core is done and the CLI works:
-> pull, list, rm, run, ps, and an HTTP server speaking two dialects. What is
+> pull, list, rm, run, ps, and an HTTP server speaking four dialects. What is
 > *not* done is the reason the project exists — health probing, automatic
 > failover, circuit breaking. See [CHANGELOG.md](CHANGELOG.md), which records
 > exactly what works and what does not.
@@ -52,7 +54,7 @@ built for *a fleet of agents that must not go down*.
 | Install | background service | Docker required | **copy one file** |
 | Model source | registry + `hf.co/...` | Docker Hub / OCI / HF | HF directly |
 | On-disk models | blob hashes | OCI layers | **plain filenames** |
-| API | Ollama | Ollama + OpenAI | **Ollama + OpenAI** |
+| API | Ollama + OpenAI + Anthropic + Responses | Ollama + OpenAI | **Ollama + OpenAI + Anthropic + Responses** |
 | Designed for | one user, one chat | container workflows | **agent fleets** |
 
 Plain filenames matter more than it sounds: when something breaks at 2am you
@@ -199,7 +201,7 @@ silently loading the wrong 7B model is worse than a message.
 ```
       cmd/kinfer              pull · list · rm · run · serve
             │
-      internal/server         Ollama + OpenAI dialects, streaming
+      internal/server         Ollama, OpenAI, Anthropic, Responses dialects, streaming
       internal/engine         one loaded model: prompt → tokens → text
             │
    ┌────────┼─────────┬──────────────┬────────────────┐

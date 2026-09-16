@@ -129,6 +129,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", s.handleOpenAIChat)
 	mux.HandleFunc("/v1/models", s.handleOpenAIModels)
 
+	// The dialects coding agents speak: Anthropic's Messages API for Claude
+	// Code, OpenAI's Responses API for Codex. Same engine, same split of thinking
+	// from prose from calls — two more ways of writing it down.
+	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
+
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
