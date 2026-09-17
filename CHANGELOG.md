@@ -5,6 +5,52 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### Fixed — prefix reuse on models with recurrent layers
+
+Measured on a 16 GB MacBook with ornith-1.5:9b and confirmed on ornith-1.5-35b;
+both are hybrids, attention plus recurrent layers.
+
+- **What was wrong.** The pool shares a cached prompt's first n tokens with a
+  new request. Attention cells can be shared up to any position, but a
+  recurrent layer's state is one value for the whole sequence, so the request
+  got a state that had already read the rest of the pooled prompt. llama.cpp
+  said so on every such reuse (`find_slot: non-consecutive token position 257
+  after 257`), and the output showed it: the same prompt sent twice came back
+  the second time with its tool call written as `<invoke name="shell">…` prose
+  instead of a `<tool_call>` — through every dialect, `/v1/chat/completions`
+  included. The warning was in the box's log for other clients' traffic too.
+  A test for content crossing between conversations — one told a codeword, a
+  second with the same system prompt asked for it — came back clean: the stale
+  state perturbed output, it did not carry text across.
+- **What it does now.** For a model llama.cpp reports as recurrent or hybrid, a
+  pooled prompt is adopted only whole, by a request that continues past its
+  end. To keep that worth having, such prompts are pooled at the two places
+  later requests repeat whole — found by rendering the conversation a second
+  way and seeing where the two part: the end of the system prompt, for another
+  conversation of the same agent, and the end of the conversation so far, for
+  its next turn. Both are taken back to just after a control token, because an
+  ordinary token at the edge tokenizes with what follows it: the `\n` that
+  ended `<|im_start|>assistant\n` came back in the next turn merged into the
+  `\n\n` before a `<tool_call>`, one token short of whole. Prefill ends a batch
+  at each so the state is pooled at exactly that position, and the system
+  prompt is kept under the conversations that extend it and evicted after
+  them. Pure attention models are unchanged.
+
+| ornith-1.5:9b, ~1,000-token agent prompt | reused | prefill |
+|---|---|---|
+| first turn | 0% | 4.95s |
+| second turn | 94% | 0.42s |
+| third turn | 94% | 0.43s |
+| another conversation, same system prompt | 99% | 0.26s |
+| back to the first conversation | 97% | 0.27s |
+| the same prompt again (tool call intact 3/3) | 99% | — |
+| control: a different system prompt | 0% | 6.53s |
+
+Whole entries pooled at the prompt's end — the first version of this fix —
+kept output right and reused 0% of the second turn, because the pooled prompt
+ended in an opening of the reply the next turn renders differently. That is
+what the checkpoints are for.
+
 ### The dialects coding agents speak
 
 Measured on a 16 GB MacBook against ornith-1.5:9b — a 5.6 GB GGUF symlinked

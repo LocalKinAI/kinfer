@@ -345,11 +345,17 @@ func Open(path string, opts Options) (*Engine, error) {
 	if queue <= 0 {
 		queue = DefaultMaxQueue
 	}
+	// A model with recurrent layers can adopt a pooled prompt only whole; see
+	// prefixPool.exact. Said once at load, so a slower repeat is not a mystery.
+	recurrent := llama.HasRecurrentState(model)
+	if recurrent && prefix > 0 {
+		log.Printf("prefix pool: whole prompts only — this model keeps recurrent state, which cannot be cut back to a shorter prefix")
+	}
 	e.sched = newScheduler(lctx, vocab, tpl, slots, prefix, e.nCtx, batchCapacity, queue,
 		deadlines{
 			generate: pick(opts.MaxGenerate, DefaultMaxGenerate),
 			wait:     pick(opts.MaxWait, DefaultMaxWait),
-		})
+		}, recurrent)
 	e.sched.onFatal = func() { e.broken.Store(true) }
 	return e, nil
 }

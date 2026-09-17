@@ -54,6 +54,21 @@ type prefixPool struct {
 	// outweighs a prefill that llama.cpp would have done in microseconds.
 	minMatch int
 
+	// exact limits reuse to whole entries: a prompt adopts a pooled prefix
+	// only when it continues past the end of it. It is set for models that
+	// keep recurrent state. Attention cells can be shared up to any position,
+	// but a recurrent layer's state is one value for the whole sequence, so
+	// adopting the first n tokens of a longer entry hands the new prompt a
+	// state that has already read the rest of the old one. llama.cpp says so
+	// ("non-consecutive token position") and the output shows it: on
+	// ornith-1.5-35b the same prompt sent twice came back the second time with
+	// its tool call written as <invoke> prose instead of a <tool_call>.
+	//
+	// An agent's next turn continues its previous prompt, so the reuse that
+	// matters most is the kind that stays. What goes is reuse of a repeat, an
+	// edited history, or another conversation that shares only a system prompt.
+	exact bool
+
 	clock int64
 }
 
@@ -63,15 +78,21 @@ type prefixEntry struct {
 	seq     int32
 	tokens  []llama.Token
 	lastUse int64
+
+	// shared marks a system prompt: a prefix every conversation of the agent
+	// that sent it opens with, as opposed to one conversation so far. It only
+	// matters to an exact pool; see victim.
+	shared bool
 }
 
 // newPrefixPool claims n sequence ids starting at firstSeq.
-func newPrefixPool(lctx llama.Context, firstSeq int32, n, minMatch int) *prefixPool {
+func newPrefixPool(lctx llama.Context, firstSeq int32, n, minMatch int, exact bool) *prefixPool {
 	if n <= 0 {
 		return nil
 	}
 	p := &prefixPool{
 		minMatch: minMatch,
+		exact:    exact,
 		share: func(src, dst int32, n int32) {
 			llama.CopySequence(lctx, src, dst, 0, n)
 		},
@@ -85,12 +106,18 @@ func newPrefixPool(lctx llama.Context, firstSeq int32, n, minMatch int) *prefixP
 	return p
 }
 
+// wholeOnly reports a pool that adopts only whole entries; see exact. A nil
+// pool adopts nothing, so it is not one.
+func (p *prefixPool) wholeOnly() bool { return p != nil && p.exact }
+
 // match returns the pooled prefix sharing the most tokens with the given
 // prompt, and how many tokens that is.
 //
 // The count never reaches len(tokens): a prompt has to contribute at least one
 // token to the batch, because logits are only produced for tokens that were
 // decoded, and with none there is nothing to sample the first reply token from.
+//
+// An exact pool only considers entries the prompt contains whole; see exact.
 func (p *prefixPool) match(tokens []llama.Token) (*prefixEntry, int) {
 	if p == nil || len(tokens) < 2 {
 		return nil, 0
@@ -103,6 +130,9 @@ func (p *prefixPool) match(tokens []llama.Token) (*prefixEntry, int) {
 		n := commonPrefix(e.tokens, tokens)
 		if n > limit {
 			n = limit
+		}
+		if p.exact && n != len(e.tokens) {
+			continue
 		}
 		if n > bestLen {
 			best, bestLen = e, n
@@ -126,11 +156,22 @@ func (p *prefixPool) adopt(e *prefixEntry, slotSeq int32, n int) {
 // The cells are already in the cache under the slot's sequence, so this only
 // tags them a second time — the pool never prefills anything itself.
 func (p *prefixPool) publish(slotSeq int32, tokens []llama.Token) {
+	p.put(slotSeq, tokens, false)
+}
+
+// publishShared records a system prompt: the prefix other conversations of
+// the same agent open with. An exact pool keeps it under the conversations
+// that extend it.
+func (p *prefixPool) publishShared(slotSeq int32, tokens []llama.Token) {
+	p.put(slotSeq, tokens, true)
+}
+
+func (p *prefixPool) put(slotSeq int32, tokens []llama.Token, shared bool) {
 	if p == nil || len(tokens) < p.minMatch {
 		return
 	}
 
-	e := p.victim(tokens)
+	e := p.victim(tokens, shared)
 	if e == nil {
 		return // already covered by an entry at least this long
 	}
@@ -141,6 +182,7 @@ func (p *prefixPool) publish(slotSeq int32, tokens []llama.Token) {
 	p.share(slotSeq, e.seq, int32(len(tokens)))
 
 	e.tokens = append(e.tokens[:0], tokens...)
+	e.shared = shared
 	p.clock++
 	e.lastUse = p.clock
 }
@@ -148,8 +190,12 @@ func (p *prefixPool) publish(slotSeq int32, tokens []llama.Token) {
 // victim picks the entry to overwrite: an empty one, the one this prompt
 // extends, or the least recently used. It returns nil when an entry already
 // covers the prompt.
-func (p *prefixPool) victim(tokens []llama.Token) *prefixEntry {
-	var lru *prefixEntry
+//
+// An exact pool keeps a system prompt under the conversations that extend it —
+// replacing it would take the one prefix every other conversation can still
+// adopt whole — and when full it evicts a conversation before a system prompt.
+func (p *prefixPool) victim(tokens []llama.Token, shared bool) *prefixEntry {
+	var lru, lruConversation *prefixEntry
 	for _, e := range p.entries {
 		if len(e.tokens) == 0 {
 			return e
@@ -163,11 +209,19 @@ func (p *prefixPool) victim(tokens []llama.Token) *prefixEntry {
 			}
 			// This prompt continues where the entry stops: replace it with the
 			// longer one rather than keeping a prefix of a prefix.
-			return e
+			if !p.exact || e.shared == shared {
+				return e
+			}
 		}
 		if lru == nil || e.lastUse < lru.lastUse {
 			lru = e
 		}
+		if !e.shared && (lruConversation == nil || e.lastUse < lruConversation.lastUse) {
+			lruConversation = e
+		}
+	}
+	if p.exact && lruConversation != nil {
+		return lruConversation
 	}
 	return lru
 }

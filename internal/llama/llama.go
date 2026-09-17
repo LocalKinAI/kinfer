@@ -174,8 +174,11 @@ var (
 	memorySeqCp        func(mem Memory, src, dst, p0, p1 int32)
 	tokenize           func(v Vocab, text string, textLen int32, out *Token, max int32, addSpecial, parseSpecial bool) int32
 	modelGetVocab      func(m Model) Vocab
+	modelIsRecurrent   func(m Model) bool
+	modelIsHybrid      func(m Model) bool
 	vocabNTokens       func(v Vocab) int32
 	vocabIsEOG         func(v Vocab, t Token) bool
+	vocabIsControl     func(v Vocab, t Token) bool
 	vocabEOS           func(v Vocab) Token
 	tokenToPiece       func(v Vocab, t Token, buf *byte, length, lstrip int32, special bool) int32
 	nCtx               func(c Context) uint32
@@ -273,8 +276,11 @@ func bind(dir string) error {
 		{&memorySeqCp, "llama_memory_seq_cp"},
 		{&tokenize, "llama_tokenize"},
 		{&modelGetVocab, "llama_model_get_vocab"},
+		{&modelIsRecurrent, "llama_model_is_recurrent"},
+		{&modelIsHybrid, "llama_model_is_hybrid"},
 		{&vocabNTokens, "llama_vocab_n_tokens"},
 		{&vocabIsEOG, "llama_vocab_is_eog"},
+		{&vocabIsControl, "llama_vocab_is_control"},
 		{&vocabEOS, "llama_vocab_eos"},
 		{&tokenToPiece, "llama_token_to_piece"},
 		{&nCtx, "llama_n_ctx"},
@@ -360,6 +366,13 @@ func NCtx(c Context) int { return int(nCtx(c)) }
 // GetVocab returns the model's vocabulary handle.
 func GetVocab(m Model) Vocab { return modelGetVocab(m) }
 
+// HasRecurrentState reports a model some or all of whose layers keep a
+// recurrent state per sequence — Mamba, RWKV, and hybrids such as Qwen3-Next —
+// rather than a cache of positions. That state is one value for the whole
+// sequence and cannot be cut back to an earlier position, which is exactly
+// what reusing part of a cached prompt needs.
+func HasRecurrentState(m Model) bool { return modelIsRecurrent(m) || modelIsHybrid(m) }
+
 // NVocab is the true vocabulary size — the number gollama hardcoded to 32,
 // which truncated every candidate list to the first 32 of Qwen's 151,936 and
 // made correct sampling impossible.
@@ -368,6 +381,11 @@ func NVocab(v Vocab) int32 { return vocabNTokens(v) }
 // IsEOG reports whether a token ends generation (end-of-sequence, end-of-turn,
 // or any other terminator this model defines).
 func IsEOG(v Vocab, t Token) bool { return vocabIsEOG(v, t) }
+
+// IsControl reports a control token — a chat template's turn markers and the
+// like. Tokenizers never merge one with its neighbours, so a boundary right
+// after one tokenizes the same whatever text follows it.
+func IsControl(v Vocab, t Token) bool { return vocabIsControl(v, t) }
 
 // EOS returns the primary end-of-sequence token id.
 func EOS(v Vocab) Token { return vocabEOS(v) }

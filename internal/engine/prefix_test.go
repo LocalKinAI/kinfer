@@ -157,3 +157,102 @@ func TestNilPoolIsInert(t *testing.T) {
 	}
 	p.publish(0, toks(1, 2, 3)) // must not panic
 }
+
+// A model with recurrent layers keeps one state per sequence, not a cache of
+// positions, so a pooled prompt can be adopted only whole — by a prompt that
+// continues past its end. Anything shorter would hand the new prompt a state
+// that has already read the rest of the old one.
+func TestExactPoolAdoptsOnlyWholeEntries(t *testing.T) {
+	p, _ := newTestPool(1, 2)
+	p.exact = true
+	p.entries[0].tokens = toks(1, 2, 3, 4, 5, 6)
+
+	cases := []struct {
+		name   string
+		prompt []llama.Token
+		want   int
+	}{
+		{"continues past the entry", toks(1, 2, 3, 4, 5, 6, 7, 8), 6},
+		{"diverges inside the entry", toks(1, 2, 3, 9, 9, 9, 9), 0},
+		// A repeat can only reuse len-1 tokens, one short of the entry.
+		{"identical to the entry", toks(1, 2, 3, 4, 5, 6), 0},
+		{"shorter than the entry", toks(1, 2, 3, 4), 0},
+	}
+	for _, c := range cases {
+		if _, n := p.match(c.prompt); n != c.want {
+			t.Errorf("%s: matched %d tokens, want %d", c.name, n, c.want)
+		}
+	}
+}
+
+func TestExactPoolPicksTheLongestWholeEntry(t *testing.T) {
+	p, _ := newTestPool(3, 2)
+	p.exact = true
+	p.entries[0].tokens = toks(1, 2, 3)
+	p.entries[1].tokens = toks(1, 2, 3, 4, 5)
+	p.entries[2].tokens = toks(1, 2, 3, 4, 5, 6, 7, 8, 9) // shares 7, not whole
+
+	e, n := p.match(toks(1, 2, 3, 4, 5, 6, 7, 0))
+	if e != p.entries[1] || n != 5 {
+		t.Errorf("matched entry %v for %d tokens; want the 5-token entry, whole", e, n)
+	}
+}
+
+// Without recurrent state nothing changes: attention cells can be shared up
+// to any position, so a partial prefix is still worth adopting.
+func TestAttentionPoolStillSharesPartialPrefixes(t *testing.T) {
+	p, _ := newTestPool(1, 2)
+	p.entries[0].tokens = toks(1, 2, 3, 4, 5, 6)
+	if _, n := p.match(toks(1, 2, 3, 9)); n != 3 {
+		t.Errorf("matched %d tokens, want 3", n)
+	}
+}
+
+// A conversation's entry must not replace the system prompt it extends: every
+// other conversation opening with that prompt can still adopt it whole.
+func TestExactPoolKeepsTheSystemPromptUnderAConversation(t *testing.T) {
+	p, _ := newTestPool(4, 2)
+	p.exact = true
+	p.publishShared(1, toks(1, 2, 3, 4))
+	p.publish(1, toks(1, 2, 3, 4, 5, 6, 7))
+
+	if _, n := p.match(toks(1, 2, 3, 4, 9, 9)); n != 4 {
+		t.Errorf("a new conversation adopted %d tokens, want the 4-token system prompt", n)
+	}
+	if _, n := p.match(toks(1, 2, 3, 4, 5, 6, 7, 8)); n != 7 {
+		t.Errorf("the next turn adopted %d tokens, want the 7-token conversation", n)
+	}
+}
+
+// A conversation's later turn replaces its earlier one, which it covers for
+// every prompt that could have used it.
+func TestExactPoolReplacesAConversationsEarlierTurn(t *testing.T) {
+	p, _ := newTestPool(4, 2)
+	p.exact = true
+	p.publish(1, toks(1, 2, 3, 4, 5))
+	p.publish(1, toks(1, 2, 3, 4, 5, 6, 7, 8))
+	used := 0
+	for _, e := range p.entries {
+		if len(e.tokens) > 0 {
+			used++
+		}
+	}
+	if used != 1 {
+		t.Errorf("%d entries in use, want 1: the later turn replaces the earlier", used)
+	}
+}
+
+func TestExactPoolEvictsAConversationBeforeASystemPrompt(t *testing.T) {
+	p, _ := newTestPool(2, 2)
+	p.exact = true
+	p.publishShared(1, toks(1, 2, 3)) // the least recently used
+	p.publish(1, toks(7, 8, 9, 10))
+	p.publish(1, toks(20, 21, 22)) // needs an entry
+
+	if _, n := p.match(toks(1, 2, 3, 4)); n != 3 {
+		t.Errorf("the system prompt was evicted (matched %d)", n)
+	}
+	if _, n := p.match(toks(7, 8, 9, 10, 11)); n != 0 {
+		t.Errorf("the older conversation survived (matched %d); it should have gone first", n)
+	}
+}

@@ -175,6 +175,12 @@ func (j *job) finish(err error) {
 	close(j.done)
 }
 
+// checkpoint is a position to pool a prefilling prompt at; see slot.checkpoints.
+type checkpoint struct {
+	pos    int32
+	shared bool
+}
+
 // slot is one sequence's worth of state: a seq_id in the shared KV cache, the
 // sampler that owns its repetition history, and the text produced so far.
 type slot struct {
@@ -186,9 +192,20 @@ type slot struct {
 	reused int   // tokens of nPast that came from the prefix pool
 	next   llama.Token
 
-	// publish marks a slot whose prompt has just finished prefilling and is
-	// worth pooling. It is acted on after the decode, so the cells exist.
-	publish bool
+	// publishLen is how much of the prompt to pool once the decode that just
+	// landed is in the cache, or 0 for nothing; publishShared marks it as a
+	// system prompt other conversations can adopt. Acted on after the decode,
+	// so the cells exist.
+	publishLen    int
+	publishShared bool
+
+	// checkpoints are the positions, in order, at which prefill ends a batch
+	// so the pool can take this sequence at exactly that point, recurrent state
+	// included. Only a pool that adopts whole entries — a model with recurrent
+	// state — needs them: the end of the system prompt, which another
+	// conversation of the same agent opens with, and the end of the
+	// conversation so far, which its next turn contains.
+	checkpoints []checkpoint
 
 	sampler *sampling.Sampler
 	out     strings.Builder
@@ -210,7 +227,7 @@ type slot struct {
 	logitIdx int32
 }
 
-func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSlots, nPrefix, ctxPerSeq, batchCap, maxQueue int, limits deadlines) *scheduler {
+func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSlots, nPrefix, ctxPerSeq, batchCap, maxQueue int, limits deadlines, wholePrefixes bool) *scheduler {
 	s := &scheduler{
 		lctx:      lctx,
 		vocab:     vocab,
@@ -228,7 +245,7 @@ func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSl
 		s.slots[i] = &slot{seq: int32(i), logitIdx: -1}
 	}
 	// Pooled prefixes live in sequence ids above the slots.
-	s.pool = newPrefixPool(lctx, int32(nSlots), nPrefix, minPrefixMatch)
+	s.pool = newPrefixPool(lctx, int32(nSlots), nPrefix, minPrefixMatch, wholePrefixes)
 	go s.run()
 	return s
 }
@@ -390,6 +407,55 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 		reused = n
 	}
 
+	// A pool that can only adopt whole entries needs this prompt pooled where
+	// later ones will repeat it whole: at the end of the conversation so far,
+	// for its next turn, and at the end of the system prompt, for the next
+	// conversation of the same agent. For the first of those: The rendered prompt ends with
+	// the template's opening of the reply — "<|im_start|>assistant\n", and for
+	// some templates a think block — which the next turn does not reproduce,
+	// because there the assistant's turn is rendered with what it said. So the
+	// conversation is rendered again with an assistant turn appended, and the
+	// two prompts agree exactly as far as the next turn will.
+	//
+	// Without this, the rule that keeps a hybrid model correct also stopped an
+	// agent's next turn reusing anything: measured on ornith-1.5:9b, 0 of 1029
+	// tokens, because the pooled prompt ended in an opening the next prompt
+	// renders differently.
+	var checkpoints []checkpoint
+	if s.pool.wholeOnly() {
+		// Where this prompt and a rendering of msgs part — taken back to just
+		// after a control token. An ordinary token at the edge is tokenized
+		// with whatever follows it, and a later prompt has different text
+		// there: the "\n" that ended "<|im_start|>assistant\n" came back in the
+		// next turn merged into the "\n\n" before a <tool_call>, one token short
+		// of whole. Control tokens are never merged with anything.
+		agreeWith := func(msgs []chat.Message) int32 {
+			ext, err := llama.Tokenize(s.vocab, render(msgs, j.params.Tools), true, true)
+			if err != nil {
+				return 0
+			}
+			n := commonPrefix(tokens, ext)
+			for n > 0 && !llama.IsControl(s.vocab, tokens[n-1]) {
+				n--
+			}
+			if n <= reused || n < minPrefixMatch {
+				return 0
+			}
+			return int32(n)
+		}
+		if len(j.msgs) > 1 && j.msgs[0].Role == "system" {
+			// Rendered with a different first message, the system prompt is
+			// where the two part.
+			if pos := agreeWith([]chat.Message{j.msgs[0], {Role: "user", Content: "x"}}); pos > 0 {
+				checkpoints = append(checkpoints, checkpoint{pos: pos, shared: true})
+			}
+		}
+		next := append(append([]chat.Message(nil), j.msgs...), chat.Message{Role: "assistant", Content: "x"})
+		if pos := agreeWith(next); pos > 0 && (len(checkpoints) == 0 || pos > checkpoints[0].pos) {
+			checkpoints = append(checkpoints, checkpoint{pos: pos})
+		}
+	}
+
 	// A caller that named no budget gets the rest of its slot's context. That
 	// is a real bound, so kinfer does not also impose a ceiling on num_predict:
 	// what a runaway request costs is time, and the wall clock in deadlines
@@ -411,7 +477,9 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	sl.prompt = tokens
 	sl.nPast = int32(reused)
 	sl.reused = reused
-	sl.publish = false
+	sl.publishLen = 0
+	sl.publishShared = false
+	sl.checkpoints = checkpoints
 	sl.nGen = 0
 	sl.maxGen = maxGen
 	sl.emitted = 0
@@ -513,9 +581,13 @@ func (s *scheduler) step() error {
 		if sl.job == nil {
 			continue
 		}
-		if sl.publish {
-			sl.publish = false
-			s.pool.publish(sl.seq, sl.prompt)
+		if sl.publishLen > 0 {
+			if sl.publishShared {
+				s.pool.publishShared(sl.seq, sl.prompt[:sl.publishLen])
+			} else {
+				s.pool.publish(sl.seq, sl.prompt[:sl.publishLen])
+			}
+			sl.publishLen = 0
 		}
 		if sl.logitIdx >= 0 {
 			s.harvest(sl, now)
@@ -553,6 +625,11 @@ func (s *scheduler) addPrefill(sl *slot) {
 	}
 	remaining := len(sl.prompt) - int(sl.nPast)
 	n := min(remaining, space)
+	// End the batch at the next checkpoint, so the sequence can be pooled at
+	// exactly that position before anything past it is decoded.
+	if len(sl.checkpoints) > 0 && sl.checkpoints[0].pos > sl.nPast {
+		n = min(n, int(sl.checkpoints[0].pos-sl.nPast))
+	}
 
 	for i := 0; i < n; i++ {
 		pos := sl.nPast + int32(i)
@@ -565,11 +642,20 @@ func (s *scheduler) addPrefill(sl *slot) {
 		if last {
 			sl.logitIdx = idx
 			// The whole prompt is now in the cache under this slot's sequence.
-			// Pool it once the decode lands.
-			sl.publish = true
+			// Pool it once the decode lands — unless the pool adopts only whole
+			// entries, which no later prompt makes of this one: it would have to
+			// repeat this reply's opening. That pool is fed at the checkpoint.
+			if !s.pool.wholeOnly() {
+				sl.publishLen = len(sl.prompt)
+			}
 		}
 	}
 	sl.nPast += int32(n)
+	if len(sl.checkpoints) > 0 && sl.nPast == sl.checkpoints[0].pos {
+		sl.publishLen = int(sl.nPast)
+		sl.publishShared = sl.checkpoints[0].shared
+		sl.checkpoints = sl.checkpoints[1:]
+	}
 }
 
 // addDecode queues the one token a generating slot needs this step.
