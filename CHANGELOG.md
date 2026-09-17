@@ -5,6 +5,63 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### Fixed — coding agents run against `serve` with no flags
+
+Codex, pointed at the box's `serve` with Qwen3.8-Flash-Next loaded, got
+`413: prompt is 7428 tokens but each slot holds 4096 (the context is split
+across 4 slots; lower -slots or raise -ctx)` on its first request — naming two
+flags nobody in a terminal tab can set. Ollama ran the same session. Two
+things were different, and both are now what Ollama does.
+
+- **The context an agent gets.** The floor below which slots are given up
+  instead was 8192, so 4.3 GiB left after a 73.4 GiB model sized 4 slots of
+  8192, and the measured cost halved that to 4096. The floor is now 32768 (or
+  the trained context, if less) — Codex's opening prompt is 7,428 tokens and
+  Claude Code's about 25k, before any tool has run — and when the measured cost
+  is too high the rebuild gives up slots, then the prefix pool's own cells,
+  then pool entries, and halves the context only after that. `-prefix` now
+  defaults to 0, sized with the rest; its old default of 4 counted as an
+  operator's choice and kept the pool out of that order.
+- **A pool that shares the slots' cells.** Its entries live in whatever the
+  slots leave free; a batch that finds the cache full takes them back and runs
+  again — llama.cpp finds room for every micro-batch before running any, so the
+  failed attempt changed nothing. An agent's next turn continues what the slot
+  already holds, so it costs no extra room. On the box: 1 slot of 32768 with
+  its turns reused, 2.6 GiB free, where the choice was otherwise 16384 or no
+  pool.
+- **A conversation longer than its slot loses its oldest turns** instead of
+  being refused. The system prompt, the latest request (the newest user turn
+  not riding along with a tool result — Claude Code sends reminders that way)
+  and the newest turn stay; a tool call goes with its results and a plain reply
+  with its question; room is left to reply in, up to an eighth of the slot.
+  Turns are dropped in chunks at points fixed by the turns before them, so the
+  kept part is the same for several turns and a hybrid model's whole-entry
+  pool keeps matching it. Only a prompt whose system prompt, request and newest
+  turn do not fit by themselves is still a 413. Measured with Qwen2.5-0.5B at
+  `-ctx 4096 -slots 1`: 28 messages, the oldest 16 dropped, 3,514 tokens, and
+  the answer read from the tool result that was kept.
+
+- **The five-minute reply limit no longer counts prefill.** It started at
+  admission, so on a machine prefilling 50 tokens a second Claude Code's
+  30k-token opening prompt was still being read when time ran out: the reply
+  came back empty with `stop_reason: max_tokens`, Claude Code sent the same
+  prompt again, and the same thing happened again. The limit is for a reply
+  that never ends; it now starts at the first sampled token.
+
+On the box, after this: Codex (`codex exec`, a task that reads a file) ran end
+to end — tool call, result, answer — in 33 s with the weights in the page
+cache and 68 s with them read from disk, where it had been refused. Claude Code answered the same task through `/v1/messages`; its
+second turn adopted the first from the shared pool (3.5 s to the first byte),
+and the pool gave its cells back each time a different prompt needed them,
+with no request failing.
+
+What stays slow there is the machine, not the runtime. ornith-1.5:35b under
+Ollama 0.34.0 on the same box, same GGUF: 79 tok/s on the first short
+request, 34 on the second, 18 on the third, 14–18 after a 6k-token prompt, 90
+again after 30 s idle — the curve kinfer shows. macOS reports thermal pressure
+"moderate" there with nothing running.
+
+
 ### Fixed — prefix reuse on models with recurrent layers
 
 Measured on a 16 GB MacBook with ornith-1.5:9b and confirmed on ornith-1.5-35b;

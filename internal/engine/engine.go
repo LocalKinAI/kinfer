@@ -53,7 +53,9 @@ type Options struct {
 	// pointer walk.
 	//
 	// Each one costs a sequence's worth of KV cache, the same as a slot, so
-	// this is memory traded for latency. Negative disables the pool.
+	// this is memory traded for latency. 0 sizes it with the rest — and where
+	// memory is short, lets it share the slots' cells instead of giving up
+	// context; negative disables the pool.
 	PrefixSlots int
 
 	// MaxGenerate bounds how long one reply may take, in wall-clock time.
@@ -271,20 +273,29 @@ func Open(path string, opts Options) (*Engine, error) {
 		llama.FreeModel(model)
 		return nil, err
 	}
-	slots, prefix, perSeq := plan.Slots, plan.Prefix, plan.PerSeq
+	slots, prefix, perSeq, shared := plan.Slots, plan.Prefix, plan.PerSeq, plan.SharedPool
 	if sized {
 		trained := "unknown"
 		if shape.TrainedCtx > 0 {
 			trained = fmt.Sprint(shape.TrainedCtx)
 		}
-		log.Printf("sizing: %d slots + %d prefix x %d tokens each — the model was trained for %s, "+
+		log.Printf("sizing: %d slots + %d prefix x %d tokens each%s — the model was trained for %s, "+
 			"the cache should cost about %s of the %s left. -slots and -ctx override this.",
-			slots, prefix, perSeq, trained, gib(uint64(plan.Estimated)), gib(bud.afterModel))
+			slots, prefix, perSeq, sharedNote(shared), trained, gib(uint64(plan.Estimated)), gib(bud.afterModel))
+	}
+
+	// What was left for us to choose. An explicit flag is never overridden, so
+	// each shrinking step below is taken only where the operator gave no number.
+	slotsAuto, prefixAuto, ctxAuto := opts.Slots <= 0, opts.PrefixSlots == 0, opts.ContextSize <= 0
+	floor := ctxFloor
+	if shape.TrainedCtx > 0 {
+		floor = min(floor, shape.TrainedCtx)
 	}
 
 	var lctx llama.Context
+sizing:
 	for {
-		lctx = newContext(model, slots, prefix, perSeq)
+		lctx = newContext(model, slots, prefix, perSeq, shared)
 		if lctx == 0 {
 			llama.FreeModel(model)
 			return nil, fmt.Errorf("create context for %s", path)
@@ -295,15 +306,38 @@ func Open(path string, opts Options) (*Engine, error) {
 		// model it cost two and a half times the estimate. When the measured
 		// cost leaves less than the floor, and the size was ours to choose,
 		// choose smaller: a context is seconds to rebuild, the weights stay.
-		if !sized || !bud.known || bud.afterCtx >= thinHeadroom || perSeq/2 < 2048 {
+		if !sized || !bud.known || bud.afterCtx >= thinHeadroom {
 			break
 		}
-		log.Printf("sizing: %d tokens x %d sequences measured %s, leaving %s — halving the context",
-			perSeq, slots+prefix, gib(sub(bud.afterModel, bud.afterCtx)), gib(bud.afterCtx))
+		measured := fmt.Sprintf("sizing: %d slots + %d prefix x %d tokens%s measured %s, leaving %s",
+			slots, prefix, perSeq, sharedNote(shared), gib(sub(bud.afterModel, bud.afterCtx)), gib(bud.afterCtx))
+		// Smaller the way AutoSize would have chosen had its estimate been
+		// right: a conversation goes before context does. This is where that
+		// matters most, because a hybrid's per-sequence state is what the
+		// estimate undercounts — and dropping a sequence frees a whole one of
+		// them. Halving alone took the box to 4 slots of 4096.
+		switch {
+		case perSeq/2 < floor && slotsAuto && slots > 1:
+			slots /= 2
+			prefix = min(prefix, max(slots/2, 1))
+			log.Printf("%s — %d slots + %d prefix instead, keeping %d tokens each", measured, slots, prefix, perSeq)
+		case perSeq/2 < floor && prefixAuto && prefix > 0 && !shared:
+			// The pool's own cells go before the pool does: sharing the slots'
+			// cells, it still carries an agent's turns forward.
+			shared = true
+			log.Printf("%s — the prefix pool shares the slots' cells instead, keeping %d tokens each", measured, perSeq)
+		case perSeq/2 < floor && prefixAuto && prefix > 0:
+			prefix--
+			log.Printf("%s — %d prefix instead, keeping %d tokens each", measured, prefix, perSeq)
+		case ctxAuto && perSeq/2 >= 2048:
+			perSeq /= 2
+			log.Printf("%s — halving the context", measured)
+		default:
+			break sizing
+		}
 		llama.FreeContext(lctx)
-		perSeq /= 2
 	}
-	bud.report(slots, prefix, perSeq)
+	bud.report(slots, prefix, perSeq, shared)
 
 	tpl := chat.FromModel(model, path)
 	if opts.Template != "" {
@@ -321,7 +355,8 @@ func Open(path string, opts Options) (*Engine, error) {
 	// months, and it stays: a struct that silently drifts out of sync with
 	// llama.h would fail here instead of somewhere unrecognisable.
 	actualCtx := llama.NCtx(lctx)
-	wantCtx := perSeq * (slots + prefix)
+	cells := Plan{Slots: slots, Prefix: prefix, SharedPool: shared}.Cells()
+	wantCtx := perSeq * cells
 	if actualCtx < wantCtx {
 		llama.FreeContext(lctx)
 		llama.FreeModel(model)
@@ -338,7 +373,7 @@ func Open(path string, opts Options) (*Engine, error) {
 		vocab: vocab,
 		tpl:   tpl,
 		path:  path,
-		nCtx:  actualCtx / (slots + prefix),
+		nCtx:  actualCtx / cells,
 		slots: slots,
 	}
 	queue := opts.MaxQueue
@@ -361,14 +396,15 @@ func Open(path string, opts Options) (*Engine, error) {
 }
 
 // newContext asks llama.cpp for a cache holding slots+prefix sequences of
-// perSeq tokens each.
-func newContext(model llama.Model, slots, prefix, perSeq int) llama.Context {
+// perSeq tokens each — or, when the pool is shared, slots conversations' worth
+// of tokens that the pool's sequences borrow from.
+func newContext(model llama.Model, slots, prefix, perSeq int, shared bool) llama.Context {
 	cp := llama.DefaultContextParams()
 	// Pooled prefixes live in sequence ids above the slots, and each needs a
-	// sequence's worth of cache.
+	// sequence's worth of cache unless it borrows the slots'.
 	cp.NSeqMax = uint32(slots + prefix)
 	// llama.cpp divides n_ctx between sequences, so ask for the total.
-	cp.NCtx = uint32(perSeq * (slots + prefix))
+	cp.NCtx = uint32(perSeq * Plan{Slots: slots, Prefix: prefix, SharedPool: shared}.Cells())
 	if cp.NBatch < uint32(batchCapacity) {
 		cp.NBatch = uint32(batchCapacity)
 	}
@@ -380,6 +416,14 @@ func newContext(model llama.Model, slots, prefix, perSeq int) llama.Context {
 		cp.KVUnified = 1
 	}
 	return llama.NewContext(model, cp)
+}
+
+// sharedNote marks a sizing line whose pool borrows the slots' cells.
+func sharedNote(shared bool) string {
+	if shared {
+		return " (the pool sharing the slots' cells)"
+	}
+	return ""
 }
 
 // Slots is how many conversations this engine serves at once.

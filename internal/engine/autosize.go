@@ -27,11 +27,25 @@ import (
 //     giving up context. A server with eight slots of 4096 answers nothing an
 //     agent sends; one slot of 32768 answers it slowly. Slow is a number and
 //     nothing is a bug report.
+//   - Even one slot keeps a pool entry. An agent's next turn is the request
+//     that reuses a prefix most, and a machine with room for one conversation
+//     is exactly where prefilling it again every turn hurts.
+//   - When one slot with a pool of its own is still short of the floor, the
+//     pool gives up its cells before the conversation gives up context. Its
+//     entries then live in whatever the slot is not using, and are dropped
+//     when the slot needs the room: an agent's own next turn is a prefix of
+//     what the slot already holds, so it costs nothing extra, and anything
+//     else simply finds the pool empty. On the box that is one conversation of
+//     32768 with its turns reused, instead of 16384 or no pool.
 
 // ctxFloor is the context below which slots are sacrificed instead. Agents'
 // prompts on the fleet this was built for run 3k–25k tokens; a person with a
-// long system prompt sent 45k. Below this the server refuses what it is for.
-const ctxFloor = 8192
+// long system prompt sent 45k; a coding agent's opening prompt alone is 7,428
+// tokens (Codex) and about 20k (Claude Code), before a single tool result has
+// come back. It was 8192: on the 96 GB box with a 73.4 GiB model that sized
+// four slots of 8192, halved to 4096 once measured, and Codex's first prompt
+// was refused. A model trained for less is floored at what it was trained for.
+const ctxFloor = 32768
 
 // Plan is what serve runs with.
 type Plan struct {
@@ -42,6 +56,18 @@ type Plan struct {
 	// Capped reports that the context is the model's trained maximum, not
 	// what memory would have allowed.
 	Capped bool
+	// SharedPool is a pool with no cells of its own: its entries use what the
+	// slots leave free, so the cache holds Slots conversations, not
+	// Slots+Prefix.
+	SharedPool bool
+}
+
+// Cells is how many conversations' worth of tokens the cache holds.
+func (p Plan) Cells() int {
+	if p.SharedPool {
+		return p.Slots
+	}
+	return p.Slots + p.Prefix
 }
 
 // AutoSize completes a configuration: any of slots, prefix and perSeq that is
@@ -51,6 +77,7 @@ type Plan struct {
 // An unknown shape (a GGUF whose header lacks the attention geometry) yields
 // the static defaults rather than a guess dressed up as a measurement.
 func AutoSize(sh store.Shape, free uint64, slots, prefix, perSeq int) (Plan, error) {
+	prefixAuto := prefix == 0
 	if prefix < 0 {
 		prefix = 0
 	} else if prefix == 0 {
@@ -75,15 +102,20 @@ func AutoSize(sh store.Shape, free uint64, slots, prefix, perSeq int) (Plan, err
 	if capCtx <= 0 {
 		capCtx = 32768
 	}
+	floor := min(ctxFloor, capCtx)
 
 	// A fixed context: find the most slots that carry it.
 	if perSeq > 0 {
 		for s := DefaultSlots; s >= 1; s /= 2 {
-			p := min(prefix, s/2)
+			p := min(prefix, max(s/2, 1))
 			if sh.CacheBytesFor(perSeq*(s+p), s+p) <= spendable {
 				return Plan{Slots: s, Prefix: p, PerSeq: perSeq,
 					Estimated: sh.CacheBytesFor(perSeq*(s+p), s+p)}, nil
 			}
+		}
+		if prefixAuto && prefix > 0 && sh.CacheBytesFor(perSeq, 2) <= spendable {
+			return Plan{Slots: 1, Prefix: 1, PerSeq: perSeq, SharedPool: true,
+				Estimated: sh.CacheBytesFor(perSeq, 2)}, nil
 		}
 		return Plan{}, fmt.Errorf("a %d-token context does not fit even for one conversation: "+
 			"the cache would need %s and %s is left after the weights",
@@ -98,18 +130,20 @@ func AutoSize(sh store.Shape, free uint64, slots, prefix, perSeq int) (Plan, err
 	}
 	var last Plan
 	for s := start; s >= 1; s /= 2 {
-		p := min(prefix, s/2)
-		ctx := LargestCtx(sh, spendable, s+p)
-		if ctx == 0 {
+		p := min(prefix, max(s/2, 1))
+		plan := sizedPlan(sh, spendable, capCtx, s, p, false)
+		// The last conversation left, or the operator's own count, still short
+		// of the floor: the pool shares its cells rather than cost context.
+		if plan.PerSeq < floor && p > 0 && prefixAuto && (s == 1 || slots > 0) {
+			if shared := sizedPlan(sh, spendable, capCtx, s, p, true); shared.PerSeq > plan.PerSeq {
+				plan = shared
+			}
+		}
+		if plan.PerSeq == 0 {
 			continue
 		}
-		capped := ctx >= capCtx
-		if capped {
-			ctx = capCtx
-		}
-		last = Plan{Slots: s, Prefix: p, PerSeq: ctx, Capped: capped,
-			Estimated: sh.CacheBytesFor(ctx*(s+p), s+p)}
-		if ctx >= ctxFloor || slots > 0 {
+		last = plan
+		if plan.PerSeq >= floor || slots > 0 {
 			return last, nil
 		}
 	}
@@ -119,14 +153,36 @@ func AutoSize(sh store.Shape, free uint64, slots, prefix, perSeq int) (Plan, err
 	return Plan{}, fmt.Errorf("no room for a context: %s left after the weights", store.HumanSize(int64(free)))
 }
 
+// sizedPlan is the largest context s slots and p pool entries fit in, capped
+// at what the model was trained for; a zero PerSeq when none does.
+func sizedPlan(sh store.Shape, spendable int64, capCtx, s, p int, shared bool) Plan {
+	plan := Plan{Slots: s, Prefix: p, SharedPool: shared}
+	ctx := largestCtx(sh, spendable, plan.Cells(), s+p)
+	if ctx == 0 {
+		return Plan{}
+	}
+	if ctx >= capCtx {
+		ctx, plan.Capped = capCtx, true
+	}
+	plan.PerSeq = ctx
+	plan.Estimated = sh.CacheBytesFor(ctx*plan.Cells(), s+p)
+	return plan
+}
+
 // LargestCtx is the biggest per-conversation context whose cache for seqs
 // sequences fits in spendable, rounded down to a power of two.
 func LargestCtx(sh store.Shape, spendable int64, seqs int) int {
-	if spendable <= 0 || seqs <= 0 {
+	return largestCtx(sh, spendable, seqs, seqs)
+}
+
+// largestCtx is LargestCtx for a cache holding cells conversations' worth of
+// tokens across seqs sequences; they differ when the pool shares cells.
+func largestCtx(sh store.Shape, spendable int64, cells, seqs int) int {
+	if spendable <= 0 || cells <= 0 {
 		return 0
 	}
 	for ctx := 1 << 20; ctx >= 512; ctx /= 2 {
-		if sh.CacheBytesFor(ctx*seqs, seqs) <= spendable {
+		if sh.CacheBytesFor(ctx*cells, seqs) <= spendable {
 			return ctx
 		}
 	}

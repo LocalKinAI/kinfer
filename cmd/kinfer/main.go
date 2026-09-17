@@ -384,7 +384,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.IntVar(&o.ngl, "ngl", 99, "layers to offload to GPU (0 = CPU only)")
 	fs.IntVar(&o.nCtx, "ctx", 0, "context size per conversation, in tokens (0 = as much as the model and the memory allow)")
 	fs.IntVar(&o.slots, "slots", 0, "conversations served at once (0 = 8, or fewer if memory is tight; use 8, 32, 64 or 128 — never 12-16)")
-	fs.IntVar(&o.prefix, "prefix", engine.DefaultPrefixSlots, "prompt prefixes kept resident so repeat requests skip prefilling them (-1 disables)")
+	fs.IntVar(&o.prefix, "prefix", 0, "prompt prefixes kept resident so repeat requests skip prefilling them (0 = sized with the rest, -1 disables)")
 	fs.IntVar(&o.queue, "queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
 	fs.DurationVar(&o.maxGen, "max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
 	fs.DurationVar(&o.maxWait, "max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")

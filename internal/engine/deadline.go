@@ -86,8 +86,15 @@ type deadlines struct {
 }
 
 // expiredGenerating reports that a slot has held its job too long. since is when
-// the slot admitted it, which is where the clock starts: queueing is the other
-// limit's business.
+// the reply's first token was sampled, which is where the clock starts: queueing
+// is the other limit's business, and prefill is bounded by the prompt.
+//
+// The clock used to start at admission. On a machine that prefills 50 tokens a
+// second — the box, running Qwen3.8-Flash-Next hot — Claude Code's 30k-token
+// opening prompt was still being read when five minutes ran out, so the reply
+// came back empty with stop_reason max_tokens, Claude Code sent the same prompt
+// again, and the same thing happened again. What this limit is for is a reply
+// that never ends, and a prompt always does.
 func (d deadlines) expiredGenerating(since time.Time) (time.Duration, bool) {
 	if d.generate <= 0 || since.IsZero() {
 		return 0, false
@@ -110,7 +117,8 @@ func (d deadlines) expiredWaiting(queued time.Time) (time.Duration, bool) {
 	return 0, false
 }
 
-// PromptTooLongError is a request that cannot fit the context one slot holds.
+// PromptTooLongError is a request that cannot fit the context one slot holds,
+// even with its older turns dropped — see fit.go.
 //
 // It is the caller's request that is wrong, not the server's moment — the same
 // prompt will not fit next time either. That distinction is the whole reason
@@ -118,11 +126,16 @@ func (d deadlines) expiredWaiting(queued time.Time) (time.Duration, bool) {
 // again", and LocalKin did, three times, before giving up on a request that
 // could never have succeeded.
 type PromptTooLongError struct {
+	// Tokens is the prompt at its shortest: the system prompt, the request and
+	// the newest turn, with everything else already dropped.
 	Tokens, Limit, Slots int
 }
 
 func (e *PromptTooLongError) Error() string {
-	return fmt.Sprintf("prompt is %d tokens but each slot holds %d "+
-		"(the context is split across %d slots; lower -slots or raise -ctx)",
-		e.Tokens, e.Limit, e.Slots)
+	msg := fmt.Sprintf("prompt is %d tokens with its older turns dropped, and a conversation here holds %d: "+
+		"the system prompt, the latest request and the newest turn do not fit by themselves", e.Tokens, e.Limit)
+	if e.Slots > 1 {
+		msg += fmt.Sprintf(" (the context is split across %d slots; -slots 1 gives one conversation all of it)", e.Slots)
+	}
+	return msg
 }

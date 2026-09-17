@@ -82,7 +82,7 @@ func TestThinHeadroomSeparatesTheMeasuredCases(t *testing.T) {
 // reported on as if it had one.
 func TestBudgetWithoutAnAcceleratorSaysNothing(t *testing.T) {
 	b := &budget{} // known == false
-	b.report(4, 0, 16384)
+	b.report(4, 0, 16384, false)
 	if b.sample() != 0 {
 		t.Error("sampling a nonexistent device returned a number")
 	}

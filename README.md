@@ -119,7 +119,9 @@ The policy: spend at most half of what is left after the weights on the cache
 running one thing); give each conversation the trained context, rounded down to
 a power of two, as far as that half allows; and when that comes out below what a
 real prompt needs, give up slots before giving up context — one slot of 32768
-answers slowly, eight of 4096 answer nothing an agent sends.
+answers slowly, eight of 4096 answer nothing an agent sends. "What a real prompt
+needs" is 32768, or the trained context if that is less: a coding agent's opening
+prompt alone is 7,428 tokens (Codex) and about 25k (Claude Code).
 
 The estimate reads the hybrid geometry from the GGUF header
 (`full_attention_interval`, the `ssm.*` keys): on the Qwen3.5 family only every
@@ -128,8 +130,35 @@ not grow with the context. Counting every layer put the 35B's cache at twice its
 size and sized a server to 32768 tokens on a machine with room for 65536 — which
 refused a 45k-token prompt that Ollama took without comment. That evening is why
 this exists. After the context is built the cost is measured, and if the measure
-leaves under 2 GiB the context is halved and rebuilt: seconds, against the
-weights' half-minute.
+leaves under 2 GiB it is rebuilt smaller — seconds, against the weights'
+half-minute — in the same order of sacrifice: slots first, then the prefix
+pool's own cells, then pool entries, and the context only after that. A pool
+without cells of its own keeps its prompts in whatever the slots leave free and
+gives them back when a slot needs the room, which on a machine with room for one
+conversation still carries an agent's turns forward:
+
+```
+sizing: 1 slots + 1 prefix x 32768 tokens measured 2.6 GiB, leaving 1.7 GiB — the prefix pool shares the slots' cells instead, keeping 32768 tokens each
+memory: MTL0   model 73.4 GiB + context 1.7 GiB -> 2.6 GiB free of 77.8 GiB (this process only)
+        context is 32768 tokens: -ctx 32768 per conversation x 1 slots, with 1 prefix entries in whatever the slots leave free
+```
+
+### A conversation longer than its slot loses its oldest turns
+
+Ollama never refuses a conversation for being long, and neither does kinfer. A
+prompt that does not fit is fitted: the system prompt, the latest request and the
+newest turn stay, and the oldest turns go until the rest fits with room left to
+reply (what the caller asked for, up to an eighth of the slot). A tool call and
+its results go together, so no result outlives the call that asked for it. Turns
+are dropped in chunks at points that depend only on the turns before them, so the
+kept part stays the same for several turns and the prefix pool keeps matching it.
+
+```
+context: dropped the oldest 16 of 28 messages so the prompt fits a 4096-token conversation with room to reply — now 3514 tokens
+```
+
+Only a prompt whose system prompt, request and newest turn do not fit by
+themselves is refused, with a 413.
 
 `kinfer plan <model>` prints the same decision without loading anything.
 Explicit `-ctx` and `-slots` are never second-guessed.
@@ -475,7 +504,8 @@ $ kinfer serve -slots 8 -prefix 4
 ```
 
 Each pooled prefix costs a sequence's worth of KV cache, the same as a slot, so
-this is memory traded for latency. A match must leave at least one token to
+this is memory traded for latency — unless memory is short and nothing was
+asked for, in which case the pool shares the slots' cells (see sizing above). A match must leave at least one token to
 decode — logits exist only for tokens that went through a forward pass, and a
 prompt adopted whole would have nothing to sample the first reply token from.
 

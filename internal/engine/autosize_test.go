@@ -61,8 +61,60 @@ func TestAutoSizeSheddsSlotsBeforeContext(t *testing.T) {
 	if p.Slots >= DefaultSlots {
 		t.Errorf("kept %d slots on 4.4 GiB; expected fewer", p.Slots)
 	}
-	if p.Prefix > p.Slots/2 {
+	if p.Prefix > max(p.Slots/2, 1) {
 		t.Errorf("prefix %d for %d slots — the pool must not outnumber the conversations it serves", p.Prefix, p.Slots)
+	}
+}
+
+// A machine with room for one conversation of agent size keeps that one — and
+// a pool entry for it, since its next turn is what reuses a prefix most. The
+// old floor of 8192 kept two slots of 16384 here; the old prefix rule gave one
+// slot no pool at all.
+func TestAutoSizeKeepsOneAgentSizedSlotWithAPoolEntry(t *testing.T) {
+	p, err := AutoSize(moe, 36*GiB/10, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Slots != 1 || p.Prefix != 1 || p.PerSeq < ctxFloor {
+		t.Errorf("got %d slots + %d prefix x %d; want 1 + 1 x at least %d", p.Slots, p.Prefix, p.PerSeq, ctxFloor)
+	}
+}
+
+// Less again, and one slot with a pool of its own is short of the floor: the
+// pool borrows the slot's cells rather than halve the context. This is the
+// box with Qwen3.8-Flash-Next, which sized 1 + 1 x 16384 without it — below
+// Claude Code's opening prompt.
+func TestAutoSizeSharesThePoolsCellsBeforeGivingUpContext(t *testing.T) {
+	p, err := AutoSize(moe, 3*GiB, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Slots != 1 || p.Prefix != 1 || !p.SharedPool || p.PerSeq < ctxFloor {
+		t.Errorf("got %d slots + %d prefix x %d, shared=%v; want 1 + 1 x at least %d, shared", p.Slots, p.Prefix, p.PerSeq, p.SharedPool, ctxFloor)
+	}
+	if p.Cells() != 1 {
+		t.Errorf("a shared pool's cache holds %d conversations; want the slot's 1", p.Cells())
+	}
+	// An operator who named a pool size gets that pool, with cells of its own.
+	q, err := AutoSize(moe, 3*GiB, 0, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.SharedPool {
+		t.Errorf("-prefix 2 was given and the pool was made to share anyway: %+v", q)
+	}
+}
+
+// A model trained for less than the floor cannot reach it by shedding slots,
+// so it is not asked to: the floor is what it was trained for.
+func TestAutoSizeFloorsAShortModelAtItsTrainedContext(t *testing.T) {
+	short := store.Shape{Layers: 24, HeadsKV: 2, Heads: 14, EmbedDim: 896, TrainedCtx: 16384}
+	p, err := AutoSize(short, 60*GiB, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Slots != DefaultSlots || p.PerSeq != 16384 {
+		t.Errorf("got %d slots x %d; want all %d slots at the trained 16384", p.Slots, p.PerSeq, DefaultSlots)
 	}
 }
 

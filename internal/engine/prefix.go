@@ -187,6 +187,27 @@ func (p *prefixPool) put(slotSeq int32, tokens []llama.Token, shared bool) {
 	e.lastUse = p.clock
 }
 
+// clear empties every entry and reports whether any held a prompt. A pool that
+// shares the slots' cells gives them back this way when a batch needs them.
+// Slots that adopted an entry keep their copy: forgetting the pool's sequence
+// id leaves theirs.
+func (p *prefixPool) clear() bool {
+	if p == nil {
+		return false
+	}
+	freed := false
+	for _, e := range p.entries {
+		if len(e.tokens) == 0 {
+			continue
+		}
+		p.forget(e.seq)
+		e.tokens = e.tokens[:0]
+		e.shared = false
+		freed = true
+	}
+	return freed
+}
+
 // victim picks the entry to overwrite: an empty one, the one this prompt
 // extends, or the least recently used. It returns nil when an entry already
 // covers the prompt.

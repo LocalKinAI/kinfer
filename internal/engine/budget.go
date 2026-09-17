@@ -113,7 +113,7 @@ func (b *budget) sample() uint64 {
 //
 // slots, perSeq and prefix are echoed because the arithmetic between them is
 // the part operators get wrong — `-ctx` reads like a total and is not one.
-func (b *budget) report(slots, prefix, perSeq int) {
+func (b *budget) report(slots, prefix, perSeq int, shared bool) {
 	if !b.known {
 		return
 	}
@@ -125,10 +125,15 @@ func (b *budget) report(slots, prefix, perSeq int) {
 
 	// The multiplication is spelled out because it is the part that surprises
 	// people: -ctx reads like a total and is per-conversation.
+	cells := Plan{Slots: slots, Prefix: prefix, SharedPool: shared}.Cells()
+	layout := fmt.Sprintf("x %d sequences (%d slots + %d prefix)", cells, slots, prefix)
+	if shared {
+		layout = fmt.Sprintf("x %d slots, with %d prefix entries in whatever the slots leave free", slots, prefix)
+	}
 	log.Printf("memory: %s   model %s + context %s -> %s free of %s (this process only)\n"+
-		"          context is %d tokens: -ctx %d per conversation x %d sequences (%d slots + %d prefix)",
+		"          context is %d tokens: -ctx %d per conversation %s",
 		b.dev.Name, gib(model), gib(ctx), gib(free), gib(total),
-		perSeq*(slots+prefix), perSeq, slots+prefix, slots, prefix)
+		perSeq*cells, perSeq, layout)
 
 	if total == 0 || free >= thinHeadroom {
 		return
@@ -144,7 +149,7 @@ func (b *budget) report(slots, prefix, perSeq int) {
 		"          died, so leave room for whatever else runs here.\n"+
 		"          -ctx %d -slots %d, or -ctx %d -slots %d, would leave more.",
 		gib(free), gib(total),
-		suggestCtx(b, slots, prefix, perSeq), slots,
+		suggestCtx(b, cells, 0, perSeq), slots,
 		perSeq, max(1, slots/2))
 }
 

@@ -382,15 +382,27 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	if j.params.NoThink {
 		render = s.tpl.RenderNoThink
 	}
-	prompt := render(j.msgs, j.params.Tools)
-	tokens, err := llama.Tokenize(s.vocab, prompt, true, true)
+	tokenize := func(msgs []chat.Message) ([]llama.Token, error) {
+		return llama.Tokenize(s.vocab, render(msgs, j.params.Tools), true, true)
+	}
+	// A conversation longer than the slot loses its oldest turns rather than
+	// being refused, and one that nearly fills it loses enough to leave room
+	// for the reply; see fit.go.
+	budget := s.ctxPerSeq - replyRoom(s.ctxPerSeq, j.params.MaxTokens)
+	msgs, tokens, dropped, err := fitMessages(j.msgs, budget, s.ctxPerSeq, tokenize, s.messageSize)
 	if err != nil {
-		j.finish(fmt.Errorf("tokenize: %w", err))
+		var big *PromptTooLongError
+		if errors.As(err, &big) {
+			big.Slots = len(s.slots)
+		} else {
+			err = fmt.Errorf("tokenize: %w", err)
+		}
+		j.finish(err)
 		return
 	}
-	if len(tokens) >= s.ctxPerSeq {
-		j.finish(&PromptTooLongError{Tokens: len(tokens), Limit: s.ctxPerSeq, Slots: len(s.slots)})
-		return
+	if dropped > 0 {
+		log.Printf("context: dropped the oldest %d of %d messages so the prompt fits a %d-token conversation "+
+			"with room to reply — now %d tokens", dropped, len(j.msgs), s.ctxPerSeq, len(tokens))
 	}
 
 	// The previous occupant's cells are still tagged with this seq_id. Drop
@@ -443,14 +455,14 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 			}
 			return int32(n)
 		}
-		if len(j.msgs) > 1 && j.msgs[0].Role == "system" {
+		if len(msgs) > 1 && msgs[0].Role == "system" {
 			// Rendered with a different first message, the system prompt is
 			// where the two part.
-			if pos := agreeWith([]chat.Message{j.msgs[0], {Role: "user", Content: "x"}}); pos > 0 {
+			if pos := agreeWith([]chat.Message{msgs[0], {Role: "user", Content: "x"}}); pos > 0 {
 				checkpoints = append(checkpoints, checkpoint{pos: pos, shared: true})
 			}
 		}
-		next := append(append([]chat.Message(nil), j.msgs...), chat.Message{Role: "assistant", Content: "x"})
+		next := append(append([]chat.Message(nil), msgs...), chat.Message{Role: "assistant", Content: "x"})
 		if pos := agreeWith(next); pos > 0 && (len(checkpoints) == 0 || pos > checkpoints[0].pos) {
 			checkpoints = append(checkpoints, checkpoint{pos: pos})
 		}
@@ -491,6 +503,32 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	sl.sampler = sampling.New(j.params.Params)
 }
 
+// replyRoom is how much of a slot a fitted prompt leaves for the reply: what
+// the caller asked for, up to an eighth of the slot. Agents ask for far more
+// than a local context holds — Claude Code sends max_tokens 32000 — and a tool
+// call rarely needs more than a few thousand.
+func replyRoom(ctxPerSeq, maxTokens int) int {
+	room := ctxPerSeq / 8
+	if maxTokens > 0 {
+		room = min(room, maxTokens)
+	}
+	return room
+}
+
+// messageSize is a message's own tokens, without the template around it. It
+// only places the points where fitting may cut a conversation, so it needs to
+// be the same every time a message is sized, not exact.
+func (s *scheduler) messageSize(m chat.Message) int {
+	n := len(m.Content) / 4
+	if t, err := llama.Tokenize(s.vocab, m.Content, false, false); err == nil {
+		n = len(t)
+	}
+	for _, c := range m.ToolCalls {
+		n += (len(c.Name) + len(c.Arguments)) / 3
+	}
+	return n
+}
+
 func (s *scheduler) active() int {
 	n := 0
 	for _, sl := range s.slots {
@@ -515,7 +553,7 @@ func (s *scheduler) step() error {
 			s.release(sl, err)
 			continue
 		}
-		if el, expired := s.limits.expiredGenerating(sl.admitted); expired {
+		if el, expired := s.limits.expiredGenerating(sl.evalStart); expired {
 			s.release(sl, &TimeoutError{After: el, Stage: StageGenerating})
 			continue
 		}
@@ -556,7 +594,18 @@ func (s *scheduler) step() error {
 		}
 	}
 	if err := s.batch.Decode(s.lctx); err != nil {
-		return err
+		// A pool without cells of its own keeps its prompts in whatever the
+		// slots are not using, so a full cache is the pool's to give back. The
+		// failed decode changed nothing — llama.cpp finds room for every
+		// micro-batch before it runs any — so the same batch simply runs again.
+		var de *llama.DecodeError
+		if !errors.As(err, &de) || de.Code != 1 || !s.pool.clear() {
+			return err
+		}
+		log.Printf("prefix pool: the cache was full — pooled prompts dropped to make room")
+		if err := s.batch.Decode(s.lctx); err != nil {
+			return err
+		}
 	}
 
 	// Take the time only when something is about to be sampled. A step that

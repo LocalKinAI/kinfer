@@ -256,3 +256,29 @@ func TestExactPoolEvictsAConversationBeforeASystemPrompt(t *testing.T) {
 		t.Errorf("the older conversation survived (matched %d); it should have gone first", n)
 	}
 }
+
+// A full cache takes the pool back whole: every entry that held a prompt is
+// forgotten, and a second clear has nothing to give.
+func TestClearEmptiesEveryEntry(t *testing.T) {
+	p, calls := newTestPool(3, 2)
+	p.publish(0, toks(1, 2, 3, 4))
+	p.publish(1, toks(9, 8, 7, 6))
+	*calls = nil
+
+	if !p.clear() {
+		t.Fatal("clear reported nothing freed from a pool holding two prompts")
+	}
+	if forgets := len(*calls); forgets != 2 {
+		t.Errorf("%d sequences forgotten, want the 2 that held prompts", forgets)
+	}
+	if _, n := p.match(toks(1, 2, 3, 4, 5)); n != 0 {
+		t.Errorf("matched %d tokens after clear", n)
+	}
+	if p.clear() {
+		t.Error("an empty pool reported freeing something")
+	}
+	var nilPool *prefixPool
+	if nilPool.clear() {
+		t.Error("a nil pool reported freeing something")
+	}
+}
