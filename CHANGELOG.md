@@ -55,11 +55,16 @@ second turn adopted the first from the shared pool (3.5 s to the first byte),
 and the pool gave its cells back each time a different prompt needed them,
 with no request failing.
 
-What stays slow there is the machine, not the runtime. ornith-1.5:35b under
-Ollama 0.34.0 on the same box, same GGUF: 79 tok/s on the first short
-request, 34 on the second, 18 on the third, 14–18 after a 6k-token prompt, 90
-again after 30 s idle — the curve kinfer shows. macOS reports thermal pressure
-"moderate" there with nothing running.
+The slow numbers above are the box with Qwen3.8-Flash-Next, and not the box
+itself. A 73.4 GiB model leaves that machine 14% of its memory, and for a
+while after such a model is loaded or released everything on it runs slow —
+ornith-1.5:35b under Ollama 0.34.0, same GGUF, went 79 → 34 → 18 tok/s over
+three short requests and back to 90 after 30 s idle, exactly as under kinfer.
+Once memory had settled, the same model under kinfer's own sizing (8 slots of
+65536) prefilled a 6,360-token prompt at 1,637 tok/s and generated at 83–88
+tok/s before and after it, with no drop. Codex did the task above in 7.3 s;
+Claude Code in 37 s, 27 s of it the first read of its 30k-token prompt, with
+0.6 s to the first byte of its second turn.
 
 
 ### Fixed — prefix reuse on models with recurrent layers

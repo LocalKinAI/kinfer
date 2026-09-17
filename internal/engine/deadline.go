@@ -89,12 +89,12 @@ type deadlines struct {
 // the reply's first token was sampled, which is where the clock starts: queueing
 // is the other limit's business, and prefill is bounded by the prompt.
 //
-// The clock used to start at admission. On a machine that prefills 50 tokens a
-// second — the box, running Qwen3.8-Flash-Next hot — Claude Code's 30k-token
-// opening prompt was still being read when five minutes ran out, so the reply
-// came back empty with stop_reason max_tokens, Claude Code sent the same prompt
-// again, and the same thing happened again. What this limit is for is a reply
-// that never ends, and a prompt always does.
+// The clock used to start at admission. On a machine prefilling 50 tokens a
+// second — the box, with a 73.4 GiB model leaving it 14% of its memory — Claude
+// Code's 30k-token opening prompt was still being read when five minutes ran
+// out, so the reply came back empty with stop_reason max_tokens, Claude Code
+// sent the same prompt again, and the same thing happened again. What this
+// limit is for is a reply that never ends, and a prompt always does.
 func (d deadlines) expiredGenerating(since time.Time) (time.Duration, bool) {
 	if d.generate <= 0 || since.IsZero() {
 		return 0, false
