@@ -94,6 +94,12 @@ type Options struct {
 	// as fewer slots holding the same number of tokens while that prompt runs,
 	// and rebuilt as it was once nothing needs them. See flex.go.
 	FixedLayout bool
+
+	// Batch is how many tokens of a prompt the GPU takes in one pass
+	// (llama.cpp's n_ubatch). 0 sizes it the way Ollama does: 2048, 1024 or
+	// 512, by the context and by how much of the memory the model and its
+	// cache take. See autoUbatch.
+	Batch int
 }
 
 // GenParams control one generation.
@@ -284,16 +290,53 @@ func Open(path string, opts Options) (*Engine, error) {
 	// shape and the memory the weights actually left — see autosize.go.
 	sized := opts.Slots <= 0 || opts.ContextSize <= 0
 	shape, _ := store.ReadShape(path)
-	plan, err := AutoSize(shape, bud.afterModel, opts.Slots, opts.PrefixSlots, opts.ContextSize)
+
+	// Slots given and the context left to us, with flex on: the total the
+	// slots share is sized per model the way Ollama sizes one request's
+	// context (SizeTotal), and flex gives one long prompt all of it.
+	byTotal := opts.Slots > 0 && opts.ContextSize <= 0 && !opts.FixedLayout
+	ctx := opts.ContextSize
+	if byTotal {
+		t, err := SizeTotal(shape, bud.dev.Total, bud.afterModel, opts.Slots)
+		if err != nil {
+			llama.FreeModel(model)
+			return nil, err
+		}
+		ctx = t.PerSeq
+		one := ollamaDefaultCtx(bud.dev.Total)
+		if shape.TrainedCtx > 0 {
+			one = min(one, shape.TrainedCtx)
+		}
+		log.Printf("sizing: %d tokens of context for %d slots of %d — Ollama would give one request %d here; "+
+			"the cache should cost about %s of the %s left. -ctx overrides this.",
+			t.PerSeq*t.Slots, t.Slots, t.PerSeq, one, gib(uint64(t.Estimated)), gib(bud.afterModel))
+	}
+
+	plan, err := AutoSize(shape, bud.afterModel, opts.Slots, opts.PrefixSlots, ctx)
 	if err != nil {
 		llama.FreeModel(model)
 		return nil, err
 	}
 	slots, prefix, perSeq, shared := plan.Slots, plan.Prefix, plan.PerSeq, plan.SharedPool
+
+	// The micro-batch, from the longest conversation the cache can hold and
+	// the memory the model and its cache are predicted to take.
+	longest := perSeq
+	if !opts.FixedLayout && slots > 1 {
+		longest = perSeq * slots
+		if shape.TrainedCtx > 0 {
+			longest = min(longest, shape.TrainedCtx)
+		}
+	}
+	ubAuto := opts.Batch <= 0
+	ub := min(max(opts.Batch, 1), batchCapacity)
+	if ubAuto {
+		ub = autoUbatch(longest, sub(bud.atStart, bud.afterModel)+uint64(plan.Estimated), bud.atStart)
+	}
 	// What was left for us to choose. An explicit flag is never overridden, so
 	// each shrinking step below is taken only where the operator gave no number.
 	slotsAuto, prefixAuto, ctxAuto := opts.Slots <= 0, opts.PrefixSlots == 0, opts.ContextSize <= 0
-	if sized {
+	if sized && !byTotal {
 		trained := "unknown"
 		if shape.TrainedCtx > 0 {
 			trained = fmt.Sprint(shape.TrainedCtx)
@@ -314,7 +357,7 @@ func Open(path string, opts Options) (*Engine, error) {
 	var lctx llama.Context
 sizing:
 	for {
-		lctx = newContext(model, slots, prefix, perSeq, shared)
+		lctx = newContext(model, slots, prefix, perSeq, shared, ub)
 		if lctx == 0 {
 			llama.FreeModel(model)
 			return nil, fmt.Errorf("create context for %s", path)
@@ -328,7 +371,13 @@ sizing:
 		// The pool counts as ours to choose even when -slots and -ctx did not:
 		// an automatic pool around fixed conversations is exactly what left the
 		// box at 0.0 GiB, and this loop never ran for it.
-		if !(sized || prefixAuto) || !bud.known || bud.afterCtx >= thinHeadroom {
+		// A total sized like Ollama's is kept down to fitReserve, not the
+		// warning line: see fitReserve for why 1.6 GiB is not too little.
+		enough := uint64(thinHeadroom)
+		if byTotal {
+			enough = fitReserve
+		}
+		if !(sized || prefixAuto || (ubAuto && ub > ubatchDefault)) || !bud.known || bud.afterCtx >= enough {
 			break
 		}
 		measured := fmt.Sprintf("sizing: %d slots + %d prefix x %d tokens%s measured %s, leaving %s",
@@ -339,6 +388,11 @@ sizing:
 		// estimate undercounts — and dropping a sequence frees a whole one of
 		// them. Halving alone took the box to 4 slots of 4096.
 		switch {
+		// A bigger micro-batch is speed, not capacity: it goes before
+		// anything a conversation would notice.
+		case ubAuto && ub > ubatchDefault:
+			ub = lowerUbatch(ub)
+			log.Printf("%s — a micro-batch of %d instead", measured, ub)
 		case perSeq/2 < floor && slotsAuto && slots > 1:
 			slots /= 2
 			prefix = min(prefix, max(slots/2, 1))
@@ -410,7 +464,13 @@ sizing:
 		log.Printf("prefix pool: whole prompts only — this model keeps recurrent state, which cannot be cut back to a shorter prefix")
 	}
 
-	home := layout{slots: slots, prefix: prefix, perSeq: e.nCtx, shared: shared}
+	home := layout{slots: slots, prefix: prefix, perSeq: e.nCtx, shared: shared, ubatch: ub}
+	how := "sized the way Ollama sizes it"
+	if !ubAuto {
+		how = "as -batch asked"
+	}
+	log.Printf("batch: the GPU reads %d prompt tokens a pass, %s — the model and its cache are %s of %s",
+		ub, how, gib(sub(bud.atStart, bud.afterCtx)), gib(bud.atStart))
 	var fx *flex
 	if !opts.FixedLayout {
 		fx = newFlex(home, shape.TrainedCtx, contextBuilder(model, home, bud))
@@ -441,7 +501,7 @@ sizing:
 func contextBuilder(model llama.Model, home layout, bud *budget) func(layout) (llama.Context, uint64, error) {
 	floor := sub(min(bud.afterCtx, thinHeadroom), reshapeSlack)
 	return func(l layout) (llama.Context, uint64, error) {
-		lctx := newContext(model, l.slots, l.prefix, l.perSeq, l.shared)
+		lctx := newContext(model, l.slots, l.prefix, l.perSeq, l.shared, l.ubatch)
 		if lctx == 0 {
 			return 0, 0, errors.New("llama.cpp could not create it (see its output above)")
 		}
@@ -461,7 +521,7 @@ func contextBuilder(model llama.Model, home layout, bud *budget) func(layout) (l
 // newContext asks llama.cpp for a cache holding slots+prefix sequences of
 // perSeq tokens each — or, when the pool is shared, slots conversations' worth
 // of tokens that the pool's sequences borrow from.
-func newContext(model llama.Model, slots, prefix, perSeq int, shared bool) llama.Context {
+func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatch int) llama.Context {
 	cp := llama.DefaultContextParams()
 	// Pooled prefixes live in sequence ids above the slots, and each needs a
 	// sequence's worth of cache unless it borrows the slots'.
@@ -470,6 +530,9 @@ func newContext(model llama.Model, slots, prefix, perSeq int, shared bool) llama
 	cp.NCtx = uint32(perSeq * Plan{Slots: slots, Prefix: prefix, SharedPool: shared}.Cells())
 	if cp.NBatch < uint32(batchCapacity) {
 		cp.NBatch = uint32(batchCapacity)
+	}
+	if ubatch > 0 {
+		cp.NUbatch = uint32(min(ubatch, batchCapacity))
 	}
 	if prefix > 0 {
 		// A cell can only belong to several sequences in the unified buffer,

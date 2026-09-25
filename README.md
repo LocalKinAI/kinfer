@@ -169,6 +169,50 @@ themselves is refused, with a 413.
 Explicit `-ctx` and `-slots` are never second-guessed: they are the layout the
 server starts in and comes back to. The next section is the one way it leaves it.
 
+### `-slots` without `-ctx`: each model's context sized the way Ollama sizes one
+
+Ollama gives a request that names no context 262144 tokens on a machine with at
+least 47 GiB of GPU memory, 32768 with 23, and 4096 below that, never more than
+the model was trained for. The number is per machine, not per model: on the box
+it gave ornith-1.5-35b and qwen3.8 262144 each, and would ask the same of a model
+whose weights leave room for a quarter of it.
+
+With `-slots N` and no `-ctx`, kinfer takes that number as the total the slots
+share, halves it until it fits in what the weights left (keeping 1 GiB free), and
+gives each slot an equal part. Flex hands one long prompt the whole total. A
+server started once with `-slots 4` sizes each model as it loads:
+
+```
+$ kinfer plan -slots 4 <model>        on the box, 77.8 GiB GPU budget
+Qwen3.8-Flash-Next  (73.5 GB)   4 x 16384, 65536 shared, cache about 1.9 GB
+ornith-1.5-35b      (20.2 GB)   4 x 65536, 262144 shared, cache about 5.3 GB
+qwen3.8-27b         (15.7 GB)   4 x 65536, 262144 shared, cache about 16.6 GB
+qwen2.5-0.5b        (0.5 GB)    4 x 8192, 32768 shared (trained for 32768)
+```
+
+ornith gets the memory Ollama spends on its one request and serves four at once.
+Flash-Next gets the 4 x 16384 that `-ctx 16384 -slots 4` used to fix for every
+model, including the ones with room for more.
+
+### The micro-batch, sized the way Ollama sizes it
+
+llama.cpp reads a prompt a micro-batch at a time, 512 tokens unless told
+otherwise, and a bigger pass keeps the GPU busier. kinfer picks it with Ollama's
+rule (`automaticGenerationBatch` in its server/sched.go). It starts at 2048
+tokens for a context over 32768 and at 1024 over 4096. It steps down while the
+model and its cache are more than 60% of the GPU budget (75% for 1024), or the
+extra memory the bigger pass takes (2 GiB, or 768 MiB) is not there:
+
+```
+batch: the GPU reads 2048 prompt tokens a pass, sized the way Ollama sizes it — the model and its cache are 26.9 GiB of 77.8 GiB
+batch: the GPU reads 512 prompt tokens a pass, sized the way Ollama sizes it — the model and its cache are 76.2 GiB of 77.8 GiB
+```
+
+On the box that read an 11,479-token prompt into ornith-1.5-35b in 5.85 s
+instead of 7.7. Flash-Next fills the machine and stays at 512. A load whose
+measured memory comes out short gives up the bigger pass before anything a
+conversation would notice. `-batch N` sets it outright.
+
 ### A prompt too long for its slot gets a longer one
 
 llama.cpp splits a context evenly between its slots, so `-ctx 16384 -slots 4` is
@@ -290,7 +334,7 @@ silently loading the wrong 7B model is worse than a message.
             │
       purego                    no CGO, so cross-compilation survives
             │
-      libllama + 7 ggml libraries   (llama.cpp b10901, 8.2 MB, embedded)
+      libllama + 7 ggml libraries   (llama.cpp b11175, 8.4 MB, embedded)
 ```
 
 **No CGO anywhere.** The native libraries load at runtime through `purego`,
@@ -309,7 +353,7 @@ onto libffi.
 # Copy the versioned sonames, not the plain names: llama.cpp's macOS builds
 # reference @rpath/libggml.0.dylib, and //go:embed cannot carry the symlinks
 # that the release tarball uses for the unversioned names.
-V=b10901
+V=b11175
 curl -sfL "https://github.com/ggml-org/llama.cpp/releases/download/$V/llama-$V-bin-macos-arm64.tar.gz" \
     | tar xz -C /tmp
 mkdir -p internal/nativelib/libs/darwin_arm64_$V
@@ -394,6 +438,54 @@ M4 kinfer fell from 178 to 104 tok/s while Ollama held near 175. Run to run the
 spread reaches ±40%, wide enough to swallow any change worth making. So every
 comparison here measures Ollama in the same round and reports the ratio. A
 kinfer number on its own, from that machine, means nothing.
+
+### Against Ollama, on the same file
+
+The box, ornith-1.5-35b (Q4_K_M, a 35B mixture of experts): kinfer's copy of it
+is a link to Ollama's own blob, so both runtimes read the same bytes. Ollama
+0.34.3 was measured as installed: one request at a time, a 262144-token context,
+and its vision projector loaded. kinfer ran with `-slots 4`, which sizes the
+same 262144 as 4 x 65536. Every request used `think: false`, temperature 0 and
+a fixed `num_predict`. The box is shared — a ComfyUI pipeline starts a job every
+few minutes — so each measurement waited for ComfyUI to be idle, and any during
+which it started a job was thrown away and taken again.
+
+| | kinfer | Ollama |
+|---|---|---|
+| memory | 26.9 GiB | 25.8 GiB |
+| one request, decode | **106.6 tok/s** | 103.3 tok/s |
+| 4 at once: aggregate / last one done | **166 tok/s / 9.6 s** | 102 tok/s / 15.8 s |
+| 8 at once: aggregate / last one done | **154 tok/s / 20.8 s** | 102 tok/s / 31.5 s |
+| 11,479-token prompt: prefill | **5.85 s** | 6.17 s |
+| decode after it | **96.2 tok/s** | 90.8 tok/s |
+| 103,641-token prompt: prefill | 126.4 s | **121.8 s** |
+| decode after it | **61.4 tok/s** | 60.2 tok/s |
+
+The replies were identical. Ollama still reads a 100k-token prompt 4% faster;
+everything else is even or kinfer's, and several requests at a time kinfer
+finishes in 60–66% of Ollama's time, because Ollama answers one request and
+queues the rest.
+
+It was not so before this build. With llama.cpp b10901 embedded, kinfer decoded
+at 87 tok/s to Ollama's 103, and read the 11k prompt in 7.7 s to 5.9. Finding
+out why, in order:
+
+- **Not the slots.** kinfer with one slot of 262144, Ollama's exact layout, ran
+  at the same 87.
+- **Not the threads.** Ollama's own llama-server gave 103.1 tok/s with 4 threads
+  and 102.2 with 20.
+- **Not kinfer's own code.** `KINFER_DEBUG_SCHED` now splits each step: of
+  11.5 ms per token, 1.32 went to queueing the forward pass, 10.06 to waiting
+  for the GPU, 0.12 to sampling, and none to the scheduler.
+- **The llama.cpp build.** The official b10901 llama-server, the same library
+  kinfer embedded (byte for byte), ran at 83.8 tok/s. The official b11175 ran
+  at 106–108. Ollama ships its own, somewhere between.
+
+kinfer now embeds b11175. llama.h gained functions between the two and changed
+none that kinfer binds. The prompt side also took Ollama's micro-batch: 2048
+tokens a pass where the model and its cache leave room, 512 where they do not
+(see `-batch`). Flash-Next on the same upgrade: 41.9 tok/s alone (was 33.6) and
+66 together at four (was 53), still at 512 a pass since it fills the box.
 
 ### The same code on a Mac Studio
 
@@ -803,6 +895,19 @@ kinfer_requests_total{outcome="failed"} 0
 Prometheus text format. The three that matter together: a deep queue beside idle
 slots is a different problem from slots that are always full, and `refused` is
 how you know which.
+
+`KINFER_DEBUG_SCHED=1` adds a line a second on what the scheduler did, and where
+each step's time went:
+
+```
+sched:   87 steps/s   mean batch   1.0 tokens   mean active slots  1.0   per step 11.50 ms: decode 1.32, gpu wait 10.06, sample 0.12, scheduler 0.00
+```
+
+`decode` is queueing the forward pass, `gpu wait` is the GPU finishing it,
+`sample` is choosing the next tokens, and `scheduler` is whatever is left of the
+wall clock. That line is how the single-request gap to Ollama was found to live
+in the llama.cpp build rather than in kinfer (see *Against Ollama* above). The
+timers run only when the variable is set.
 
 ## Sizing a model before loading it
 

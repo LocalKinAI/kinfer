@@ -26,11 +26,12 @@ import (
 func cmdPlan(args []string) error {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
 	ctxWant := fs.Int("ctx", 0, "context per conversation to plan for (0 = what serve would choose unasked)")
+	slotsWant := fs.Int("slots", 0, "conversations at once, with the context they share sized as serve -slots N sizes it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: kinfer plan <model> [-ctx N]")
+		return fmt.Errorf("usage: kinfer plan [-slots N] [-ctx N] <model>")
 	}
 
 	st, err := store.Open()
@@ -93,6 +94,18 @@ func cmdPlan(args []string) error {
 		}
 		fmt.Printf("\n  Unasked, serve picks: %d slots + %d prefix x %d tokens%s, cache about %s\n",
 			p.Slots, p.Prefix, p.PerSeq, capped, store.HumanSize(p.Estimated))
+	}
+	if *slotsWant > 0 {
+		if p, err := engine.SizeTotal(sh, uint64(budget), uint64(free), *slotsWant); err != nil {
+			fmt.Printf("  With -slots %d: %v\n", *slotsWant, err)
+		} else {
+			one := p.PerSeq * p.Slots
+			if sh.TrainedCtx > 0 {
+				one = min(one, sh.TrainedCtx)
+			}
+			fmt.Printf("  With -slots %d: %d x %d, %d tokens shared, cache about %s; one long prompt can have up to %d\n",
+				*slotsWant, p.Slots, p.PerSeq, p.PerSeq*p.Slots, store.HumanSize(p.Estimated), one)
+		}
 	}
 	if *ctxWant > 0 {
 		fmt.Printf("  For -ctx %d: ", *ctxWant)

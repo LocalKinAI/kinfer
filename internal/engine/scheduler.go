@@ -164,6 +164,11 @@ type scheduler struct {
 	promptTok int
 	reusedTok int
 	lastLog   time.Time
+
+	// Where a step's time goes, for the same debug line: queueing the forward
+	// pass, waiting for the GPU to finish it, and sampling. What is left of the
+	// wall clock is the scheduler itself. Timed only when debug is set.
+	tDecode, tWait, tSample time.Duration
 }
 
 // job is one request waiting for, or receiving, a reply.
@@ -708,14 +713,23 @@ func (s *scheduler) step() error {
 					s.admitted, s.promptTok, s.reusedTok,
 					100*float64(s.reusedTok)/float64(s.promptTok))
 			}
-			log.Printf("sched: %4d steps/s   mean batch %5.1f tokens   mean active slots %4.1f%s",
-				s.steps, float64(s.tokSum)/float64(s.steps), float64(s.activeSum)/float64(s.steps), reuse)
+			ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) / float64(s.steps) }
+			wall := float64(time.Since(s.lastLog)) / float64(time.Millisecond) / float64(s.steps)
+			log.Printf("sched: %4d steps/s   mean batch %5.1f tokens   mean active slots %4.1f   "+
+				"per step %.2f ms: decode %.2f, gpu wait %.2f, sample %.2f, scheduler %.2f%s",
+				s.steps, float64(s.tokSum)/float64(s.steps), float64(s.activeSum)/float64(s.steps),
+				wall, ms(s.tDecode), ms(s.tWait), ms(s.tSample), wall-ms(s.tDecode)-ms(s.tWait)-ms(s.tSample), reuse)
 			// Interval statistics, not cumulative: a mean diluted by an idle
 			// minute says nothing about what happens under load.
 			s.steps, s.tokSum, s.activeSum = 0, 0, 0
+			s.tDecode, s.tWait, s.tSample = 0, 0, 0
 			s.admitted, s.promptTok, s.reusedTok = 0, 0, 0
 			s.lastLog = time.Now()
 		}
+	}
+	var t0, decoded time.Time
+	if s.debug {
+		t0 = time.Now()
 	}
 	if err := s.batch.Decode(s.lctx); err != nil {
 		// A pool without cells of its own keeps its prompts in whatever the
@@ -730,6 +744,10 @@ func (s *scheduler) step() error {
 		if err := s.batch.Decode(s.lctx); err != nil {
 			return err
 		}
+	}
+	if s.debug {
+		decoded = time.Now()
+		s.tDecode += decoded.Sub(t0)
 	}
 
 	// Take the time only when something is about to be sampled. A step that
@@ -748,6 +766,9 @@ func (s *scheduler) step() error {
 		// batch the same instant rather than the order this loop visits them.
 		llama.Synchronize(s.lctx)
 		now = time.Now()
+		if s.debug {
+			s.tWait += now.Sub(decoded)
+		}
 	}
 
 	for _, sl := range s.slots {
@@ -860,7 +881,14 @@ func (s *scheduler) harvest(sl *slot, now time.Time) {
 		sl.evalStart = now
 	}
 
+	var t0 time.Time
+	if s.debug {
+		t0 = time.Now()
+	}
 	tok := sl.sampler.Sample(s.lctx, idx)
+	if s.debug {
+		s.tSample += time.Since(t0)
+	}
 	if llama.IsEOG(s.vocab, tok) {
 		s.finishSlot(sl)
 		return

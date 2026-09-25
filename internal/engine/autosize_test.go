@@ -213,3 +213,88 @@ func TestAutoSizeFitsAnAutomaticPoolAroundFixedConversations(t *testing.T) {
 		t.Errorf("-prefix 3 became %d (%v); explicit numbers are never second-guessed", p.Prefix, err)
 	}
 }
+
+// Qwen3.8-Flash-Next as its header describes it: 48 layers of which every
+// fourth attends, and a recurrent state on the rest. 24 KiB of cache per token
+// and 112 MiB per sequence — llama.cpp's own figures on the box (1536 MiB for
+// 65536 cells; 450 MiB for 4 sequences).
+var flashNext = store.Shape{Layers: 48, HeadsKV: 2, Heads: 32, EmbedDim: 4096, KeyLen: 256, ValLen: 256,
+	TrainedCtx: 262144, Experts: 512, AttnInterval: 4, SSMConv: 4, SSMState: 128, SSMGroups: 16, SSMInner: 6144}
+
+// The box: a 77.8 GiB GPU budget. Ollama gives one request 262144 there, and
+// four slots share that — or as much of it as the memory left allows.
+func TestSizeTotalIsOllamasContextSharedBySlots(t *testing.T) {
+	box := uint64(778) * GiB / 10
+	cases := []struct {
+		name      string
+		sh        store.Shape
+		budget    uint64
+		free      uint64
+		slots     int
+		wantShare int
+	}{
+		// 262144 would be 7 GiB of cache where the weights leave 4.4: halved
+		// to 65536, the 4 x 16384 that -ctx used to write down for it.
+		{"Flash-Next on the box", flashNext, box, 44 * GiB / 10, 4, 16384},
+		// Small enough for all of it: 262144 as 4 x 65536, about the 5 GiB
+		// of cache Ollama spends on its one request.
+		{"ornith-35b on the box", moe, box, 561 * GiB / 10, 4, 65536},
+		// Ollama gives 4096 on a 16 GB machine; four slots of 1024 would
+		// answer nothing, so each gets 4096 and flex the 16384 together.
+		{"a 16 GB Mac", store.Shape{Layers: 24, HeadsKV: 2, Heads: 14, EmbedDim: 896, TrainedCtx: 32768}, 118 * GiB / 10, 11 * GiB, 4, 4096},
+		{"a 32 GB machine", moe, 30 * GiB, 10 * GiB, 4, 8192},
+		// Trained for 2048: never more than that a slot.
+		{"a model trained short", store.Shape{Layers: 24, HeadsKV: 2, Heads: 14, EmbedDim: 896, TrainedCtx: 2048}, box, 60 * GiB, 4, 2048},
+	}
+	for _, c := range cases {
+		p, err := SizeTotal(c.sh, c.budget, c.free, c.slots)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if p.Slots != c.slots || p.PerSeq != c.wantShare {
+			t.Errorf("%s: %d x %d, want %d x %d", c.name, p.Slots, p.PerSeq, c.slots, c.wantShare)
+		}
+		if p.Estimated > int64(c.free) {
+			t.Errorf("%s: estimated %d bytes of cache with %d free", c.name, p.Estimated, c.free)
+		}
+	}
+	if _, err := SizeTotal(flashNext, box, GiB/2, 4); err == nil {
+		t.Error("half a GiB left after Flash-Next's weights was sized anyway")
+	}
+}
+
+// Ollama's own thresholds (server/routes.go), which it sets a GiB under 48 and
+// 24 to allow for how the total is reported.
+func TestOllamaDefaultContext(t *testing.T) {
+	for budget, want := range map[uint64]int{
+		47 << 30: 262144, 47<<30 - 1: 32768, 23 << 30: 32768, 23<<30 - 1: 4096, 0: 4096,
+	} {
+		if got := ollamaDefaultCtx(budget); got != want {
+			t.Errorf("ollamaDefaultCtx(%.2f GiB) = %d, want %d", float64(budget)/GiB, got, want)
+		}
+	}
+}
+
+// Ollama's micro-batch rule, on the box's numbers: a 77.8 GiB budget.
+func TestAutoUbatchIsOllamas(t *testing.T) {
+	box := uint64(778) * GiB / 10
+	cases := []struct {
+		name      string
+		longest   int
+		predicted uint64
+		want      int
+	}{
+		{"ornith: 25.6 GiB with 262144 tokens", 262144, 256 * GiB / 10, 2048},
+		{"Flash-Next: 76.1 GiB, past 80%", 65536, 761 * GiB / 10, 512},
+		{"50 GiB: past 60%, within 75%", 262144, 50 * GiB, 1024},
+		{"a short context starts at 1024", 8192, 10 * GiB, 1024},
+		{"4096 or less stays at 512", 4096, 10 * GiB, 512},
+		{"unknown memory takes the context's", 65536, 0, 2048},
+	}
+	for _, c := range cases {
+		if got := autoUbatch(c.longest, c.predicted, box); got != c.want {
+			t.Errorf("%s: %d, want %d", c.name, got, c.want)
+		}
+	}
+}

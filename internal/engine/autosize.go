@@ -157,6 +157,137 @@ func AutoSize(sh store.Shape, free uint64, slots, prefix, perSeq int) (Plan, err
 	return Plan{}, fmt.Errorf("no room for a context: %s left after the weights", store.HumanSize(int64(free)))
 }
 
+// Sizing the total a fixed number of slots share, the way Ollama sizes one
+// request's context.
+//
+// Ollama's rule, from its server/routes.go: a request that names no context
+// gets 262144 tokens on a machine with at least 47 GiB of GPU memory, 32768
+// with 23, 4096 below that, never more than the model was trained for. That is
+// why ornith-1.5-35b and qwen3.8 both loaded at 262144 on the box. The number
+// is per machine, not per model. It only worked for those two because they
+// are small; Flash-Next at 262144 would need 7 GiB of cache where its weights
+// leave 4.4.
+//
+// kinfer takes the same number as the total its slots share. At home each slot
+// gets an equal part, and flex gives one long prompt the whole of it (see
+// flex.go). Where the total does not fit it is halved until it does, leaving
+// fitReserve free. On the box: ornith gets 262144 as 4 x 65536, the memory
+// Ollama gives its single request, with four conversations at once. Flash-Next
+// gets 65536 as 4 x 16384, which is what -ctx 16384 -slots 4 used to write down
+// for every model.
+
+// ollamaDefaultCtx is the context Ollama gives a request that names none, for a
+// machine with this much GPU memory.
+func ollamaDefaultCtx(budget uint64) int {
+	switch {
+	case budget >= 47<<30:
+		return 262144
+	case budget >= 23<<30:
+		return 32768
+	}
+	return 4096
+}
+
+// fitReserve is the least an automatically sized total leaves free. Below
+// thinHeadroom the server still says so. Flash-Next at 4 x 16384 leaves 1.6
+// GiB and ran the deep-study swarm that way for a day. Every failure seen on
+// the box came from another process's memory, which no reserve kept here can
+// see.
+const fitReserve = 1 << 30
+
+// minSlotCtx is the least a home slot is given when Ollama's number is small:
+// on a 16 GB machine 4096 split four ways answers nothing. flex still gives a
+// long prompt the whole total.
+const minSlotCtx = 4096
+
+// SizeTotal is the plan for slots conversations sharing a context sized as
+// above, for a machine whose GPU budget is budget with free left after the
+// weights. PerSeq is each slot's share at home; Slots x PerSeq is the total.
+func SizeTotal(sh store.Shape, budget, free uint64, slots int) (Plan, error) {
+	if slots <= 0 {
+		slots = 1
+	}
+	one := ollamaDefaultCtx(budget)
+	if sh.TrainedCtx > 0 {
+		one = min(one, sh.TrainedCtx)
+	}
+	total := max(one, slots*minSlotCtx)
+	if sh.TrainedCtx > 0 {
+		total = min(total, slots*sh.TrainedCtx)
+	}
+	share := func(t int) int { return t / slots / 256 * 256 }
+	if sh.CacheBytes(1024) == 0 || free == 0 {
+		// No shape or no accelerator to measure against: Ollama's number, as is.
+		return Plan{Slots: slots, PerSeq: share(total)}, nil
+	}
+	spend := int64(sub(free, fitReserve))
+	for ; share(total) >= 1024; total /= 2 {
+		if c := sh.CacheBytesFor(share(total)*slots, slots); c <= spend {
+			return Plan{Slots: slots, PerSeq: share(total), Estimated: c,
+				Capped: sh.TrainedCtx > 0 && share(total)*slots >= sh.TrainedCtx}, nil
+		}
+	}
+	return Plan{}, fmt.Errorf("%d slots do not fit even at 1024 tokens each: %s left after the weights",
+		slots, store.HumanSize(int64(free)))
+}
+
+// The micro-batch, sized the way Ollama sizes it.
+//
+// llama.cpp reads a prompt n_ubatch tokens at a time, 512 unless told
+// otherwise, and a bigger pass keeps the GPU busier. Ollama started the box's
+// ornith-1.5-35b with -ub 2048 and read an 11,479-token prompt in 5.9 s, where
+// kinfer at 512 took 7.7. Its rule is automaticGenerationBatch in
+// server/sched.go. It starts at 2048 for a context over 32768 and at 1024 over
+// 4096, and steps down while the model and its cache (predicted) are too much
+// of the memory (available): 2048 needs them under 60% of it and 2 GiB to
+// spare within 80%; 1024 needs 75% and 768 MiB. Flash-Next's 76 GiB of 77.8
+// gets 512, as before; ornith's 25.6 gets 2048.
+const (
+	ubatchDefault = 512
+	ubatchMedium  = 1024
+	ubatchLarge   = 2048
+)
+
+// autoUbatch is Ollama's micro-batch for a model whose longest conversation is
+// longest tokens.
+func autoUbatch(longest int, predicted, available uint64) int {
+	b := ubatchDefault
+	switch {
+	case longest > 32768:
+		b = ubatchLarge
+	case longest > 4096:
+		b = ubatchMedium
+	}
+	for b > ubatchDefault && !ubatchFits(b, predicted, available) {
+		b = lowerUbatch(b)
+	}
+	return b
+}
+
+func ubatchFits(b int, predicted, available uint64) bool {
+	if predicted == 0 || available == 0 {
+		return true
+	}
+	within := available * 80 / 100
+	if predicted > within {
+		return false
+	}
+	switch {
+	case b >= ubatchLarge:
+		return predicted <= available*60/100 && 2<<30 <= within-predicted
+	case b >= ubatchMedium:
+		return predicted <= available*75/100 && 768<<20 <= within-predicted
+	}
+	return true
+}
+
+func lowerUbatch(b int) int {
+	if b > ubatchMedium {
+		return ubatchMedium
+	}
+	return ubatchDefault
+}
+
 // spendableOf is what the cache may cost: half of what the weights left, and
 // never the last thinHeadroom of it. The other half is for company — see the
 // policy at the top of this file.

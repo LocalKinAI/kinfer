@@ -5,6 +5,62 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### llama.cpp b10901 → b11175, and Ollama's micro-batch
+
+Measured against Ollama on the same ornith-1.5-35b file, kinfer decoded one
+request at 87 tok/s to Ollama's 103. The cause was not the slots (one slot ran
+the same), nor the CPU threads (Ollama's llama-server gave 103 with 4 or 20),
+nor kinfer's code: `KINFER_DEBUG_SCHED` now splits a step, and of 11.5 ms per
+token 10.06 was the GPU, 1.32 queueing it, 0.12 sampling, 0 the scheduler. The
+official llama-server of kinfer's embedded build, b10901 — the same library
+byte for byte — ran at 83.8. The official b11175 ran at 106–108. llama.h between
+the two only gained functions; nothing kinfer binds changed shape.
+
+Now embedded: b11175. And the micro-batch is Ollama's rule (automaticGenerationBatch
+in its server/sched.go): 2048 tokens a pass for a context over 32768, 1024 over
+4096, stepped down while the model and its cache are more than 60% (or 75%) of
+the GPU budget or the extra memory the bigger pass takes is not there; `-batch`
+overrides. A measured load that leaves too little steps the batch down before
+anything a conversation would notice.
+
+On the box, each measurement taken while ComfyUI was idle:
+
+- **ornith-1.5-35b, 2048 a pass:** one request 106.6 tok/s (Ollama 103.3); four
+  at once 166 together (was 145; Ollama 102); an 11,479-token prompt read in
+  5.85 s (was 7.7; Ollama 6.17). Ollama is still 4% faster on a 103,641-token
+  prompt.
+- **Flash-Next, 512 a pass (76.2 of 77.8 GiB):** 41.9 tok/s alone (was 33.6),
+  66 together at four (was 53), the same 4 x 16384 and 1.6 GiB left.
+
+### `-slots` without `-ctx`: each model's context sized the way Ollama sizes one
+
+The box ran `-ctx 16384 -slots 4`, numbers chosen for Flash-Next, whose weights
+leave 4.3 GiB. They applied to every model the server loaded. ornith-1.5-35b,
+whose weights leave 58 GiB, got the same four slots of 16384, while Ollama on
+the same machine gave its one request 262144.
+
+Ollama's rule is in its server/routes.go: 262144 tokens with at least 47 GiB of
+GPU memory, 32768 with 23, 4096 below, capped at the trained context. It is per
+machine, not per model. Given `-slots` and no `-ctx`, with flex on, kinfer now
+takes that number as the total the slots share. It halves it until the cache
+fits with 1 GiB to spare and splits it equally at home; flex gives one long
+prompt the whole of it. A cache sized this way is shrunk after loading only if
+it leaves under 1 GiB, not the 2 GiB warning line: Flash-Next at 4 x 16384
+leaves 1.6. `kinfer plan -slots N` prints the result without loading anything.
+
+Measured on the box, started with `-slots 4` and no other size given:
+
+- **Flash-Next:** 4 x 16384, 65536 in all, 2.7 GiB of cache and 1.6 GiB left —
+  what the old flags said.
+- **ornith-1.5-35b:** 4 x 65536, 262144 in all, 5.9 GiB of cache and 52.1 GiB
+  left. Four short requests at once came to 145 tok/s together, the same as at
+  4 x 16384. A 103,641-token prompt got 2 x 131072 in 422 ms and answered whole:
+  150 s to read it, then 55 tok/s.
+
+Against Ollama on the same file this was, at the time, 18% slower one request at
+a time and 42% faster several at once; the entry above is what closed the first
+gap. The table is in the README.
+
 ### A long prompt gets a longer slot
 
 `-ctx 16384 -slots 4` on the box refused a 44,555-token prompt with a 413 while

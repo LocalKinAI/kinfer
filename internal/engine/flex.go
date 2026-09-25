@@ -38,6 +38,11 @@ import (
 type layout struct {
 	slots, prefix, perSeq int
 	shared                bool
+
+	// ubatch is how many tokens of a prompt the GPU takes in one pass. Every
+	// layout keeps home's: it was sized to the model and the memory, not to
+	// the shape the cache happens to have.
+	ubatch int
 }
 
 func (l layout) cells() int {
@@ -105,7 +110,7 @@ func (f *flex) layout(n int) layout {
 	if n == f.home.slots {
 		return f.home
 	}
-	return layout{slots: n, perSeq: f.per(n)}
+	return layout{slots: n, perSeq: f.per(n), ubatch: f.home.ubatch}
 }
 
 // want is the most slots in which a prompt of promptLen tokens runs whole,

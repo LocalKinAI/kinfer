@@ -13,11 +13,13 @@
 // The whole surface kinfer needs is about thirty entry points, so binding them
 // here costs less than working around a mirror that drifts. Every struct below
 // is transcribed from llama.h at the build embedded in internal/nativelib
-// (b10901), and Open verifies the layout at runtime rather than trusting this
+// (b11175), and Open verifies the layout at runtime rather than trusting this
 // comment. Both param structs changed shape between b6862 and b10901 — three
 // new fields in one, two removed and two added in the other — and the size
 // assertions in bind caught it before a single call was made. That is the whole
-// point of having them.
+// point of having them. From b10901 to b11175 llama.h only gained: an extended
+// batch API and a LoRA loader kinfer does not use, and a vocabulary type added
+// at the end of its enum; ggml-backend.h did not change at all.
 //
 // Still no CGO: purego resolves symbols at runtime, so cross-compilation from a
 // Mac keeps working. Struct arguments and returns go through purego directly —

@@ -378,6 +378,7 @@ type serveOpts struct {
 	maxGen, maxWait time.Duration
 	keepAlive       time.Duration
 	flex            bool
+	batch           int
 }
 
 // prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
@@ -428,13 +429,14 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs := flag.NewFlagSet("serve", h)
 	fs.StringVar(&o.addr, "addr", ":11500", "listen address")
 	fs.IntVar(&o.ngl, "ngl", 99, "layers to offload to GPU (0 = CPU only)")
-	fs.IntVar(&o.nCtx, "ctx", 0, "context size per conversation, in tokens (0 = as much as the model and the memory allow)")
+	fs.IntVar(&o.nCtx, "ctx", 0, "context size per conversation, in tokens (0 = sized to each model as it loads; with -slots, the context Ollama would give one request, shared by the slots)")
 	fs.IntVar(&o.slots, "slots", 0, "conversations served at once (0 = 8, or fewer if memory is tight; use 8, 32, 64 or 128 — never 12-16)")
 	fs.Var(&o.prefix, "prefix", "prompt prefixes kept resident so repeat requests skip prefilling them: auto (sized to the memory the slots leave), off, or a number")
 	fs.IntVar(&o.queue, "queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
 	fs.DurationVar(&o.maxGen, "max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
 	fs.DurationVar(&o.maxWait, "max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
 	fs.DurationVar(&o.keepAlive, "keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
+	fs.IntVar(&o.batch, "batch", 0, "prompt tokens the GPU reads in one pass (0 = sized the way Ollama sizes it: 2048, 1024 or 512 by context and memory)")
 	fs.BoolVar(&o.flex, "flex", true, "give a prompt too long for a slot a longer one: fewer slots, the same tokens, while it runs (false = keep the layout)")
 	return fs, o
 }
@@ -455,7 +457,7 @@ func cmdServe(args []string) error {
 	srv := server.New(st, engine.Options{
 		GPULayers: o.ngl, ContextSize: o.nCtx, Slots: o.slots, PrefixSlots: int(o.prefix),
 		MaxQueue: o.queue, MaxGenerate: noLimit(o.maxGen), MaxWait: noLimit(o.maxWait),
-		FixedLayout: !o.flex,
+		FixedLayout: !o.flex, Batch: o.batch,
 	})
 	srv.SetKeepAlive(o.keepAlive)
 	defer srv.Close()
@@ -463,6 +465,8 @@ func cmdServe(args []string) error {
 	models, _ := st.List()
 	fmt.Printf("kinfer serving on %s — %d model(s) in %s\n", o.addr, len(models), st.Root())
 	switch {
+	case o.slots > 0 && o.nCtx <= 0 && o.flex:
+		fmt.Printf("  %d slots sharing a context sized to each model as it loads — what Ollama would give one request, as far as memory allows; one long prompt can have all of it\n", o.slots)
 	case o.slots > 0 && o.nCtx > 0:
 		fmt.Printf("  %d slots × %d tokens — conversations share one forward pass\n", o.slots, o.nCtx)
 		if o.flex && o.slots > 1 {

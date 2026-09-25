@@ -6,7 +6,7 @@ that change with every llama.cpp release, so they are fetched rather than
 committed:
 
 ```bash
-V=b10901
+V=b11175
 curl -sfL "https://github.com/ggml-org/llama.cpp/releases/download/$V/llama-$V-bin-macos-arm64.tar.gz" \
     | tar xz -C /tmp
 mkdir -p internal/nativelib/libs/darwin_arm64_$V
@@ -24,11 +24,11 @@ is what puts real files under the names the loader will ask for.
 The result is one subdirectory per platform:
 
 ```
-libs/darwin_arm64_b10901/
-    libllama.0.dylib        3.1M
-    libggml-metal.0.dylib   2.1M
+libs/darwin_arm64_b11175/
+    libllama.0.dylib        3.2M
+    libggml-metal.0.dylib   2.2M
     libmtmd.0.dylib         1.4M
-    …                             8 files, 8.2 MB total
+    …                             8 files, 8.4 MB total
 ```
 
 `internal/nativelib` embeds the whole tree with `//go:embed all:libs` and
