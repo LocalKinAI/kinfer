@@ -113,6 +113,24 @@ type scheduler struct {
 	slots []*slot
 	pool  *prefixPool
 
+	// wholePrefixes is the pool's rule for a model with recurrent state, kept
+	// so a rebuilt context's pool follows it too; see prefixPool.exact.
+	wholePrefixes bool
+
+	// flex rebuilds the context in another layout when a prompt needs longer
+	// slots, and back when nothing does; nil keeps the layout it loaded with.
+	// See flex.go.
+	flex *flex
+
+	// held is the oldest request not yet in a slot. It has been taken off the
+	// queue to be sized, and waits here for a slot or for the layout it needs.
+	held *job
+
+	// nSlots and holding mirror len(slots) and held != nil for readers on
+	// other goroutines: the slots are replaced when the layout changes.
+	nSlots  atomic.Int32
+	holding atomic.Bool
+
 	// onFatal is called when llama.cpp's backend fails unrecoverably, so the
 	// engine can be marked unusable and replaced rather than kept in service.
 	onFatal func()
@@ -157,6 +175,12 @@ type job struct {
 	// queued is when submit accepted it, so a job the fleet has given up on can
 	// be refused rather than handed a slot.
 	queued time.Time
+
+	// full is the whole prompt, rendered and tokenized when the job reached
+	// the head of the queue, and want is the most slots it runs whole in —
+	// the layout it asks for when flex is on, and the slot count otherwise.
+	full []llama.Token
+	want int
 
 	// frags carries generated text; it is closed when the reply ends. err holds
 	// the failure, if any, and is only read after frags is closed.
@@ -227,25 +251,23 @@ type slot struct {
 	logitIdx int32
 }
 
-func newScheduler(lctx llama.Context, vocab llama.Vocab, tpl *chat.Template, nSlots, nPrefix, ctxPerSeq, batchCap, maxQueue int, limits deadlines, wholePrefixes bool) *scheduler {
+// newScheduler takes over lctx, laid out as home: from here on the scheduler
+// owns the context, frees and rebuilds it when fx changes the layout, and hands
+// whatever context it holds last to the engine to free once it has stopped.
+func newScheduler(lctx llama.Context, home layout, vocab llama.Vocab, tpl *chat.Template, batchCap, maxQueue int, limits deadlines, wholePrefixes bool, fx *flex) *scheduler {
 	s := &scheduler{
-		lctx:      lctx,
-		vocab:     vocab,
-		tpl:       tpl,
-		ctxPerSeq: ctxPerSeq,
-		batch:     llama.NewBatchBuilder(batchCap),
-		slots:     make([]*slot, nSlots),
-		incoming:  make(chan *job, maxQueue),
-		limits:    limits,
-		stop:      make(chan struct{}),
-		stopped:   make(chan struct{}),
-		debug:     os.Getenv("KINFER_DEBUG_SCHED") != "",
+		vocab:         vocab,
+		tpl:           tpl,
+		batch:         llama.NewBatchBuilder(batchCap),
+		incoming:      make(chan *job, maxQueue),
+		limits:        limits,
+		wholePrefixes: wholePrefixes,
+		flex:          fx,
+		stop:          make(chan struct{}),
+		stopped:       make(chan struct{}),
+		debug:         os.Getenv("KINFER_DEBUG_SCHED") != "",
 	}
-	for i := range s.slots {
-		s.slots[i] = &slot{seq: int32(i), logitIdx: -1}
-	}
-	// Pooled prefixes live in sequence ids above the slots.
-	s.pool = newPrefixPool(lctx, int32(nSlots), nPrefix, minPrefixMatch, wholePrefixes)
+	s.install(lctx, home)
 	go s.run()
 	return s
 }
@@ -281,8 +303,15 @@ func (s *scheduler) submit(j *job) error {
 	}
 }
 
-// Waiting is how many requests are queued for a slot.
-func (s *scheduler) Waiting() int { return len(s.incoming) }
+// Waiting is how many requests are queued for a slot, counting the one at the
+// head that admission has already taken off the queue to size.
+func (s *scheduler) Waiting() int {
+	n := len(s.incoming)
+	if s.holding.Load() {
+		n++
+	}
+	return n
+}
 
 func (s *scheduler) close() {
 	close(s.stop)
@@ -294,14 +323,25 @@ func (s *scheduler) run() {
 	defer close(s.stopped)
 
 	for {
-		s.admit()
+		if !s.admit() {
+			// A layout change freed the context and nothing could be built in
+			// its place. Everything waiting is told so and can run again on
+			// a reloaded model.
+			if s.onFatal != nil {
+				s.onFatal()
+			}
+			s.drain()
+			return
+		}
 
 		if s.active() == 0 {
 			// Nothing to do. Block rather than spin — an idle fleet should not
 			// keep a core warm.
 			select {
 			case j := <-s.incoming:
-				s.start(j)
+				if s.prepare(j) {
+					s.hold(j)
+				}
 			case <-s.stop:
 				s.drain()
 				return
@@ -342,39 +382,108 @@ func (s *scheduler) run() {
 	}
 }
 
-// admit fills free slots from the queue without blocking.
-func (s *scheduler) admit() {
-	for _, sl := range s.slots {
-		if sl.job != nil {
+// admit fills free slots from the queue, oldest first, without blocking. false
+// means a layout change left the scheduler without a context.
+//
+// Oldest first is kept strictly: the request at the head is placed before
+// anything behind it is looked at, so one waiting for the slots to drain holds
+// back everything after it. See flex.go for why.
+func (s *scheduler) admit() bool {
+	for {
+		j := s.head()
+		if j == nil {
+			return true
+		}
+		switch s.place(j) {
+		case placeNow:
+			s.hold(nil)
+			s.startIn(s.freeSlot(), j)
+		case placeReshape:
+			if !s.reshape(j) {
+				return false
+			}
+		default:
+			return true
+		}
+	}
+}
+
+// head is the oldest request not yet in a slot: the one already held, or the
+// next off the queue, sized. nil when nothing is waiting.
+func (s *scheduler) head() *job {
+	for {
+		if j := s.held; j != nil {
+			if s.stillWanted(j) {
+				return j
+			}
+			s.hold(nil)
 			continue
 		}
 		select {
 		case j := <-s.incoming:
-			s.startIn(sl, j)
+			if s.prepare(j) {
+				s.hold(j)
+			}
 		default:
-			return
+			return nil
 		}
 	}
 }
 
-func (s *scheduler) start(j *job) {
-	for _, sl := range s.slots {
-		if sl.job == nil {
-			s.startIn(sl, j)
-			return
-		}
-	}
+func (s *scheduler) hold(j *job) {
+	s.held = j
+	s.holding.Store(j != nil)
 }
 
-func (s *scheduler) startIn(sl *slot, j *job) {
+// stillWanted answers a request nobody is waiting for any more, and reports
+// whether it is still worth a slot.
+func (s *scheduler) stillWanted(j *job) bool {
 	if err := j.ctx.Err(); err != nil {
 		j.finish(err)
-		return
+		return false
 	}
 	// Spending a slot on an answer nobody is left to read costs the requests
 	// behind it, which are the ones still being waited for.
 	if el, expired := s.limits.expiredWaiting(j.queued); expired {
 		j.finish(&TimeoutError{After: el, Stage: StageQueued})
+		return false
+	}
+	return true
+}
+
+// prepare renders and tokenizes a request as it reaches the head of the queue
+// and works out the layout it runs whole in. false when it has been answered
+// already: abandoned, expired, or not something the template can render.
+func (s *scheduler) prepare(j *job) bool {
+	if !s.stillWanted(j) {
+		return false
+	}
+	full, err := s.tokenizer(j)(j.msgs)
+	if err != nil {
+		j.finish(fmt.Errorf("tokenize: %w", err))
+		return false
+	}
+	j.full = full
+	j.want = len(s.slots)
+	if s.flex != nil {
+		j.want = s.flex.want(len(full), j.params.MaxTokens)
+	}
+	return true
+}
+
+// tokenizer renders and tokenizes a conversation the way j asked for it.
+func (s *scheduler) tokenizer(j *job) func([]chat.Message) ([]llama.Token, error) {
+	render := s.tpl.Render
+	if j.params.NoThink {
+		render = s.tpl.RenderNoThink
+	}
+	return func(msgs []chat.Message) ([]llama.Token, error) {
+		return llama.Tokenize(s.vocab, render(msgs, j.params.Tools), true, true)
+	}
+}
+
+func (s *scheduler) startIn(sl *slot, j *job) {
+	if !s.stillWanted(j) {
 		return
 	}
 
@@ -382,18 +491,33 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	if j.params.NoThink {
 		render = s.tpl.RenderNoThink
 	}
-	tokenize := func(msgs []chat.Message) ([]llama.Token, error) {
-		return llama.Tokenize(s.vocab, render(msgs, j.params.Tools), true, true)
+	tokenize := s.tokenizer(j)
+	// fitMessages renders the whole conversation first, and prepare already
+	// did exactly that; the cuts after it render afresh.
+	full := j.full
+	fitTokenize := func(msgs []chat.Message) ([]llama.Token, error) {
+		if full != nil {
+			t := full
+			full = nil
+			return t, nil
+		}
+		return tokenize(msgs)
 	}
 	// A conversation longer than the slot loses its oldest turns rather than
 	// being refused, and one that nearly fills it loses enough to leave room
 	// for the reply; see fit.go.
 	budget := s.ctxPerSeq - replyRoom(s.ctxPerSeq, j.params.MaxTokens)
-	msgs, tokens, dropped, err := fitMessages(j.msgs, budget, s.ctxPerSeq, tokenize, s.messageSize)
+	msgs, tokens, dropped, err := fitMessages(j.msgs, budget, s.ctxPerSeq, fitTokenize, s.messageSize)
+	j.full = nil // the slot keeps what it runs; the rest is garbage
 	if err != nil {
 		var big *PromptTooLongError
 		if errors.As(err, &big) {
 			big.Slots = len(s.slots)
+			if s.flex != nil {
+				// It already has the longest slot on offer, so fewer slots
+				// is not advice that would help.
+				big.Slots = 1
+			}
 		} else {
 			err = fmt.Errorf("tokenize: %w", err)
 		}
@@ -802,7 +926,9 @@ func (s *scheduler) release(sl *slot, err error) {
 	if sl.job == nil {
 		return
 	}
-	llama.ForgetSequence(s.lctx, sl.seq, -1, -1)
+	if s.lctx != 0 {
+		llama.ForgetSequence(s.lctx, sl.seq, -1, -1)
+	}
 	if sl.sampler != nil {
 		sl.sampler.Close()
 		sl.sampler = nil
@@ -855,6 +981,10 @@ func (s *scheduler) drain() {
 	closing := errors.New("engine is closing")
 	for _, sl := range s.slots {
 		s.release(sl, closing)
+	}
+	if s.held != nil {
+		s.held.finish(ErrNotStarted)
+		s.hold(nil)
 	}
 	for {
 		select {

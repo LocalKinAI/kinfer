@@ -101,7 +101,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		waiting, busy, slots := cur.eng.Load()
 		metric("queue_depth", "Requests waiting for a slot.", "gauge", waiting, "")
 		metric("slots_busy", "Slots currently generating.", "gauge", busy, "")
-		metric("slots_total", "Slots this model was loaded with.", "gauge", slots, "")
+		metric("slots_total", "Slots in the layout the context has now; a long prompt lowers it while it runs.", "gauge", slots, "")
 		metric("prompt_tokens_total", "Prompt tokens processed since this model loaded.",
 			"counter", cur.eng.PromptTokens(), "")
 		metric("eval_tokens_total", "Tokens generated since this model loaded.",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -400,6 +401,51 @@ func TestPSReportsWhatIsLoaded(t *testing.T) {
 
 	if got := ps(); len(got) != 1 {
 		t.Errorf("after a chat, ps reports %d models, want 1", len(got))
+	}
+}
+
+// TestPSNamesASplitModelAsTagsDoes: a model in three files is one model, and
+// ps must call it what tags calls it — the name a caller then unloads by.
+func TestPSNamesASplitModelAsTagsDoes(t *testing.T) {
+	dir := t.TempDir()
+	for i, size := range []int{11, 40, 30} {
+		name := fmt.Sprintf("big-00%03d-of-00003.gguf", i+1)
+		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := store.OpenAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := &registry{byName: map[string]*fakeEngine{}}
+	srv := New(st, engine.Options{})
+	srv.open = func(path string, _ engine.Options) (generator, error) {
+		f := &fakeEngine{path: path, frags: []string{"ok"}}
+		reg.put(f)
+		return f, nil
+	}
+	defer srv.Close()
+
+	_, release, err := srv.acquire("big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/ps", nil))
+	var out struct {
+		Models []struct {
+			Name string `json:"name"`
+			Size int64  `json:"size"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Models) != 1 || out.Models[0].Name != "big" || out.Models[0].Size != 81 {
+		t.Errorf("ps = %+v, want big at 81 bytes, the whole of it", out.Models)
 	}
 }
 

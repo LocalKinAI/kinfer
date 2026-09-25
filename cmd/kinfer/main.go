@@ -377,6 +377,7 @@ type serveOpts struct {
 	prefix          prefixFlag
 	maxGen, maxWait time.Duration
 	keepAlive       time.Duration
+	flex            bool
 }
 
 // prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
@@ -434,6 +435,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.DurationVar(&o.maxGen, "max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
 	fs.DurationVar(&o.maxWait, "max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
 	fs.DurationVar(&o.keepAlive, "keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
+	fs.BoolVar(&o.flex, "flex", true, "give a prompt too long for a slot a longer one: fewer slots, the same tokens, while it runs (false = keep the layout)")
 	return fs, o
 }
 
@@ -453,6 +455,7 @@ func cmdServe(args []string) error {
 	srv := server.New(st, engine.Options{
 		GPULayers: o.ngl, ContextSize: o.nCtx, Slots: o.slots, PrefixSlots: int(o.prefix),
 		MaxQueue: o.queue, MaxGenerate: noLimit(o.maxGen), MaxWait: noLimit(o.maxWait),
+		FixedLayout: !o.flex,
 	})
 	srv.SetKeepAlive(o.keepAlive)
 	defer srv.Close()
@@ -462,6 +465,9 @@ func cmdServe(args []string) error {
 	switch {
 	case o.slots > 0 && o.nCtx > 0:
 		fmt.Printf("  %d slots × %d tokens — conversations share one forward pass\n", o.slots, o.nCtx)
+		if o.flex && o.slots > 1 {
+			fmt.Printf("  a prompt too long for one takes fewer, longer slots while it runs; -flex=false keeps the layout\n")
+		}
 	default:
 		fmt.Printf("  slots and context are sized to each model as it loads — the sizing line says what it chose\n")
 	}

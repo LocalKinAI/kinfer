@@ -166,7 +166,42 @@ Only a prompt whose system prompt, request and newest turn do not fit by
 themselves is refused, with a 413.
 
 `kinfer plan <model>` prints the same decision without loading anything.
-Explicit `-ctx` and `-slots` are never second-guessed.
+Explicit `-ctx` and `-slots` are never second-guessed: they are the layout the
+server starts in and comes back to. The next section is the one way it leaves it.
+
+### A prompt too long for its slot gets a longer one
+
+llama.cpp splits a context evenly between its slots, so `-ctx 16384 -slots 4` is
+four conversations of 16384, and the longest prompt it takes is a quarter of the
+cache. On the box a 44,555-token prompt was refused with a 413 although the cache
+held 65,536 tokens in all. Giving every slot 65,536 does not fit there: 8.2 GiB
+of cache where the weights leave 4.4.
+
+So the total stays the same and the shape changes. A prompt that will not run
+whole in a slot waits for the slots to finish what they are doing, and the cache
+is rebuilt as the most slots that still hold it:
+
+```
+slots: 65536 tokens of context as 4 x 16384; a prompt that needs a longer slot gets 3 x 21760, 2 x 32768, 1 x 65536 while it runs — the rest wait, and 4 x 16384 comes back when nothing needs the longer slots. -flex=false keeps 4 x 16384.
+slots: 4 x 16384 -> 1 x 65536 for a 44555-token prompt (it queued 10.9s; the cache was rebuilt in 224ms, leaving 10.1 GiB free (this process only))
+slots: 1 x 65536 -> 4 x 16384 — nothing running needs the longer slots (it queued 1m56.3s; the cache was rebuilt in 223ms, leaving 9.8 GiB free (this process only))
+slots: 4 x 16384 -> 2 x 32768 for a 27174-token prompt (it queued 2m4s; the cache was rebuilt in 246ms, leaving 10.0 GiB free (this process only))
+```
+
+The weights stay where they are; only the cache is reallocated, in about a quarter
+of a second on the box. (The free memory in those lines is with the box's GPU budget
+raised to 86 GiB that day; at macOS's default the same cache leaves about 1.6.) The request at the head of the queue decides, and nothing
+behind it is admitted until it has its slot, so short requests arriving after a
+long one cannot starve it. While it runs, a short request that finds a free longer
+slot takes it rather than wait. Once nothing running needs the longer slots, the
+next request that wants more of them brings the layout back the same way.
+
+What it costs is waiting. A long prompt waits for the slots to drain, and the
+requests that arrive meanwhile wait for it. A prompt no layout holds whole gets the
+longest slot on offer and loses its oldest turns there, as above. A layout that
+would leave less memory than the loaded one did is refused before any batch runs
+in it, and not tried again. The prefix pool lives only in the loaded layout.
+`-flex=false` keeps the layout fixed.
 
 ### `kinfer install` keeps the server up
 
@@ -181,6 +216,13 @@ installed ~/Library/LaunchAgents/ai.localkin.kinfer.plist
   log : ~/.kinfer/serve.log
   starts at login and restarts if it exits; kinfer uninstall removes it
 ```
+
+`-keepalive 0` keeps the model resident for good, which suits a machine that does
+nothing else. On one that is shared, give it a time instead. The box's job ran with
+`-keepalive 0`, so a 73.4 GiB model held most of a 96 GB machine around the clock,
+and an Ollama model and a ComfyUI job that other sessions ran there stalled or failed
+against it. Installed with `-keepalive 10m` now, it gives the memory back ten
+minutes after its last request, and the next request loads it again.
 
 It is a per-user launchd job — no sudo, the same arrangement Ollama's app uses —
 started at login and restarted within seconds of any exit (measured: `kill -9`,

@@ -5,6 +5,47 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### A long prompt gets a longer slot
+
+`-ctx 16384 -slots 4` on the box refused a 44,555-token prompt with a 413 while
+the cache held 65,536 tokens in all: llama.cpp splits a context evenly between
+its sequences, so the longest prompt a server took was a quarter of its cache.
+Giving every slot the whole 65,536 was measured and does not fit: 8.2 GiB of
+cache where the weights leave 4.4 under macOS's default GPU budget. With the
+budget raised to 86 GiB it loaded, and the first decode still died with
+`kIOGPUCommandBufferCallbackErrorOutOfMemory`, because another process on the
+machine was holding 20 GB at the time.
+
+So the cache keeps its total and changes its shape. The layout the server loaded
+with is home. A prompt that will not run whole in a home slot waits for the slots
+to drain, and the context is rebuilt as the most slots that still hold it: 3 x
+21760, 2 x 32768 or 1 x 65536 on the box. Once nothing running needs the longer
+slots, home is rebuilt. The request at the head of the queue decides and nothing
+behind it is admitted until it has its slot, so short requests arriving after a
+long one cannot starve it. While it runs, a short request that finds a free
+longer slot takes it.
+
+Measured on the box with Flash-Next. A 44,555-token prompt queued behind three
+short ones waited 10.9 s for them, got 1 x 65536 in 224 ms, and answered whole:
+95 s to read it, then 24 tok/s. The two short requests queued behind it got 4 x
+16384 back in 223 ms. A 27,174-token prompt got 2 x 32768 in 246 ms, with a short
+request riding in the other slot. Four short requests at once in the home layout
+still run at 14 tok/s each, as before. A layout that would leave less memory than
+home did is refused before any batch runs in it, and not tried again. The prefix
+pool lives only in home. `-flex=false` keeps the layout fixed.
+
+Also:
+
+- **`/api/ps` named a split model by its first file.** It reported
+  `…-00001-of-00003`, which `/api/tags` does not list and a request does not
+  resolve, so an unload by the name `ps` gave found nothing. It also sized the
+  model at the first file's 11 MB of 73.5 GB. It now names and sizes the model
+  the way `/api/tags` does.
+- **`kinfer_slots_total` in `/metrics` reports the current layout**, not the one
+  the model loaded with.
+- **The context belongs to the scheduler.** It frees and rebuilds the context on
+  a layout change, and hands whichever one it holds last to the engine to free.
+
 ### Four places Ollama answered differently, and a caller paid for it
 
 A night of deep-study runs on the box — a local worker writing citation cards

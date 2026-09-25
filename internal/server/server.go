@@ -723,22 +723,36 @@ func (s *Server) handlePS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	var loaded []entry
+	var path string
+	var expiry time.Time
 	if s.cur != nil {
-		e := entry{Name: modelName(s.cur.path), Model: modelName(s.cur.path)}
-		if fi, err := os.Stat(s.cur.path); err == nil {
-			e.Size = fi.Size()
-		}
-		if !s.expiry.IsZero() {
-			t := s.expiry
-			e.ExpiresAt = &t
-		}
-		loaded = append(loaded, e)
+		path, expiry = s.cur.path, s.expiry
 	}
 	s.mu.Unlock()
 
-	if loaded == nil {
-		loaded = []entry{}
+	loaded := []entry{}
+	if path != "" {
+		e := entry{Name: modelName(path), Model: modelName(path)}
+		if fi, err := os.Stat(path); err == nil {
+			e.Size = fi.Size()
+		}
+		// A split model is loaded from its first piece, and was reported as
+		// that piece: named "…-00001-of-00003", which is not a name /api/tags
+		// lists or a request resolves — so unloading it by the name ps gave
+		// did not find it — and sized at the first 11 MB of a 73.5 GB model.
+		// The store knows it as the whole; report it that way.
+		if models, err := s.store.All(); err == nil {
+			for _, m := range models {
+				if m.Path == path {
+					e.Name, e.Model, e.Size = m.Name, m.Name, m.Size
+					break
+				}
+			}
+		}
+		if !expiry.IsZero() {
+			e.ExpiresAt = &expiry
+		}
+		loaded = append(loaded, e)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": loaded})
 }

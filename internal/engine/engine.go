@@ -88,6 +88,12 @@ type Options struct {
 	// Template forces a chat family ("chatml", "llama3", "mistral").
 	// Empty means guess from the filename.
 	Template string
+
+	// FixedLayout keeps the slots and context the model loaded with. Without
+	// it a prompt too long for a slot gets a longer one: the context is rebuilt
+	// as fewer slots holding the same number of tokens while that prompt runs,
+	// and rebuilt as it was once nothing needs them. See flex.go.
+	FixedLayout bool
 }
 
 // GenParams control one generation.
@@ -235,13 +241,14 @@ func DefaultGenParams() GenParams {
 type Engine struct {
 	mu    sync.Mutex
 	model llama.Model
-	lctx  llama.Context
 	vocab llama.Vocab
 	tpl   *chat.Template
 	path  string
-	nCtx  int // per conversation
-	slots int
+	nCtx  int // per conversation, in the layout it loaded with
+	slots int // likewise; the scheduler's layout can change, see Slots
 
+	// sched owns the llama.cpp context: it rebuilds it when the layout
+	// changes, so the context it holds when it stops is the one to free.
 	sched *scheduler
 
 	// broken is set when llama.cpp reports a fatal decode. The context cannot
@@ -386,7 +393,6 @@ sizing:
 	vocab := llama.GetVocab(model)
 	e := &Engine{
 		model: model,
-		lctx:  lctx,
 		vocab: vocab,
 		tpl:   tpl,
 		path:  path,
@@ -403,13 +409,53 @@ sizing:
 	if recurrent && prefix > 0 {
 		log.Printf("prefix pool: whole prompts only — this model keeps recurrent state, which cannot be cut back to a shorter prefix")
 	}
-	e.sched = newScheduler(lctx, vocab, tpl, slots, prefix, e.nCtx, batchCapacity, queue,
+
+	home := layout{slots: slots, prefix: prefix, perSeq: e.nCtx, shared: shared}
+	var fx *flex
+	if !opts.FixedLayout {
+		fx = newFlex(home, shape.TrainedCtx, contextBuilder(model, home, bud))
+	}
+	if fx != nil {
+		log.Printf("slots: %d tokens of context as %s; a prompt that needs a longer slot gets %s while it runs "+
+			"— the rest wait, and %s comes back when nothing needs the longer slots. -flex=false keeps %s.",
+			fx.total, home, fx.offers(), home, home)
+	}
+
+	e.sched = newScheduler(lctx, home, vocab, tpl, batchCapacity, queue,
 		deadlines{
 			generate: pick(opts.MaxGenerate, DefaultMaxGenerate),
 			wait:     pick(opts.MaxWait, DefaultMaxWait),
-		}, recurrent)
+		}, recurrent, fx)
 	e.sched.onFatal = func() { e.broken.Store(true) }
 	return e, nil
+}
+
+// contextBuilder makes the contexts a changing layout needs, from the model
+// already loaded and against the budget measured while loading it.
+//
+// A layout other than home is refused if it would leave less memory than home
+// did (or than the warning line, if home left more), less reshapeSlack. It
+// holds the same tokens, so it should cost about the same; if it does not, the
+// place to find out is here, before any batch runs in it — a batch that cannot
+// allocate retires the whole model (see thinHeadroom).
+func contextBuilder(model llama.Model, home layout, bud *budget) func(layout) (llama.Context, uint64, error) {
+	floor := sub(min(bud.afterCtx, thinHeadroom), reshapeSlack)
+	return func(l layout) (llama.Context, uint64, error) {
+		lctx := newContext(model, l.slots, l.prefix, l.perSeq, l.shared)
+		if lctx == 0 {
+			return 0, 0, errors.New("llama.cpp could not create it (see its output above)")
+		}
+		if got, want := llama.NCtx(lctx), l.perSeq*l.cells(); got < want {
+			llama.FreeContext(lctx)
+			return 0, 0, fmt.Errorf("llama.cpp allocated %d tokens of the %d asked for", got, want)
+		}
+		free := bud.sample()
+		if bud.known && l != home && free < floor {
+			llama.FreeContext(lctx)
+			return 0, 0, fmt.Errorf("it would leave %s free, where %s left %s", gib(free), home, gib(bud.afterCtx))
+		}
+		return lctx, free, nil
+	}
 }
 
 // newContext asks llama.cpp for a cache holding slots+prefix sequences of
@@ -443,8 +489,17 @@ func sharedNote(shared bool) string {
 	return ""
 }
 
-// Slots is how many conversations this engine serves at once.
-func (e *Engine) Slots() int { return e.slots }
+// Slots is how many conversations this engine serves at once — in the layout
+// it has now, which a long prompt can change for as long as it runs.
+func (e *Engine) Slots() int {
+	e.mu.Lock()
+	sched := e.sched
+	e.mu.Unlock()
+	if sched == nil {
+		return e.slots
+	}
+	return int(sched.nSlots.Load())
+}
 
 // Broken reports that llama.cpp's backend failed fatally and this engine can no
 // longer generate. The usual cause is the GPU running out of memory, after
@@ -456,13 +511,14 @@ func (e *Engine) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.sched != nil {
-		// Stop decoding before anything it decodes into is freed.
+		// Stop decoding before anything it decodes into is freed. Once it has
+		// stopped, the context it holds is no longer touched by anything.
 		e.sched.close()
+		if e.sched.lctx != 0 {
+			llama.FreeContext(e.sched.lctx)
+			e.sched.lctx = 0
+		}
 		e.sched = nil
-	}
-	if e.lctx != 0 {
-		llama.FreeContext(e.lctx)
-		e.lctx = 0
 	}
 	if e.model != 0 {
 		llama.FreeModel(e.model)
@@ -484,7 +540,7 @@ func (e *Engine) Load() (waiting, busy, slots int) {
 	if sched == nil {
 		return 0, 0, e.slots
 	}
-	return sched.Waiting(), int(sched.busy.Load()), len(sched.slots)
+	return sched.Waiting(), int(sched.busy.Load()), int(sched.nSlots.Load())
 }
 
 // PromptTokens and EvalTokens are what this engine has processed since it
