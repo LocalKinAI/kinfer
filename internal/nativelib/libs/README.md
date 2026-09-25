@@ -1,9 +1,17 @@
 # Native libraries live here
 
 This directory holds the llama.cpp shared libraries that get embedded into the
-kinfer binary. It ships empty — they are ~8.2 MB of platform-specific binaries
+kinfer binary. It ships empty — they are 8.8 MB of platform-specific binaries
 that change with every llama.cpp release, so they are fetched rather than
 committed:
+
+```bash
+scripts/fetch-libs.sh            # the build internal/llama was checked against
+scripts/fetch-libs.sh b11200     # another release, once its llama.h is checked
+scripts/fetch-libs.sh -f         # fetch again
+```
+
+What it does, for when it has to be done by hand:
 
 ```bash
 V=b11175
@@ -43,10 +51,12 @@ beside a new one makes which version loads depend on directory order.
 **Upgrading llama.cpp means checking the structs.** `internal/llama` mirrors
 `llama_model_params`, `llama_context_params`, `llama_batch` and
 `llama_sampler_chain_params` field for field. Between b6862 and b10901 both
-param structs changed shape. `bind` asserts each size at startup and `Open`
-verifies `n_ctx` after every load, so a mismatch is a clear error rather than
-silent corruption — but the fix is still to re-transcribe from the new
-`include/llama.h`.
+param structs changed shape; between b10901 and b11175 nothing kinfer binds
+did (llama.h only gained functions). `bind` asserts each size at startup and
+`Open` verifies `n_ctx` after every load, so a mismatch is a clear error rather
+than silent corruption — but the fix is still to re-transcribe from the new
+`include/llama.h`. Diff it first: `fetch-libs.sh` will fetch any build asked
+for, checked or not.
 
 **This file is not decoration.** `//go:embed all:libs` fails at compile time if
 the directory does not exist, and git does not track empty directories — so

@@ -16,7 +16,9 @@ official llama-server of kinfer's embedded build, b10901 — the same library
 byte for byte — ran at 83.8. The official b11175 ran at 106–108. llama.h between
 the two only gained functions; nothing kinfer binds changed shape.
 
-Now embedded: b11175. And the micro-batch is Ollama's rule (automaticGenerationBatch
+Now embedded: b11175, fetched by `scripts/fetch-libs.sh`, which puts the eight
+libraries (8.8 MB) where they are embedded and removes any other version. And
+the micro-batch is Ollama's rule (automaticGenerationBatch
 in its server/sched.go): 2048 tokens a pass for a context over 32768, 1024 over
 4096, stepped down while the model and its cache are more than 60% (or 75%) of
 the GPU budget or the extra memory the bigger pass takes is not there; `-batch`

@@ -349,21 +349,19 @@ onto libffi.
 ## Build
 
 ```bash
-# Fetch the native libraries once, into the package that embeds them.
-# Copy the versioned sonames, not the plain names: llama.cpp's macOS builds
-# reference @rpath/libggml.0.dylib, and //go:embed cannot carry the symlinks
-# that the release tarball uses for the unversioned names.
-V=b11175
-curl -sfL "https://github.com/ggml-org/llama.cpp/releases/download/$V/llama-$V-bin-macos-arm64.tar.gz" \
-    | tar xz -C /tmp
-mkdir -p internal/nativelib/libs/darwin_arm64_$V
-for f in libllama libggml libggml-base libggml-cpu libggml-blas libggml-metal libggml-rpc libmtmd; do
-    cp -L /tmp/llama-$V/$f.0.dylib internal/nativelib/libs/darwin_arm64_$V/
-done
+# Fetch llama.cpp's libraries once, into the package that embeds them
+# (8 files, 8.8 MB; they are not committed — every upgrade is a new set).
+scripts/fetch-libs.sh
 
-# The libraries end up inside the binary
+# The libraries end up inside the binary (19 MB in all)
 go build -o kinfer ./cmd/kinfer
 ```
+
+`scripts/fetch-libs.sh` takes the llama.cpp build kinfer is checked against
+(b11175) from the official release, copies the eight `.0.dylib` files into
+`internal/nativelib/libs/darwin_arm64_b11175/`, and removes any other version
+there. Run it with `-f` to fetch again, or with a build number to try another
+release — after diffing its `llama.h`; see `internal/nativelib/libs/README.md`.
 
 ## Measured on M-series (Qwen2.5-0.5B Q4_K_M)
 

@@ -9,12 +9,11 @@
 
 # Native llama.cpp libraries.
 #
-# These are 4.6 MB of platform-specific binaries that change with every
+# These are 8.8 MB of platform-specific binaries that change with every
 # llama.cpp release; committing them would bloat history for no benefit since
 # they are one command away:
 #
-#   go run github.com/dianlight/gollama.cpp/cmd/gollama-download \
-#       -download -copy-libs -libs-dir internal/nativelib/libs
+#   scripts/fetch-libs.sh
 #
 # The directory itself must survive, though: `//go:embed all:libs` fails to
 # compile when the path does not exist. Hence the README exception below.
