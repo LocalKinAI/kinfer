@@ -43,10 +43,12 @@ type fakeEngine struct {
 	mu     sync.Mutex
 	closed bool
 	inChat bool
+	params engine.GenParams // what the last request asked the engine for
 }
 
-func (f *fakeEngine) Chat(ctx context.Context, _ []chat.Message, _ engine.GenParams, onToken func(string)) (string, error) {
+func (f *fakeEngine) Chat(ctx context.Context, _ []chat.Message, p engine.GenParams, onToken func(string)) (string, error) {
 	f.mu.Lock()
+	f.params = p
 	if f.closed {
 		f.mu.Unlock()
 		// The real engine segfaults here. Returning an error makes the failure

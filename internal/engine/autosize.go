@@ -83,11 +83,15 @@ func AutoSize(sh store.Shape, free uint64, slots, prefix, perSeq int) (Plan, err
 	} else if prefix == 0 {
 		prefix = DefaultPrefixSlots
 	}
+	known := sh.CacheBytes(1024) != 0 && free != 0
 	if slots > 0 && perSeq > 0 {
+		if prefixAuto && known {
+			return poolAround(sh, spendableOf(free), slots, prefix, perSeq), nil
+		}
 		return Plan{Slots: slots, Prefix: prefix, PerSeq: perSeq,
 			Estimated: sh.CacheBytesFor(perSeq*(slots+prefix), slots+prefix)}, nil
 	}
-	if sh.CacheBytes(1024) == 0 || free == 0 {
+	if !known {
 		if slots <= 0 {
 			slots = DefaultSlots
 		}
@@ -97,7 +101,7 @@ func AutoSize(sh store.Shape, free uint64, slots, prefix, perSeq int) (Plan, err
 		return Plan{Slots: slots, Prefix: prefix, PerSeq: perSeq}, nil
 	}
 
-	spendable := int64(min(free/2, sub(free, thinHeadroom)))
+	spendable := spendableOf(free)
 	capCtx := sh.TrainedCtx
 	if capCtx <= 0 {
 		capCtx = 32768
@@ -151,6 +155,41 @@ func AutoSize(sh store.Shape, free uint64, slots, prefix, perSeq int) (Plan, err
 		return last, nil // one slot, a short context: it will answer something
 	}
 	return Plan{}, fmt.Errorf("no room for a context: %s left after the weights", store.HumanSize(int64(free)))
+}
+
+// spendableOf is what the cache may cost: half of what the weights left, and
+// never the last thinHeadroom of it. The other half is for company — see the
+// policy at the top of this file.
+func spendableOf(free uint64) int64 {
+	return int64(min(free/2, sub(free, thinHeadroom)))
+}
+
+// poolAround sizes an automatic prefix pool around conversations the operator
+// fixed with -slots and -ctx. Their numbers are theirs and stand; the pool is
+// ours, and it gets only what they leave.
+//
+// It used to get DefaultPrefixSlots entries whatever that cost, because a
+// fixed -slots and -ctx returned before any arithmetic. On the box,
+// `-ctx 16384 -slots 4` with the pool left automatic asked for eight sequences
+// of 16384: 0.0 GiB left after loading, and the first request failed inside
+// llama.cpp (code -3). Now the pool takes cells of its own if they fit, shares
+// the slots' cells if only that fits, and is left out if neither does — the
+// operator's conversations never pay for a pool nobody asked for. The measured
+// check in Open backs this up, because a hybrid model's cache can cost more
+// than this estimate.
+func poolAround(sh store.Shape, spendable int64, slots, want, perSeq int) Plan {
+	most := min(want, max(slots/2, 1))
+	for p := most; p >= 1; p-- {
+		if c := sh.CacheBytesFor(perSeq*(slots+p), slots+p); c <= spendable {
+			return Plan{Slots: slots, Prefix: p, PerSeq: perSeq, Estimated: c}
+		}
+	}
+	for p := most; p >= 1; p-- {
+		if c := sh.CacheBytesFor(perSeq*slots, slots+p); c <= spendable {
+			return Plan{Slots: slots, Prefix: p, PerSeq: perSeq, SharedPool: true, Estimated: c}
+		}
+	}
+	return Plan{Slots: slots, PerSeq: perSeq, Estimated: sh.CacheBytesFor(perSeq*slots, slots)}
 }
 
 // sizedPlan is the largest context s slots and p pool entries fit in, capped

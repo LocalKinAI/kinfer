@@ -97,7 +97,12 @@ qwen2.5-0.5b-instruct-q4_k_m                   468.6 MB  5m0s
 ```
 
 An idle model is unloaded after `-keepalive` (default 5 minutes), because a 7B
-left resident forever owns most of a 16 GB machine. `-local` skips the daemon
+left resident forever owns most of a 16 GB machine. A request can say otherwise,
+the way Ollama's do: `keep_alive` on a chat request is how long the model stays
+after it (seconds, `"5m"`, or negative for forever), and
+`POST /api/generate {"model": m, "keep_alive": 0}` — what `ollama stop` sends —
+unloads it, answering once the memory is free. The flag's `0` means never; the
+request's `0` means now, as it does in Ollama. `-local` skips the daemon
 and loads in-process, which is how you see llama.cpp's own stderr when the
 question is why a model failed to load.
 
@@ -522,8 +527,15 @@ one differed — an arithmetic question the model was genuinely torn on, where t
 pooled answer happened to be the better one. Nothing is misaligned: a prompt
 reused in full still lets the model quote the last sentence of its own system
 prompt, which a position error would destroy. What is lost is the guarantee that
-a fixed seed reproduces a previous run exactly, so `-prefix -1` turns the pool
+a fixed seed reproduces a previous run exactly, so `-prefix off` turns the pool
 off for callers who need it.
+
+`-prefix` takes `auto` (the default), `off`, or a number of entries. A number is
+taken as given. `auto` gets only the memory the conversations leave: with
+`-slots` and `-ctx` both set, the pool takes cells of its own if they fit, shares
+the slots' cells if only that fits, and is left out otherwise — `-prefix 0`
+used to mean "sized with the rest", and on a 96 GB box running a 73.4 GiB model
+that sized four entries of 16384 into 0.0 GiB. `0` now means none, like `off`.
 
 ## Chat templates come from the model
 
@@ -630,16 +642,20 @@ POST /api/chat  {"think": true, …}
              "thinking":"The user asks \"What is 2+2?\" and wants just the number…"}}
 ```
 
-Without `think`, the working out is split off and dropped, so `content` is the
-answer and nothing else.
+Without `think` the model thinks, and the working out comes back in `thinking`
+as it does from Ollama; `content` is the answer and nothing else either way.
+`"think": false` keeps the model out of its think block altogether. Dropping the
+thinking when the field was absent — the old behaviour — returned an empty reply
+with nothing to show for it whenever a reasoning model ran out of time.
 
 A reasoning model can spend an entire token budget thinking and return an empty
 answer, so a reply cut short by the budget reports `done_reason: "length"` —
 `finish_reason` in the OpenAI dialect — rather than `"stop"`. Told a truncated
 reply completed normally, a caller has no way to tell it from a model that had
 nothing to say. Streaming separates them as they arrive rather than
-buffering the reply. The OpenAI dialect uses `reasoning_content`, the field
-DeepSeek introduced and most clients now look for.
+buffering the reply. The OpenAI dialect returns it as both `reasoning`, the
+field Ollama's own `/v1` writes, and `reasoning_content`, the one DeepSeek
+introduced and most clients now look for.
 
 Thinking is split before tool calls are parsed, so a `<tool_call>` the model
 merely considered while reasoning is not mistaken for one it made. All three
@@ -711,9 +727,10 @@ caller back at the same invented moment.
 
 **A clock on every request.** `-max-gen` (default 5m) bounds one reply;
 `-max-wait` (same) bounds how long it may queue before being refused rather than
-given a slot. Without them a caller could pass `num_predict` meaning "keep
-going" and hold a slot for over 400 seconds — eight of those is the whole
-server. A reply cut off by the clock returns its text with
+given a slot. There is no token ceiling unless a caller names one — no
+`num_predict` means until the model stops or its slot is full, as in Ollama — so
+the clock is what bounds a runaway reply. Without it a single request could hold
+a slot for over 400 seconds — eight of those is the whole server. A reply cut off by the clock returns its text with
 `done_reason: "timeout"`, because `"stop"` would claim the model finished and
 `"length"` would claim it hit the budget it was given.
 

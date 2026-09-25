@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -201,7 +202,7 @@ func cmdRun(args []string) error {
 	ngl := fs.Int("ngl", 99, "layers to offload to GPU (0 = CPU only)")
 	nCtx := fs.Int("ctx", 0, "context size in tokens (0 = sized to the model and this machine)")
 	system := fs.String("system", "", "system prompt")
-	maxTok := fs.Int("n", 512, "maximum tokens to generate")
+	maxTok := fs.Int("n", 0, "maximum tokens to generate (0 = until the model stops, as `ollama run` does)")
 	addr := fs.String("addr", defaultAddr, "daemon address")
 	keepAlive := fs.Duration("keepalive", 5*time.Minute, "how long the daemon keeps an idle model loaded")
 	local := fs.Bool("local", false, "load the model in this process instead of using a daemon")
@@ -370,11 +371,55 @@ func cmdPS(args []string) error {
 // struct so that `kinfer install` can run the same flag set over the arguments
 // it is about to record, and refuse a typo before launchd meets it.
 type serveOpts struct {
-	addr                 string
-	ngl, nCtx            int
-	slots, prefix, queue int
-	maxGen, maxWait      time.Duration
-	keepAlive            time.Duration
+	addr            string
+	ngl, nCtx       int
+	slots, queue    int
+	prefix          prefixFlag
+	maxGen, maxWait time.Duration
+	keepAlive       time.Duration
+}
+
+// prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
+// is the engine's convention — 0 auto, negative off, n > 0 exactly n.
+//
+// It was an int where 0 meant "sized with the rest" and -1 meant off. Read
+// cold, 0 says none: on the box, `-ctx 16384 -slots 4 -prefix 0` was typed to
+// turn the pool off, and sized it at four entries of 16384 tokens instead —
+// 0.0 GiB left, and the first request failed in llama.cpp (code -3). So the
+// flag takes words, 0 means what it looks like, and -1 still means off for the
+// installs that recorded it.
+type prefixFlag int
+
+func (p *prefixFlag) String() string {
+	switch {
+	case *p == 0:
+		return "auto"
+	case *p < 0:
+		return "off"
+	default:
+		return strconv.Itoa(int(*p))
+	}
+}
+
+func (p *prefixFlag) Set(v string) error {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "auto":
+		*p = 0
+		return nil
+	case "off", "none", "no", "false":
+		*p = -1
+		return nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return fmt.Errorf(`want "auto", "off", or a number of entries`)
+	}
+	if n <= 0 {
+		*p = -1 // zero entries is no pool; -1 was the old way of saying so
+	} else {
+		*p = prefixFlag(n)
+	}
+	return nil
 }
 
 func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
@@ -384,7 +429,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.IntVar(&o.ngl, "ngl", 99, "layers to offload to GPU (0 = CPU only)")
 	fs.IntVar(&o.nCtx, "ctx", 0, "context size per conversation, in tokens (0 = as much as the model and the memory allow)")
 	fs.IntVar(&o.slots, "slots", 0, "conversations served at once (0 = 8, or fewer if memory is tight; use 8, 32, 64 or 128 — never 12-16)")
-	fs.IntVar(&o.prefix, "prefix", 0, "prompt prefixes kept resident so repeat requests skip prefilling them (0 = sized with the rest, -1 disables)")
+	fs.Var(&o.prefix, "prefix", "prompt prefixes kept resident so repeat requests skip prefilling them: auto (sized to the memory the slots leave), off, or a number")
 	fs.IntVar(&o.queue, "queue", engine.DefaultMaxQueue, "requests that may wait for a slot before the server answers 503")
 	fs.DurationVar(&o.maxGen, "max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
 	fs.DurationVar(&o.maxWait, "max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
@@ -406,7 +451,7 @@ func cmdServe(args []string) error {
 		return err
 	}
 	srv := server.New(st, engine.Options{
-		GPULayers: o.ngl, ContextSize: o.nCtx, Slots: o.slots, PrefixSlots: o.prefix,
+		GPULayers: o.ngl, ContextSize: o.nCtx, Slots: o.slots, PrefixSlots: int(o.prefix),
 		MaxQueue: o.queue, MaxGenerate: noLimit(o.maxGen), MaxWait: noLimit(o.maxWait),
 	})
 	srv.SetKeepAlive(o.keepAlive)

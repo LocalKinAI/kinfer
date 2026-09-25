@@ -78,6 +78,11 @@ type lease struct {
 	eng  generator
 	path string
 	refs int
+
+	// keepAlive is what the last request to finish with this model asked for,
+	// in Ollama's terms (see parseKeepAlive); nil when it named nothing, and the
+	// server's own -keepalive applies.
+	keepAlive *time.Duration
 }
 
 // generator is the part of engine.Engine this package uses.
@@ -118,6 +123,7 @@ func (s *Server) Handler() http.Handler {
 
 	// Ollama dialect.
 	mux.HandleFunc("/api/chat", s.handleOllamaChat)
+	mux.HandleFunc("/api/generate", s.handleOllamaGenerate)
 	mux.HandleFunc("/api/tags", s.handleOllamaTags)
 	mux.HandleFunc("/api/ps", s.handlePS)
 	mux.HandleFunc("/api/show", s.handleShow)
@@ -190,21 +196,45 @@ func (s *Server) dropLocked(l *lease) {
 // but nobody is using it. That is the moment the clock should start.
 func (s *Server) armIdleLocked() {
 	s.stopIdleLocked()
-	if s.keepAlive <= 0 || s.cur == nil || s.cur.refs != 1 {
+	if s.cur == nil || s.cur.refs != 1 {
 		return
 	}
 	l := s.cur
-	s.expiry = time.Now().Add(s.keepAlive)
-	s.idle = time.AfterFunc(s.keepAlive, func() {
+	d, forever := s.idleForLocked(l)
+	if forever {
+		return
+	}
+	s.expiry = time.Now().Add(d)
+	s.idle = time.AfterFunc(d, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		// Re-check under the lock: a request may have arrived while the timer
 		// was firing, in which case the model is in use again.
 		if s.cur == l && l.refs == 1 {
-			log.Printf("unloading %s after %s idle", l.path, s.keepAlive)
+			log.Printf("unloading %s after %s idle", l.path, d)
 			s.retireLocked()
 		}
 	})
+}
+
+// idleForLocked is how long l may sit idle before it is unloaded, or forever.
+//
+// The -keepalive flag and a request's keep_alive disagree about zero, and each
+// keeps its own meaning. The flag's zero is "forever": `kinfer install` records
+// -keepalive 0 for a machine that serves a fleet. The request field is Ollama's
+// wire format, where zero is "unload now" — the idiom `ollama stop` and every
+// script that frees memory for another model send — so there it means that.
+func (s *Server) idleForLocked(l *lease) (d time.Duration, forever bool) {
+	if l.keepAlive != nil {
+		if *l.keepAlive < 0 {
+			return 0, true
+		}
+		return *l.keepAlive, false
+	}
+	if s.keepAlive <= 0 {
+		return 0, true
+	}
+	return s.keepAlive, false
 }
 
 func (s *Server) stopIdleLocked() {
@@ -294,11 +324,15 @@ type ollamaChatRequest struct {
 	Options  *ollamaOptions `json:"options"`
 	Tools    []tools.Tool   `json:"tools"`
 
-	// Think asks for a reasoning model's working out to be returned separately
-	// rather than dropped. Ollama takes true/false or a level string; only
-	// presence matters here, since kinfer does not instruct the model either
-	// way — it splits whatever the model produced.
+	// Think is Ollama's switch for a reasoning model: false keeps it out of its
+	// think block (see thinkOff); true, a level string, or nothing at all lets
+	// it think and returns the thinking in message.thinking (see wantThinking).
 	Think json.RawMessage `json:"think"`
+
+	// KeepAlive is how long the model stays loaded after this request, in
+	// Ollama's terms: see parseKeepAlive. With no messages, the request only
+	// loads the model — or, at zero, unloads it.
+	KeepAlive json.RawMessage `json:"keep_alive"`
 }
 
 type ollamaMsg struct {
@@ -314,10 +348,6 @@ type ollamaCall struct {
 	Function tools.Call `json:"function"`
 }
 
-// wantThinking reports whether the caller asked to see a reasoning model's
-// working out. Absent or false, it is split off and dropped: it is not the
-// reply, and a client that prints replies verbatim would show the model talking
-// to itself.
 // thinkOff reports that the caller explicitly asked for no thinking — a JSON
 // false, or the string "false" Ollama also accepts.
 //
@@ -336,9 +366,21 @@ func thinkOff(raw json.RawMessage) bool {
 	return json.Unmarshal(raw, &s) == nil && s == "false"
 }
 
+// wantThinking reports whether a reasoning model's working out goes back to the
+// caller, in its own field — message.thinking here, reasoning and
+// reasoning_content in the OpenAI dialect — never mixed into the reply.
+//
+// Absent means yes, as it does in Ollama (measured against 0.34.3 on the box:
+// no "think" field, and the reply carries the model's thinking beside a clean
+// content). It used to mean no: the model still thought, since absent is not
+// off (see thinkOff), but the thinking was split off and dropped. A caller then
+// got an empty reply with nothing to show why — measured on Flash-Next behind a
+// wall-clock limit, 3,143 tokens generated, 0 characters of thinking and 0 of
+// content returned. Dropping it also never protected anyone: a client that
+// prints content verbatim does not print a field it does not know about.
 func wantThinking(raw json.RawMessage) bool {
 	if len(raw) == 0 {
-		return false
+		return true
 	}
 	var b bool
 	if json.Unmarshal(raw, &b) == nil {
@@ -448,6 +490,24 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	keepAlive, err := parseKeepAlive(req.KeepAlive)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// No messages: Ollama's way of loading a model ahead of use, and with
+	// keep_alive 0 of unloading it.
+	if len(req.Messages) == 0 {
+		reason, status, err := s.loadOrUnload(req.Model, keepAlive)
+		if err != nil {
+			writeJSON(w, status, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, ollamaChatResponse{Model: req.Model, CreatedAt: time.Now(),
+			Message: ollamaMsg{Role: "assistant"}, Done: true, DoneReason: reason})
+		return
+	}
 
 	loadStart := time.Now()
 	eng, release, err := s.acquire(req.Model)
@@ -456,6 +516,9 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	// Runs before release: the model's idle clock starts when the last
+	// request lets go, and it runs for what that request asked.
+	defer s.noteKeepAlive(req.Model, keepAlive)
 	// Whatever acquire took is load time: reading a GGUF off disk, or waiting
 	// behind another request's swap. It is near zero when the model was already
 	// resident, which is the number a caller wants to see.
@@ -810,7 +873,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 		msg := map[string]any{"role": "assistant", "content": content}
 		if wantThinking(req.Think) && thinking != "" {
-			msg["reasoning_content"] = thinking
+			withReasoning(msg, thinking)
 		}
 		finish := openAIFinishReason(st)
 		if len(calls) > 0 {
@@ -841,9 +904,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		thinking, content := chat.SplitThinking(text)
 		msg := map[string]any{"role": "assistant", "content": content}
 		if wantThinking(req.Think) && thinking != "" {
-			// OpenAI has no standard field for this; reasoning_content is what
-			// DeepSeek introduced and what most clients now look for.
-			msg["reasoning_content"] = thinking
+			withReasoning(msg, thinking)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id": id, "object": "chat.completion", "created": created, "model": req.Model,
@@ -899,7 +960,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			chunk(map[string]any{"content": content}, nil)
 		}
 		if showThinking && thinking != "" {
-			chunk(map[string]any{"reasoning_content": thinking}, nil)
+			chunk(withReasoning(map[string]any{}, thinking), nil)
 		}
 	}
 
@@ -959,6 +1020,18 @@ usage:
 	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// withReasoning puts a reasoning model's thinking where OpenAI-dialect clients
+// look for it, and returns m for use inline. OpenAI has no standard field.
+// reasoning_content is DeepSeek's, and most clients built against that API read
+// it; reasoning is what Ollama's own /v1 endpoint writes (0.34.3, measured), so
+// a client that was pointed at Ollama before kinfer finds it where it looked.
+// Both, because a caller that finds neither concludes the model said nothing.
+func withReasoning(m map[string]any, thinking string) map[string]any {
+	m["reasoning_content"] = thinking
+	m["reasoning"] = thinking
+	return m
 }
 
 func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {

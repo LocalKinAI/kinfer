@@ -94,7 +94,8 @@ type Options struct {
 type GenParams struct {
 	sampling.Params
 
-	// MaxTokens caps the reply. 0 means "until the model stops".
+	// MaxTokens caps the reply. 0 (the default) or negative means "until the
+	// model stops or the slot's context is full" — Ollama's num_predict -1.
 	MaxTokens int
 
 	// Tools are the functions the model may ask to have run. They are folded
@@ -209,8 +210,16 @@ const (
 )
 
 // DefaultGenParams are sane conversational defaults.
+//
+// No token ceiling: MaxTokens 0 means the reply runs until the model stops or
+// its slot's context is full, which is Ollama's default too (num_predict -1).
+// The scheduler was written on that premise — what a runaway reply costs is
+// time, and the wall clock bounds that (see deadline.go) — but this default
+// said 512, so a caller that named no budget was cut off at 512 tokens anyway.
+// Measured: a card-writing request whose JSON ran past 512 tokens came back
+// truncated mid-string, done_reason "length", and parsed as zero cards.
 func DefaultGenParams() GenParams {
-	return GenParams{Params: sampling.DefaultParams(), MaxTokens: 512}
+	return GenParams{Params: sampling.DefaultParams(), MaxTokens: 0}
 }
 
 // Engine is one loaded model, ready to answer.
@@ -274,6 +283,9 @@ func Open(path string, opts Options) (*Engine, error) {
 		return nil, err
 	}
 	slots, prefix, perSeq, shared := plan.Slots, plan.Prefix, plan.PerSeq, plan.SharedPool
+	// What was left for us to choose. An explicit flag is never overridden, so
+	// each shrinking step below is taken only where the operator gave no number.
+	slotsAuto, prefixAuto, ctxAuto := opts.Slots <= 0, opts.PrefixSlots == 0, opts.ContextSize <= 0
 	if sized {
 		trained := "unknown"
 		if shape.TrainedCtx > 0 {
@@ -282,11 +294,11 @@ func Open(path string, opts Options) (*Engine, error) {
 		log.Printf("sizing: %d slots + %d prefix x %d tokens each%s — the model was trained for %s, "+
 			"the cache should cost about %s of the %s left. -slots and -ctx override this.",
 			slots, prefix, perSeq, sharedNote(shared), trained, gib(uint64(plan.Estimated)), gib(bud.afterModel))
+	} else if prefixAuto {
+		log.Printf("sizing: %d prefix entries%s around the %d slots x %d tokens asked for — "+
+			"the pool gets only what they leave; -prefix overrides", prefix, sharedNote(shared), slots, perSeq)
 	}
 
-	// What was left for us to choose. An explicit flag is never overridden, so
-	// each shrinking step below is taken only where the operator gave no number.
-	slotsAuto, prefixAuto, ctxAuto := opts.Slots <= 0, opts.PrefixSlots == 0, opts.ContextSize <= 0
 	floor := ctxFloor
 	if shape.TrainedCtx > 0 {
 		floor = min(floor, shape.TrainedCtx)
@@ -306,7 +318,10 @@ sizing:
 		// model it cost two and a half times the estimate. When the measured
 		// cost leaves less than the floor, and the size was ours to choose,
 		// choose smaller: a context is seconds to rebuild, the weights stay.
-		if !sized || !bud.known || bud.afterCtx >= thinHeadroom {
+		// The pool counts as ours to choose even when -slots and -ctx did not:
+		// an automatic pool around fixed conversations is exactly what left the
+		// box at 0.0 GiB, and this loop never ran for it.
+		if !(sized || prefixAuto) || !bud.known || bud.afterCtx >= thinHeadroom {
 			break
 		}
 		measured := fmt.Sprintf("sizing: %d slots + %d prefix x %d tokens%s measured %s, leaving %s",
@@ -321,12 +336,14 @@ sizing:
 			slots /= 2
 			prefix = min(prefix, max(slots/2, 1))
 			log.Printf("%s — %d slots + %d prefix instead, keeping %d tokens each", measured, slots, prefix, perSeq)
-		case perSeq/2 < floor && prefixAuto && prefix > 0 && !shared:
+		// When the context is the operator's, halving it is not ours to do, so
+		// the pool goes first whatever the floor.
+		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0 && !shared:
 			// The pool's own cells go before the pool does: sharing the slots'
 			// cells, it still carries an agent's turns forward.
 			shared = true
 			log.Printf("%s — the prefix pool shares the slots' cells instead, keeping %d tokens each", measured, perSeq)
-		case perSeq/2 < floor && prefixAuto && prefix > 0:
+		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0:
 			prefix--
 			log.Printf("%s — %d prefix instead, keeping %d tokens each", measured, prefix, perSeq)
 		case ctxAuto && perSeq/2 >= 2048:

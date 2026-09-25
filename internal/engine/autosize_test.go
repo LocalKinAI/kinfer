@@ -158,3 +158,58 @@ func TestAutoSizeFallsBackWithoutAShape(t *testing.T) {
 		t.Errorf("got %+v, want the defaults with no estimate", p)
 	}
 }
+
+// freeFor is the memory after the weights that leaves exactly spendable for
+// the cache (see spendableOf).
+func freeFor(spendable int64) uint64 {
+	if spendable >= thinHeadroom {
+		return uint64(2 * spendable)
+	}
+	return uint64(spendable + thinHeadroom)
+}
+
+// An automatic pool around conversations the operator fixed gets only what
+// they leave. It used to get DefaultPrefixSlots entries whatever that cost:
+// `-ctx 16384 -slots 4` on the box asked for eight sequences and left 0.0 GiB.
+func TestAutoSizeFitsAnAutomaticPoolAroundFixedConversations(t *testing.T) {
+	const slots, ctx = 4, 16384
+	base := moe.CacheBytesFor(ctx*slots, slots)
+	shared := moe.CacheBytesFor(ctx*slots, slots+2)
+	dedicated := moe.CacheBytesFor(ctx*(slots+2), slots+2)
+	if !(base < shared && shared < moe.CacheBytesFor(ctx*(slots+1), slots+1)) {
+		t.Fatalf("the shape no longer separates the cases: base %d shared %d", base, shared)
+	}
+
+	for _, c := range []struct {
+		name       string
+		spendable  int64
+		wantPrefix int
+		wantShared bool
+	}{
+		{"room for cells of its own", dedicated, 2, false},
+		{"room only to share the slots' cells", shared, 2, true},
+		{"no room at all", base - 1, 0, false},
+	} {
+		p, err := AutoSize(moe, freeFor(c.spendable), slots, 0, ctx)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if p.Slots != slots || p.PerSeq != ctx {
+			t.Errorf("%s: the operator's %d slots x %d became %d x %d", c.name, slots, ctx, p.Slots, p.PerSeq)
+		}
+		if p.Prefix != c.wantPrefix || p.SharedPool != c.wantShared {
+			t.Errorf("%s: pool %d (shared %v), want %d (shared %v)", c.name, p.Prefix, p.SharedPool, c.wantPrefix, c.wantShared)
+		}
+		// The operator's own conversations cost what they cost; the pool must
+		// not push the plan past that or past the budget, whichever is more.
+		if limit := max(c.spendable, base); p.Estimated > limit {
+			t.Errorf("%s: plan costs %d, over the %d that the slots or the budget allow", c.name, p.Estimated, limit)
+		}
+	}
+
+	// A count the operator typed is theirs, however tight.
+	p, err := AutoSize(moe, freeFor(base-1), slots, 3, ctx)
+	if err != nil || p.Prefix != 3 {
+		t.Errorf("-prefix 3 became %d (%v); explicit numbers are never second-guessed", p.Prefix, err)
+	}
+}

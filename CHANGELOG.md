@@ -5,6 +5,54 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### Four places Ollama answered differently, and a caller paid for it
+
+A night of deep-study runs on the box — a local worker writing citation cards
+from source texts through `/api/chat` — hit four differences from Ollama in a
+row. Each is now what Ollama does, or, for `-prefix`, what it looks like it
+does.
+
+- **Thinking comes back unless it is turned off.** With no `think` field the
+  model still thought — absent is not off — but the thinking was split off and
+  dropped. A reply cut short by the clock then came back with nothing at all:
+  measured on Flash-Next, 3,143 tokens generated, 0 characters of thinking and
+  0 of content. Ollama 0.34.3, asked the same way, returns the thinking in
+  `message.thinking` beside a clean `content` (measured, streamed and not). Now
+  so does kinfer. `think: false` still keeps the model out of its think block.
+  The OpenAI dialect returns it too, as both `reasoning` (Ollama's `/v1` name)
+  and `reasoning_content` (DeepSeek's).
+- **No token ceiling unless the caller names one.** The default was 512, which
+  contradicted the scheduler's own premise that a caller who names no budget
+  gets the rest of its slot, bounded in time by `-max-gen`. Card-writing replies
+  ran past 512 tokens and came back cut off mid-JSON, `done_reason: "length"`,
+  which parsed as zero cards. Ollama's default is `num_predict: -1`. `kinfer run
+  -n` defaults to 0 as well: until the model stops.
+- **A model can be unloaded with one request.** Freeing the box's 73.4 GiB for a
+  second model meant `launchctl bootout` — the whole service down — and a
+  bootstrap afterwards. Ollama does it with the request `ollama stop` sends:
+  `POST /api/generate {"model": m, "keep_alive": 0}`. kinfer now answers that,
+  a prompt-less `/api/generate` that loads a model ahead of use, and both as
+  `/api/chat` with no messages, in Ollama's exact shape (`done_reason` "load" or
+  "unload"). An unload answers once the memory is free; a request still
+  generating finishes first, and nothing loads a second copy meanwhile.
+  `keep_alive` on an ordinary request now governs how long the model stays
+  after it — seconds, `"5m"`, or negative for forever, as Ollama reads it. Its
+  zero means unload; the `-keepalive` flag's zero still means never. Each keeps
+  its own convention, and the code says so where they meet.
+- **`-prefix` takes `auto`, `off` or a number, and `auto` fits.** It was an int
+  where 0 meant "sized with the rest". Typed as `-ctx 16384 -slots 4 -prefix 0`
+  to turn the pool off, it sized four entries of 16384 instead: 0.0 GiB left
+  after loading, and the first request failed inside llama.cpp (code -3). Two
+  things were wrong. The spelling: `0` now means no pool, `-1` still does for
+  installs that recorded it, and unset is `auto`. And `auto` did no arithmetic
+  when `-slots` and `-ctx` were both given — it returned four entries before any
+  check, and the measured check after loading skipped it because the slots and
+  context were not its to change. Now an automatic pool around fixed
+  conversations gets only what they leave: cells of its own if they fit, the
+  slots' cells if only that fits, none otherwise; and the measured check sheds
+  it when the estimate was short. An explicit count is still never
+  second-guessed.
+
 ### Fixed — coding agents run against `serve` with no flags
 
 Codex, pointed at the box's `serve` with Qwen3.8-Flash-Next loaded, got
