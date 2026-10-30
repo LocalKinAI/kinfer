@@ -169,6 +169,22 @@ themselves is refused, with a 413.
 Explicit `-ctx` and `-slots` are never second-guessed: they are the layout the
 server starts in and comes back to. The next section is the one way it leaves it.
 
+A model's files are not always what it holds in memory. DeepSeek-V4.1,
+Qwen3.8-Flash-Next and Gemma 4 carry a table llama.cpp reads from disk a few rows
+a token instead of loading — V4.1's n-gram "Engram" is 111 GB of a 249 GB set.
+`plan`, `fit`, `can-run` and `/api/ps` read the GGUF headers (ranged, for a repo
+on Hugging Face) and count only what stays resident:
+
+```
+$ kinfer plan Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S          on the box, 77.8 GiB budget
+  weights           51.1 GB
+  read from disk    26.8 GB   (a table read a few rows a token: it stays on the SSD, not in memory)
+  left for cache    26.7 GB
+```
+
+Counted as weights, that file was 117.8 MB too large for the box. Loaded, it
+takes 50.7 GiB and decodes at 44.5 tok/s.
+
 ### `-slots` without `-ctx`: each model's context sized the way Ollama sizes one
 
 Ollama gives a request that names no context 262144 tokens on a machine with at

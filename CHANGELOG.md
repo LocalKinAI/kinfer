@@ -5,6 +5,46 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### Sizing counts what stays in memory, not what is on disk
+
+llama.cpp b11998 leaves one table of three architectures on disk and reads it a
+few rows a token: `per_layer_token_embd`, which is DeepSeek-V4.1's 111 GB n-gram
+table, Qwen3.8-Flash-Next's, and Gemma 4's per-layer embeddings — marked
+`TENSOR_READ_LAZY` by their loaders and honoured over 4 GiB. kinfer judged every
+model by its file size, so it counted the table as weights.
+
+The header now says how big the table is. `store.ReadShape` reads the tensor
+offsets of every shard (a split model's table usually sits in a later one, and
+in ISTA's V4.1 layout that file is a link to a shared one) and reports
+`LazyBytes`; the rest is what the model holds.
+
+- `kinfer plan` subtracts it, and says how much is read from disk.
+- `kinfer fit` judges installed models by what they hold.
+- `kinfer can-run`, for these three architectures, reads each quantisation's
+  headers with ranged requests — growing from 256 KB, never the weights — and
+  drops a group that is only a shared table published on its own, such as
+  ISTA's Engram file, which it used to offer as a model to pull.
+- `/api/ps` reports the loaded model's size without the table, as Ollama's does.
+
+On the box, with the ISTA Flash-Next IQ3_S already there (54.8 + 28.8 GB):
+`plan` used to say it did not fit, by 117.8 MB. It now counts 51.1 GiB of
+weights and 26.8 read from disk, and loaded it takes 50.7 GiB of the 77.8 GiB
+budget, leaving 27 GiB for 8 slots + 4 prefix x 32768 and 5.8 free. It decodes
+at 44.5 tok/s (the UD-Q2_K_XL it replaces ran at 41.9 on b11175) and reads a 7,024-token
+prompt at 666 tok/s.
+
+### An exact prefix pool copies whole sequences, and says so
+
+The same load went down on its first pooled prompt: b11998 gave Flash-Next an
+indexed hybrid memory whose `seq_cp` aborts on anything but a whole sequence —
+`GGML_ASSERT(p0 <= 0 && p1 < 0 && "partial seq_cp is not supported")` — and the
+pool asked for `[0, n)`. For a hybrid model the pool only ever copies whole
+sequences already (it adopts whole entries and publishes a slot at the instant
+it holds exactly the checkpoint), so it now asks for `(0, -1)`, which means the
+same thing to every memory. A pool for a plain transformer still copies ranges.
+On the box after the fix, an agent's second turn reused its 3,338-token prompt
+in 0.12 s on Flash-Next (4.76 s cold) and 0.05 s on ornith-1.5:35b (1.54 s).
+
 ### DeepSeek-V4.1 prompts, rendered by kinfer
 
 Loading V4.1 was not serving it. llama.cpp has no V4 chat family, and matched

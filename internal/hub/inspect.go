@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/LocalKinAI/kinfer/internal/store"
 )
 
 // Quant is one quantisation of a model: possibly several files, and the size
@@ -19,6 +21,8 @@ type Quant struct {
 	Repo  string   // where it lives
 	Files []string // in shard order
 	Size  int64
+
+	sizes map[string]int64 // each file's, for reading its header
 }
 
 var shardName = regexp.MustCompile(`-\d{5}-of-\d{5}\.gguf$`)
@@ -72,11 +76,12 @@ func Quants(ctx context.Context, repo string) ([]Quant, error) {
 
 		q := byBase[base]
 		if q == nil {
-			q = &Quant{Name: quantName(f.Name, base), Repo: repo}
+			q = &Quant{Name: quantName(f.Name, base), Repo: repo, sizes: map[string]int64{}}
 			byBase[base] = q
 		}
 		q.Files = append(q.Files, f.Name)
 		q.Size += f.Size
+		q.sizes[f.Name] = f.Size
 	}
 
 	out := make([]Quant, 0, len(byBase))
@@ -232,4 +237,75 @@ func ggufArchitecture(d []byte) (string, error) {
 		return "", fmt.Errorf("truncated GGUF header")
 	}
 	return arch, nil
+}
+
+// Lazy is how much of a quantisation llama.cpp would read from disk as needed
+// rather than hold in memory, for a model of arch; see store.ReadsLazily. It
+// reads every file's header with ranged requests — a few megabytes for the
+// first file, which carries the tokenizer, and far less for the rest.
+//
+// standalone is false when the group's first file is a later piece of some
+// split model: a shared table published on its own, as ISTA ships V4.1's
+// Engram file to be linked in as the last shard of every set. That is
+// something to download beside a model, never a model to choose.
+func (q Quant) Lazy(ctx context.Context, arch string) (lazy int64, standalone bool, err error) {
+	standalone = true
+	for i, f := range q.Files {
+		url := fmt.Sprintf("%s/%s/resolve/main/%s", endpoint(), q.Repo, f)
+		h, err := store.ReadHeader(&rangeReader{ctx: ctx, url: url, next: 256 << 10}, q.sizes[f])
+		if err != nil {
+			return 0, standalone, fmt.Errorf("%s: %w", f, err)
+		}
+		if i == 0 && h.SplitNo > 0 {
+			standalone = false
+		}
+		lazy += h.Lazy(arch)
+	}
+	return lazy, standalone, nil
+}
+
+// rangeReader reads a remote file from its start in ranged requests that
+// double in size, so a header costs what it is and the weights behind it are
+// never fetched.
+type rangeReader struct {
+	ctx  context.Context
+	url  string
+	off  int64
+	next int64
+	buf  []byte
+}
+
+func (r *rangeReader) Read(p []byte) (int, error) {
+	if len(r.buf) == 0 {
+		req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.url, nil)
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", r.off, r.off+r.next-1))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		switch resp.StatusCode {
+		case http.StatusPartialContent:
+		case http.StatusRequestedRangeNotSatisfiable:
+			return 0, io.EOF
+		default:
+			// A 200 would be the whole file, from the start, every time.
+			return 0, fmt.Errorf("%s: %s, not a ranged reply", r.url, resp.Status)
+		}
+		b, err := io.ReadAll(io.LimitReader(resp.Body, r.next))
+		if err != nil {
+			return 0, err
+		}
+		if len(b) == 0 {
+			return 0, io.EOF
+		}
+		r.buf, r.off = b, r.off+int64(len(b))
+		r.next = min(r.next*2, 16<<20)
+	}
+	n := copy(p, r.buf)
+	r.buf = r.buf[n:]
+	return n, nil
 }

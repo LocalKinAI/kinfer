@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 
 	"github.com/LocalKinAI/kinfer/internal/hardware"
@@ -88,7 +89,7 @@ func cmdCanRun(args []string) error {
 	case archFrom == "config.json":
 		// A repo's config.json names the architecture in Hugging Face's
 		// vocabulary, and the GGUF converter renames it: DeepSeek-V4.1 is
-		// "deepseek_v41" there and "deepseek4" in a GGUF. Checking one against
+		// "deepseek_v41" there and "deepseek41" in a GGUF. Checking one against
 		// the other reports models as unrunnable that run perfectly well, so it
 		// is not checked at all — only the GGUF's own name is authoritative.
 		fmt.Printf("  architecture   %-16s (declared by config.json; a GGUF conversion renames it,\n", arch)
@@ -137,31 +138,65 @@ func cmdCanRun(args []string) error {
 	fmt.Printf("  machine        %s\n", hardware.Detect())
 	fmt.Printf("  budget         %s for weights\n\n", store.HumanSize(rec.Budget))
 
+	// For an architecture that reads a table from disk as needed, a file's size
+	// is not what it takes in memory, and only the headers can say how much of
+	// it is that table. They are read here, ranged, for every quantisation.
+	lazy := map[string]int64{}
+	if store.ReadsLazily(arch) {
+		var kept []hub.Quant
+		for _, q := range quants {
+			n, standalone, err := q.Lazy(ctx, arch)
+			if err != nil {
+				fmt.Printf("  (%s: headers unreadable, judged by file size: %v)\n", q.Name, err)
+			}
+			if !standalone {
+				continue // a shared table, linked in beside a model; see hub.Quant.Lazy
+			}
+			lazy[q.Name] = n
+			kept = append(kept, q)
+		}
+		quants = kept
+		sort.SliceStable(quants, func(i, j int) bool {
+			return quants[i].Size-lazy[quants[i].Name] < quants[j].Size-lazy[quants[j].Name]
+		})
+	}
+	resident := func(q hub.Quant) int64 { return q.Size - lazy[q.Name] }
+	fromDisk := func(q hub.Quant) string {
+		if lazy[q.Name] == 0 {
+			return ""
+		}
+		return fmt.Sprintf("  (+%s read from disk)", store.HumanSize(lazy[q.Name]))
+	}
+
 	var fits, toobig []hub.Quant
 	for _, q := range quants {
-		if q.Size <= rec.Budget {
+		if resident(q) <= rec.Budget {
 			fits = append(fits, q)
 		} else {
 			toobig = append(toobig, q)
 		}
 	}
 
+	if len(quants) == 0 {
+		fmt.Printf("  No quantisation here is a model on its own.\n")
+		return nil
+	}
 	if len(fits) == 0 {
-		fmt.Printf("  Nothing fits. The smallest is %s at %s.\n",
-			quants[0].Name, store.HumanSize(quants[0].Size))
+		fmt.Printf("  Nothing fits. The smallest is %s at %s%s.\n",
+			quants[0].Name, store.HumanSize(resident(quants[0])), fromDisk(quants[0]))
 		fmt.Printf("  A mixture-of-experts model is no help here: it activates a fraction\n")
 		fmt.Printf("  of its weights per token, which makes it fast, but routing can reach\n")
 		fmt.Printf("  any expert, so all of them stay resident.\n")
 		return nil
 	}
 
-	fmt.Printf("  %-22s %10s  %s\n", "QUANTISATION", "SIZE", "")
+	fmt.Printf("  %-22s %10s  %s\n", "QUANTISATION", "IN MEMORY", "")
 	for _, q := range fits {
-		fmt.Printf("  %-22s %10s  %s\n", q.Name, store.HumanSize(q.Size), rec.Fits(q.Size))
+		fmt.Printf("  %-22s %10s  %s%s\n", q.Name, store.HumanSize(resident(q)), rec.Fits(resident(q)), fromDisk(q))
 	}
 	if *all {
 		for _, q := range toobig {
-			fmt.Printf("  %-22s %10s  too large\n", q.Name, store.HumanSize(q.Size))
+			fmt.Printf("  %-22s %10s  too large%s\n", q.Name, store.HumanSize(resident(q)), fromDisk(q))
 		}
 	} else if len(toobig) > 0 {
 		fmt.Printf("  (%d larger quantisations hidden — pass -all to see them)\n", len(toobig))

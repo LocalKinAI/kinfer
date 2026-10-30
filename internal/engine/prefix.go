@@ -94,7 +94,8 @@ func newPrefixPool(lctx llama.Context, firstSeq int32, n, minMatch int, exact bo
 		minMatch: minMatch,
 		exact:    exact,
 		share: func(src, dst int32, n int32) {
-			llama.CopySequence(lctx, src, dst, 0, n)
+			p0, p1 := copyBounds(exact, n)
+			llama.CopySequence(lctx, src, dst, p0, p1)
 		},
 		forget: func(seq int32) {
 			llama.ForgetSequence(lctx, seq, -1, -1)
@@ -104,6 +105,22 @@ func newPrefixPool(lctx llama.Context, firstSeq int32, n, minMatch int, exact bo
 		p.entries = append(p.entries, &prefixEntry{seq: firstSeq + int32(i)})
 	}
 	return p
+}
+
+// copyBounds is the range of positions a share copies.
+//
+// An exact pool only ever copies a whole sequence: it adopts whole entries,
+// and it publishes a slot at a checkpoint the instant the slot holds exactly
+// that many positions. So it says "all of it" — (0, -1) — rather than [0, n).
+// The two mean the same, but llama.cpp b11998 gave Qwen3.8-Flash-Next an
+// indexed hybrid memory that accepts only the first: given [0, n) it aborts
+// with "partial seq_cp is not supported", which took a kinfer server down on
+// the box the first time a prompt was pooled.
+func copyBounds(exact bool, n int32) (p0, p1 int32) {
+	if exact {
+		return 0, -1
+	}
+	return 0, n
 }
 
 // wholeOnly reports a pool that adopts only whole entries; see exact. A nil

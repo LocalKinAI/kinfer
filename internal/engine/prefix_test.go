@@ -282,3 +282,14 @@ func TestClearEmptiesEveryEntry(t *testing.T) {
 		t.Error("a nil pool reported freeing something")
 	}
 }
+
+// An exact pool's copies are of whole sequences and must say so: llama.cpp's
+// indexed hybrid memory (Flash-Next, b11998) aborts on anything but (0, -1).
+func TestExactPoolCopiesWholeSequences(t *testing.T) {
+	if p0, p1 := copyBounds(true, 1234); p0 != 0 || p1 != -1 {
+		t.Errorf("exact pool copies [%d, %d), want the whole sequence (0, -1)", p0, p1)
+	}
+	if p0, p1 := copyBounds(false, 1234); p0 != 0 || p1 != 1234 {
+		t.Errorf("attention-only pool copies [%d, %d), want [0, 1234)", p0, p1)
+	}
+}

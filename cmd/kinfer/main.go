@@ -548,7 +548,14 @@ func cmdFit(args []string) error {
 		if models, err := st.List(); err == nil && len(models) > 0 {
 			fmt.Printf("Installed\n")
 			for _, m := range models {
-				fmt.Printf("  %-44s %9s  %s\n", m.Name, store.HumanSize(m.Size), rec.Fits(m.Size))
+				// Judged by what it takes in memory: a table llama.cpp reads
+				// from disk as needed does not count against the budget.
+				resident, note := m.Size, ""
+				if sh, err := store.ReadShape(m.Path); err == nil && sh.LazyBytes > 0 {
+					resident = m.Size - sh.LazyBytes
+					note = fmt.Sprintf("  (%s of it read from disk)", store.HumanSize(sh.LazyBytes))
+				}
+				fmt.Printf("  %-44s %9s  %s%s\n", m.Name, store.HumanSize(resident), rec.Fits(resident), note)
 			}
 			fmt.Println()
 		}

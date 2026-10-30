@@ -79,6 +79,10 @@ type lease struct {
 	path string
 	refs int
 
+	// lazy is the part of the model's files llama.cpp reads from disk as
+	// needed, which ps does not count as loaded; see store.ReadsLazily.
+	lazy int64
+
 	// keepAlive is what the last request to finish with this model asked for,
 	// in Ollama's terms (see parseKeepAlive); nil when it named nothing, and the
 	// server's own -keepalive applies.
@@ -310,6 +314,9 @@ func (s *Server) acquireOnce(name string) (generator, func(), error) {
 		return nil, nil, err
 	}
 	l := &lease{eng: e, path: path, refs: 2} // one for the server, one for the caller
+	if sh, err := store.ReadShape(path); err == nil {
+		l.lazy = sh.LazyBytes
+	}
 	s.cur = l
 	s.stopIdleLocked()
 	return e, func() { s.release(l) }, nil
@@ -744,8 +751,9 @@ func (s *Server) handlePS(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	var path string
 	var expiry time.Time
+	var lazy int64
 	if s.cur != nil {
-		path, expiry = s.cur.path, s.expiry
+		path, expiry, lazy = s.cur.path, s.expiry, s.cur.lazy
 	}
 	s.mu.Unlock()
 
@@ -767,6 +775,11 @@ func (s *Server) handlePS(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			}
+		}
+		// As Ollama's ps does, size is what the model holds in memory, which a
+		// table read from disk as needed is not.
+		if lazy > 0 && lazy < e.Size {
+			e.Size -= lazy
 		}
 		if !expiry.IsZero() {
 			e.ExpiresAt = &expiry

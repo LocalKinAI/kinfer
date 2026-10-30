@@ -48,11 +48,17 @@ func cmdPlan(args []string) error {
 	}
 
 	sh, shErr := store.ReadShape(m.Path)
-	weights := m.Size
+	// A table llama.cpp reads from disk as needed is in the files, not in
+	// memory; see store.ReadsLazily.
+	weights := m.Size - sh.LazyBytes
 	free := budget - weights
 
 	fmt.Printf("%s\n", m.Name)
 	fmt.Printf("  weights        %10s\n", store.HumanSize(weights))
+	if sh.LazyBytes > 0 {
+		fmt.Printf("  read from disk %10s   (a table read a few rows a token: it stays on the SSD, not in memory)\n",
+			store.HumanSize(sh.LazyBytes))
+	}
 	fmt.Printf("  GPU budget     %10s   (this process's share, not the machine's RAM)\n",
 		store.HumanSize(budget))
 	fmt.Printf("  left for cache %10s\n\n", store.HumanSize(free))
