@@ -5,6 +5,38 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### Experts from the SSD at speed: a patched MoE cache
+
+On a MacBook Pro (48 GB, 40 GiB for the GPU) Flash-Next IQ3_S does not fit, so
+what is not on the GPU comes from the SSD. Experts placed on the host by whole
+layers, 16 of 48, decoded at 4.3 tok/s, reading 130 MB a token at about
+0.6 GB/s: llama.cpp copies them out of the mapped file one page fault at a time.
+With a GPU cache in front (24 layers on the host, 8 GiB cache, 94% hits) the
+release build managed 9.1.
+
+`scripts/build-libs.sh` builds llama.cpp b11998 with a patch to its MoE cache
+(`patches/llama.cpp/b11998/`, 675 added lines, nothing upstream changed):
+misses are asked of the kernel at once and paged in by sixteen threads; the next
+cached layer's experts are guessed from its router applied to this layer's input
+and asked for ahead; a prompt's large batches page in what they copy the same
+way; and two new calls, `llama_moe_cache_save_profile` and
+`llama_moe_cache_load_profile`, keep counts of the experts generation selects.
+kinfer saves them to `~/.kinfer/profiles/<model>.moeprof` when a context is
+freed and fills a loading model's cache from them. The libraries go to
+`darwin_arm64_b11998k1`; kinfer binds the profile calls only if they are there,
+so the release set still works, without a profile.
+
+Same model, same laptop, same 24 layers and 8 GiB: decode 19.3 / 23.2 / 22.9
+tok/s over three replies (9.1 before), the prompt 103 tok/s (38), the first
+reply 23.1 once a profile exists. The reply is identical word for word, and a
+model without experts gives the same reply at the same speed (qwen2.5-0.5b,
+176.6 and 180.1 tok/s). A read-ahead as wide as the router's choice won: half as
+wide again reached 21.7, twice as wide 19.6, because the unused reads crowd the
+SSD. Filling the cache from the profile was 28 s while it read all 8 GiB before
+copying any — the first experts were evicted again before they were copied — and
+is 5 s in 512 MiB batches. A context rebuilt for a longer prompt saves its counts
+but does not refill.
+
 ### Experts in host memory, and llama.cpp's MoE cache measured on Metal
 
 `serve -host-experts N` leaves the routed experts of a mixture of experts' first

@@ -384,6 +384,14 @@ go build -o kinfer ./cmd/kinfer
 there. Run it with `-f` to fetch again, or with a build number to try another
 release — after diffing its `llama.h`; see `internal/nativelib/libs/README.md`.
 
+`scripts/build-libs.sh` instead builds b11998 from source with kinfer's patch to
+the MoE cache (`patches/llama.cpp/b11998/`; about two minutes, cmake and Xcode's
+command line tools) into `darwin_arm64_b11998k1/`, replacing the release set. It
+matters only for a mixture of experts whose experts come from the SSD — see
+[When the experts do not fit in memory either](#when-the-experts-do-not-fit-in-memory-either);
+with the release set `-host-experts` and `-moe-cache` work as before and there is
+no profile.
+
 ## Measured on M-series (Qwen2.5-0.5B Q4_K_M)
 
 This machine's throughput drifts by tens of percent over a session, so a number
@@ -1027,7 +1035,7 @@ of the KV cache there: give `-ctx` and `-slots` explicitly until it measures bot
 
 ## A mixture of experts that does not fit: experts in host memory
 
-A token uses a few experts per layer — 8 of Flash-Next's 512 — so a model too
+A token uses a few experts per layer — 10 of Flash-Next's 512 — so a model too
 big for the GPU can leave some layers' routed experts in host memory, mapped
 from the file, and the CPU computes them; llama.cpp b11998 can also keep the ones
 in use in a GPU cache (`llama-moe-cache.cpp`), so only a miss is copied:
@@ -1070,6 +1078,51 @@ Placing experts on the host also turns off llama.cpp's CPU repacking
 (`--no-repack`): a repacked buffer is not plain host memory, and the cache passed
 over every layer that had one — 39 of Flash-Next's 48.
 
+### When the experts do not fit in memory either
+
+All of that holds while the host experts stay in the page cache. On a MacBook Pro
+(48 GB, 40 GiB of it the GPU's) Flash-Next IQ3_S does not fit at all, and what is
+not on the GPU comes from the SSD. There the cache earns its place: the GPU keeps
+the experts in use and the SSD serves the rest. Only, llama.cpp copies a miss out
+of the mapped file one page fault at a time, about 0.6 GB/s from an SSD that does
+several, so it spends most of its time waiting. kinfer's build of llama.cpp
+(`scripts/build-libs.sh`, the patch in `patches/llama.cpp/`) adds what Strata
+does on a Mac:
+
+- a layer's misses are asked of the kernel at once (`madvise`) and paged in by
+  sixteen threads before they are copied;
+- the next cached layer's experts are guessed by running its router on this
+  layer's input, and asked for while the GPU computes the layers in between;
+- the experts generation selects are counted into
+  `~/.kinfer/profiles/<model>.moeprof` whenever a context is freed (older counts
+  halved), and a model loads with its cache already holding the ones counted
+  most;
+- a prompt's large batches page in the experts they copy the same way.
+
+Measured on the MacBook Pro, one slot: decode is three 200-token replies in
+order, the prompt 2,116 tokens. The reply is the same, word for word, in every
+row.
+
+| experts on the host | GPU cache | build | decode | prompt | read from the SSD per token |
+|---|---:|---|---|---:|---:|
+| 16 of 48 layers | — | release | 4.2 / 4.2 / 4.4 | 47 | 130 MB |
+| 24 of 48 layers | 8 GiB | release | 6.2 / 8.8 / 9.1 | 38 | 39 MB |
+| 24 of 48 layers | 8 GiB | kinfer, no profile yet | 19.3 / 23.2 / 22.9 | 103 | 57 MB |
+| 24 of 48 layers | 8 GiB | kinfer, with a profile | 23.1 / 22.7 / 23.1 | 104 | 58 MB |
+
+An 8 GiB cache over 22.7 GiB of experts hits 94% of the time in generation; the
+other 6% is all the SSD reads, and the read-ahead guesses a third of them. The
+guess is as wide as the router's choice (10 experts): half as wide again caught
+44% of the misses instead of 34%, but read twice as much and decoded at 21.7, and
+twice as wide at 19.6 — reads that go unused slow the ones that are needed.
+Filling the cache from the profile reads 8 GiB and adds 5 s to the load; a
+context rebuilt for a longer prompt does not refill it, since warming up by
+itself costs less than that.
+
+For comparison, the same model with that third on the box's GPU over USB 2.0
+instead (`-peers`) decodes at 25.6 tok/s and reads a prompt at 254: another
+machine's memory is still faster than the SSD, but no longer by six times.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary
@@ -1081,6 +1134,8 @@ over every layer that had one — 39 of Flash-Next's 48.
       llama.cpp's RPC backend; measured over USB 2.0 between the box and a MacBook Pro
 - [x] **Experts in host memory** — `-host-experts`, `-moe-cache`; llama.cpp's MoE
       cache measured on Metal, where it costs more than it saves for a model that fits
+- [x] **Experts from the SSD, at speed** — a patched MoE cache: parallel reads,
+      next-layer read-ahead, a profile that warms it; 9 → 23 tok/s on a MacBook Pro
 - [ ] **Bigger than one machine, at speed** — a Thunderbolt 5 link, sizing that
       measures every machine's GPU and places overflow experts by itself
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,

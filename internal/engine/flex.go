@@ -204,6 +204,11 @@ func (s *scheduler) reshape(j *job) bool {
 	target := s.flex.layout(j.want)
 	began := time.Now()
 
+	// The counts are kept, but the new context's cache is not filled from them:
+	// that reads the whole cache from the SSD (5 s for 8 GiB on the laptop),
+	// more than the cache costs filling itself as it generates, and a long
+	// prompt reshapes twice, on arrival and when it is done.
+	s.profile.save(s.lctx)
 	llama.FreeContext(s.lctx)
 	s.lctx = 0
 	lctx, free, err := s.flex.build(target)

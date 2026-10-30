@@ -326,6 +326,7 @@ func bind(dir string) error {
 	bindGGML(dir)
 	bindRPC(dir)
 	bindCPU(dir)
+	bindProfile(lib)
 	return nil
 }
 

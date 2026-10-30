@@ -556,11 +556,15 @@ sizing:
 			fx.total, home, fx.offers(), home, home)
 	}
 
+	profile := newExpertProfile(path, moeCache)
+	profile.load(lctx)
+
 	e.sched = newScheduler(lctx, home, vocab, tpl, batchCapacity, queue,
 		deadlines{
 			generate: pick(opts.MaxGenerate, DefaultMaxGenerate),
 			wait:     pick(opts.MaxWait, DefaultMaxWait),
 		}, recurrent, fx)
+	e.sched.profile = profile
 	e.sched.onFatal = func() { e.broken.Store(true) }
 	return e, nil
 }
@@ -654,6 +658,7 @@ func (e *Engine) Close() {
 		// stopped, the context it holds is no longer touched by anything.
 		e.sched.close()
 		if e.sched.lctx != 0 {
+			e.sched.profile.save(e.sched.lctx)
 			llama.FreeContext(e.sched.lctx)
 			e.sched.lctx = 0
 		}

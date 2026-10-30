@@ -123,6 +123,10 @@ type scheduler struct {
 	// See flex.go.
 	flex *flex
 
+	// profile keeps the counts of the experts generation selects from one
+	// context to the next; see experts.go.
+	profile expertProfile
+
 	// held is the oldest request not yet in a slot. It has been taken off the
 	// queue to be sized, and waits here for a slot or for the layout it needs.
 	held *job
