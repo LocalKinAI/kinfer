@@ -5,6 +5,42 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### A model the GPU cannot hold, placed by itself
+
+Flash-Next on the MacBook Pro ran fastest with `-host-experts 24 -moe-cache 8192
+-batch 2048 -slots 1 -ctx 16384`, numbers found by loading the model again and
+again. `kinfer serve` with none of them now runs it as fast:
+
+- The header is read for what the tensors hold: every shard's tensors, each the
+  distance to the next, totalled as `WeightBytes`, the routed experts of each
+  layer as `ExpertBytes`, and the vocabulary as `Vocab`. A split model with a
+  shard missing counts nothing rather than part of itself.
+- `engine.Place`: a mixture of experts the GPU cannot hold with room kept — for
+  one conversation of 32768 tokens or what `-slots` and `-ctx` ask, a prompt
+  pool entry, a pass of 2048 (its logits and activations) and the 2 GiB serve
+  warns below — leaves the experts of as few of its first layers on the host as
+  free what is missing plus a GPU cache of a third of them, the ratio of the
+  hand-tuned configuration; the cache gets everything freed beyond what was
+  missing. A dense model that does not fit, or a mixture whose shared part alone
+  does not, loads as before, with a line saying why it will not fit.
+- Sizing counts the MoE cache, which is allocated with each context: what the
+  context may cost is what the weights left less the cache. With `-moe-cache`
+  and the sizing left to serve, the cache's memory had been counted free for the
+  KV cache as well. A placed model's context is sized to the room placement kept,
+  and when the measured context costs more, the pool and the context give way
+  before the pass, which with experts in host memory goes last.
+- `-place=false` turns it off, `-host-experts` and `-moe-cache` choose by hand as
+  before, and with `-peers` it stays out of the way for now. `kinfer plan` shows
+  the placement, and what is left for the context after it.
+
+Same laptop, back to back, the 7,753-token prompt and three 200-token replies:
+no flags placed 28 of 48 layers' experts on the host with a 9.0 GiB cache and
+read the prompt at 706 and 726 tok/s, decoding at 27-29; the hand-tuned flags
+read it at 712 and decoded at 29. The same reply from both; the placed model
+keeps 32768 tokens of context and a pool entry where the flags kept 16384, and
+2.3 GiB free where they left 0.7. On the box nothing changes: Flash-Next (51.0
+GiB of weights against 88 GiB), ornith-1.5-35b and qwen3.8-27b all fit.
+
 ### Prompts from the SSD at speed: reads with pread, a stream for large batches
 
 The patched cache made generation fast and left prompts slow. On the MacBook Pro,

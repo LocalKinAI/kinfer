@@ -1161,6 +1161,47 @@ For comparison, the same model with that third on the box's GPU over USB 2.0
 instead (`-peers`) decodes at 25.6 tok/s and reads a prompt at 254: the SSD is
 now the faster of the two.
 
+### Placed by itself
+
+None of those flags is needed any more. A mixture of experts the GPU cannot
+hold, given neither `-host-experts` nor `-moe-cache`, is placed as it loads:
+
+```
+placement: Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf has 51.0 GiB of weights; with 6.2 GiB
+kept free for its context, a pass of 2048 and the headroom, it needs 17.3 GiB more than the GPU's 40.0 GiB.
+The routed experts of its first 28 of 48 layers, 26.2 GiB, stay in host memory, and a 9.0 GiB GPU cache
+keeps the ones in use; host memory beside the GPU's part is about 8.0 GiB, so the ones the cache misses
+are read from the SSD.
+```
+
+The header says how much each layer's experts take, every shard's tensors
+counted; the GPU says what it has free. kinfer keeps room for one conversation
+of 32768 tokens (or what `-slots` and `-ctx` ask for) with a prompt pool entry,
+a pass of 2048 and the 2 GiB it warns below, then leaves the experts of as few
+layers on the host as free what is missing plus a GPU cache of a third of them
+— the ratio of the best configuration found by hand above. The context is sized
+to the room kept, not to half of what is left; and when the measured context
+costs more, the pool and the context give way before the pass does, since every
+pass reads the host experts again.
+
+Measured back to back on the MacBook Pro, the 7,753-token prompt and three
+200-token replies, the same reply from both:
+
+| flags | experts on the host | GPU cache | prompt | decode | context | free after load |
+|---|---|---:|---:|---:|---|---:|
+| none (two runs) | 28 of 48 layers | 9.0 GiB | 706, 726 tok/s | 27-29 tok/s | 32768, and a pool entry | 2.3 GiB |
+| `-host-experts 24 -moe-cache 8192 -batch 2048 -slots 1 -ctx 16384 -prefix off` | 24 of 48 | 8.0 GiB | 712 tok/s | 29 tok/s | 16384 | 0.7 GiB |
+
+`kinfer plan <model>` shows the placement without loading anything.
+`-host-experts` and `-moe-cache` still choose by hand, and `-place=false` loads
+the model whole. A model that fits is untouched: on the box, Flash-Next, ornith
+and qwen3.8-27b load as before. A dense model that does not fit, or a mixture
+whose shared part alone does not, is loaded as it is, with a line saying why it
+will not fit. The rule was tuned where the host experts come from the SSD; where
+they would fit in host memory instead, it has not been measured against the
+fewest layers and no cache. With `-peers` the split decides where layers go,
+and placement stays out of it for now.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary
@@ -1177,8 +1218,11 @@ now the faster of the two.
 - [x] **Prompts from the SSD, at speed** — `pread` for everything mapped, large
       batches streamed through host memory, per-layer tables read ahead; a prompt
       62 → 705 tok/s and decode 23 → 31 on the same laptop
-- [ ] **Bigger than one machine, at speed** — a Thunderbolt 5 link, sizing that
-      measures every machine's GPU and places overflow experts by itself
+- [x] **Placed by itself** — a mixture of experts the GPU cannot hold leaves as
+      many layers' experts in host memory as it must, with a cache sized for
+      them: no flags on the MacBook Pro, as fast as the hand-tuned ones
+- [ ] **Bigger than one machine, at speed** — a Thunderbolt 5 link, and placement
+      across every machine's GPU
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,
       circuit breaking, per-agent model routing
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks

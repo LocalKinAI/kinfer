@@ -60,6 +60,13 @@ func ggufFile(kvs map[string]any, tensors []tensorEntry) []byte {
 		case uint16:
 			w(uint32(2))
 			w(v)
+		case []string:
+			w(uint32(9))
+			w(uint32(8))
+			w(uint64(len(v)))
+			for _, s := range v {
+				str(s)
+			}
 		}
 	}
 	for _, t := range tensors {
@@ -145,10 +152,64 @@ func TestReadShapeTotalsLazyBytesAcrossShards(t *testing.T) {
 		t.Errorf("arch %q, LazyBytes %d; want deepseek41, %d", sh.Arch, sh.LazyBytes, 103*gib)
 	}
 
-	// An architecture that reads nothing lazily does not open its other files.
+	// An architecture that reads nothing lazily has nothing lazy in any file.
 	plain := write("p-00001-of-00002.gguf", ggufFile(map[string]any{
 		"general.architecture": "llama", "split.count": uint16(2)}, nil))
 	if sh, err := ReadShape(plain); err != nil || sh.LazyBytes != 0 {
 		t.Errorf("plain split model: %d, %v", sh.LazyBytes, err)
+	}
+}
+
+// Placement needs what a model holds and, by layer, how much of it is routed
+// experts — every shard counted, and nothing at all when one is missing: a
+// model counted in part would look smaller than it is.
+func TestReadShapeCountsWeightsAndExpertsByLayer(t *testing.T) {
+	const mib = 1 << 20
+	dir := t.TempDir()
+	// write pads a header with dataLen bytes of tensor data, so the last
+	// tensor's size is the data section's end less its offset.
+	write := func(name string, raw []byte, dataLen int64) string {
+		data := make([]byte, (len(raw)+31)/32*32-len(raw)+int(dataLen))
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, append(raw, data...), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	first := write("x-00001-of-00002.gguf", ggufFile(map[string]any{
+		"general.architecture": "qwen3moe", "split.count": uint16(2),
+		"tokenizer.ggml.tokens": []string{"a", "b", "c"},
+	}, []tensorEntry{
+		{"token_embd.weight", 0},
+		{"blk.0.ffn_gate_exps.weight", 1 * mib},
+		{"blk.0.attn_q.weight", 3 * mib},
+	}), 4*mib)
+	second := write("x-00002-of-00002.gguf", ggufFile(map[string]any{"split.count": uint16(2)},
+		[]tensorEntry{
+			{"blk.1.ffn_up_exps.weight", 0},
+			{"blk.1.ffn_down_exps.weight", 4 * mib},
+			{"blk.1.ffn_gate_inp.weight", 6 * mib}, // the router: every token uses it
+			{"output.weight", 7 * mib},
+		}), 8*mib)
+
+	sh, err := ReadShape(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sh.Vocab != 3 {
+		t.Errorf("Vocab = %d, want 3", sh.Vocab)
+	}
+	if sh.WeightBytes != 12*mib {
+		t.Errorf("WeightBytes = %d MiB, want 12 (4 in the first file, 8 in the second)", sh.WeightBytes/mib)
+	}
+	if want := []int64{2 * mib, 6 * mib}; len(sh.ExpertBytes) != 2 || sh.ExpertBytes[0] != want[0] || sh.ExpertBytes[1] != want[1] {
+		t.Errorf("ExpertBytes = %v, want %v", sh.ExpertBytes, want)
+	}
+
+	if err := os.Remove(second); err != nil {
+		t.Fatal(err)
+	}
+	if sh, err := ReadShape(first); err != nil || sh.WeightBytes != 0 || sh.ExpertBytes != nil {
+		t.Errorf("a shard missing: WeightBytes %d, ExpertBytes %v, %v; want nothing counted", sh.WeightBytes, sh.ExpertBytes, err)
 	}
 }

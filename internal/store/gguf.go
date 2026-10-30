@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -47,6 +49,19 @@ type Shape struct {
 	// row at a time, summed over every shard: a model's size less this is
 	// what it takes in memory. See ReadsLazily.
 	LazyBytes int64
+
+	// Vocab is the tokenizer's vocabulary: a pass of n tokens may produce n x
+	// Vocab logits, the largest part of its compute buffer.
+	Vocab int
+
+	// WeightBytes is what the model's tensors hold in memory, every shard
+	// counted and LazyBytes left out. ExpertBytes is the part of it that is
+	// each layer's routed experts, by layer: what a GPU short of memory can
+	// leave in host memory (see engine.Place). Both are zero when a shard
+	// could not be read, since a model counted in part would look smaller
+	// than it is.
+	WeightBytes int64
+	ExpertBytes []int64
 }
 
 // ReadsLazily reports whether the embedded llama.cpp reads part of an
@@ -91,29 +106,57 @@ type tensorEntry struct {
 
 // Lazy is how much of this file llama.cpp reads on demand for a model of arch.
 // A split model's later files carry no architecture of their own, so it is
-// passed in. Each tensor's size is the distance to the next one, the data
-// section's end for the last — alignment padding included, at most a few
-// dozen bytes.
+// passed in.
 func (h Header) Lazy(arch string) int64 {
-	if !lazyArchs[arch] {
-		return 0
-	}
+	var lazy int64
+	h.eachTensor(func(name string, size int64) {
+		if isLazy(arch, name, size) {
+			lazy += size
+		}
+	})
+	return lazy
+}
+
+func isLazy(arch, name string, size int64) bool {
+	return lazyArchs[arch] && name == lazyTensor && size > lazyMinimum
+}
+
+// eachTensor calls fn with each tensor of this file and its size: the distance
+// to the next one, the data section's end for the last — alignment padding
+// included, at most a few dozen bytes.
+func (h Header) eachTensor(fn func(name string, size int64)) {
 	ts := append([]tensorEntry(nil), h.tensors...)
 	sort.Slice(ts, func(i, j int) bool { return ts[i].offset < ts[j].offset })
-	var lazy int64
 	for i, t := range ts {
-		if t.name != lazyTensor {
-			continue
-		}
 		end := h.fileSize - h.dataStart
 		if i+1 < len(ts) {
 			end = int64(ts[i+1].offset)
 		}
-		if n := end - int64(t.offset); n > lazyMinimum {
-			lazy += n
-		}
+		fn(t.name, end-int64(t.offset))
 	}
-	return lazy
+}
+
+// expertTensor names a layer's routed experts and captures the layer, as
+// llama.cpp's --cpu-moe matches them (LLM_FFN_EXPS_REGEX in common/common.h).
+var expertTensor = regexp.MustCompile(`^blk\.(\d+)\.ffn_(up|down|gate|gate_up)_(ch|)exps\.`)
+
+// account adds this file's tensors to sh, a model of arch: what is read
+// lazily, what is held in memory, and of that what is routed experts.
+func (h Header) account(sh *Shape, arch string) {
+	h.eachTensor(func(name string, size int64) {
+		if isLazy(arch, name, size) {
+			sh.LazyBytes += size
+			return
+		}
+		sh.WeightBytes += size
+		if m := expertTensor.FindStringSubmatch(name); m != nil {
+			layer, _ := strconv.Atoi(m[1])
+			for len(sh.ExpertBytes) <= layer {
+				sh.ExpertBytes = append(sh.ExpertBytes, 0)
+			}
+			sh.ExpertBytes[layer] += size
+		}
+	})
 }
 
 // HeadDim is the size of one attention head. GGUF states it outright when it
@@ -185,24 +228,27 @@ func (s Shape) CacheBytesFor(tokens, seqs int) int64 {
 }
 
 // ReadShape reads a GGUF model's header — from its first file, for a split
-// model — and, for an architecture that reads part of itself lazily, the
-// headers of its other files too, to total LazyBytes.
+// model — and the headers of its other files, to total what its tensors hold.
 func ReadShape(path string) (Shape, error) {
 	h, err := readHeaderFile(path)
 	if err != nil {
 		return Shape{}, err
 	}
 	sh := h.Shape
-	if !lazyArchs[sh.Arch] {
-		return sh, nil
-	}
-	sh.LazyBytes = h.Lazy(sh.Arch)
+	h.account(&sh, sh.Arch)
+	whole := true
 	for _, p := range otherShards(path, h.SplitCount) {
 		// A missing shard is llama.cpp's to report at load; it cannot be
 		// counted here.
-		if oh, err := readHeaderFile(p); err == nil {
-			sh.LazyBytes += oh.Lazy(sh.Arch)
+		oh, err := readHeaderFile(p)
+		if err != nil {
+			whole = false
+			continue
 		}
+		oh.account(&sh, sh.Arch)
+	}
+	if !whole {
+		sh.WeightBytes, sh.ExpertBytes = 0, nil
 	}
 	return sh, nil
 }
@@ -315,6 +361,10 @@ func ReadHeader(r io.Reader, fileSize int64) (Header, error) {
 			sh.SSMGroups = int(n)
 		case strings.HasSuffix(key, ".ssm.inner_size"):
 			sh.SSMInner = int(n)
+		case key == "tokenizer.ggml.tokens":
+			if a, ok := v.(arrayLen); ok {
+				sh.Vocab = int(a)
+			}
 		}
 	}
 
@@ -355,6 +405,10 @@ func (c *countingReader) Read(p []byte) (int, error) {
 }
 
 type ggufReader struct{ r io.Reader }
+
+// arrayLen is what value returns for an array: how many elements it had, which
+// is all a shape needs of one (the vocabulary's size).
+type arrayLen uint64
 
 func (g *ggufReader) bytes(n uint64) ([]byte, error) {
 	if n > 1<<24 {
@@ -436,7 +490,7 @@ func (g *ggufReader) value(typ uint32) (any, error) {
 				return nil, err
 			}
 		}
-		return nil, nil
+		return arrayLen(n), nil
 	case 10, 11: // uint64, int64
 		v, err := g.u64()
 		return v, err

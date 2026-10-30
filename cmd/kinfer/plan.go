@@ -51,22 +51,45 @@ func cmdPlan(args []string) error {
 	// A table llama.cpp reads from disk as needed is in the files, not in
 	// memory; see store.ReadsLazily.
 	weights := m.Size - sh.LazyBytes
-	free := budget - weights
+	if sh.WeightBytes > 0 {
+		weights = sh.WeightBytes
+	}
+	// What the GPU cannot hold, serve places, as it would here: see
+	// engine.Place.
+	onGPU := weights
+	place, placeErr := engine.PlaceUnasked(sh, uint64(budget), *slotsWant, *ctxWant, 0)
+	if place.HostExperts > 0 {
+		onGPU = weights - int64(place.Host) + int64(place.MoeCache)<<20
+	}
+	free := budget - onGPU
 
 	fmt.Printf("%s\n", m.Name)
-	fmt.Printf("  weights        %10s\n", store.HumanSize(weights))
+	fmt.Printf("  weights          %10s\n", store.HumanSize(weights))
 	if sh.LazyBytes > 0 {
-		fmt.Printf("  read from disk %10s   (a table read a few rows a token: it stays on the SSD, not in memory)\n",
+		fmt.Printf("  read from disk   %10s   (a table read a few rows a token: it stays on the SSD, not in memory)\n",
 			store.HumanSize(sh.LazyBytes))
 	}
-	fmt.Printf("  GPU budget     %10s   (this process's share, not the machine's RAM)\n",
+	fmt.Printf("  GPU budget       %10s   (this process's share, not the machine's RAM)\n",
 		store.HumanSize(budget))
-	fmt.Printf("  left for cache %10s\n\n", store.HumanSize(free))
+	if place.HostExperts > 0 {
+		fmt.Printf("  in host memory   %10s   (the routed experts of the first %d of %d layers, which serve leaves there)\n",
+			store.HumanSize(int64(place.Host)), place.HostExperts, len(sh.ExpertBytes))
+		fmt.Printf("  expert cache     %10s   (GPU memory keeping the ones in use)\n",
+			store.HumanSize(int64(place.MoeCache)<<20))
+	}
+	fmt.Printf("  left for context %10s\n\n", store.HumanSize(free))
 
 	if free <= 0 {
 		fmt.Printf("  This model does not fit. It is %s larger than the budget.\n",
 			store.HumanSize(-free))
+		if placeErr != nil {
+			fmt.Printf("  %v\n", placeErr)
+		}
 		return nil
+	}
+	if place.HostExperts > 0 {
+		fmt.Printf("  serve keeps those experts in host memory, read from the SSD as the cache misses\n" +
+			"  them where memory cannot hold them; -host-experts and -moe-cache choose instead.\n\n")
 	}
 	if shErr != nil || sh.CacheBytes(1024) == 0 {
 		fmt.Printf("  Cannot size the cache: the header does not carry the shape this needs.\n")

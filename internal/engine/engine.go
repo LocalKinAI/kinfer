@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -124,6 +125,13 @@ type Options struct {
 	// a miss is copied; 0 is none. It applies to layers whose experts are all
 	// in host memory.
 	MoeCache int
+
+	// NoPlace loads every weight on the GPU even when it cannot hold them.
+	// Without it, a mixture of experts the GPU cannot hold, given neither
+	// HostExperts nor MoeCache, leaves as many layers' experts in host memory
+	// as it must, with a GPU cache for the ones in use: see Place. Not with
+	// Peers, whose split decides where layers go.
+	NoPlace bool
 }
 
 // GenParams control one generation.
@@ -324,7 +332,21 @@ func Open(path string, opts Options) (*Engine, error) {
 			mp.TensorSplit = uintptr(unsafe.Pointer(&split[0]))
 		}
 	}
-	overrides, patterns, err := hostExpertOverrides(opts.HostExperts)
+	// Read the accelerator's free memory before anything is allocated, so the
+	// model's and the context's real costs can be measured rather than guessed.
+	bud := newBudget()
+	shape, _ := store.ReadShape(path)
+
+	// Where the weights go, when the operator did not say: a mixture of
+	// experts the GPU cannot hold leaves some layers' experts in host memory.
+	hostExperts, moeCache := opts.HostExperts, opts.MoeCache
+	var placed Placed
+	if hostExperts == 0 && moeCache == 0 && !opts.NoPlace && len(opts.Peers) == 0 && bud.known {
+		placed = placeFor(shape, bud.atStart, opts, filepath.Base(path))
+		hostExperts, moeCache = placed.HostExperts, placed.MoeCache
+	}
+
+	overrides, patterns, err := hostExpertOverrides(hostExperts)
 	if err != nil {
 		return nil, err
 	}
@@ -336,16 +358,12 @@ func Open(path string, opts Options) (*Engine, error) {
 		// every layer with an IQ4_NL down projection, 39 of 48. llama.cpp's
 		// --no-repack, the same switch.
 		mp.UseExtraBufts = 0
-		which := fmt.Sprintf("the first %d layers'", opts.HostExperts)
-		if opts.HostExperts < 0 {
+		which := fmt.Sprintf("the first %d layers'", hostExperts)
+		if hostExperts < 0 {
 			which = "every layer's"
 		}
-		log.Printf("experts: %s routed experts stay in host memory, mapped from the file; a %d MiB GPU cache keeps the ones in use", which, opts.MoeCache)
+		log.Printf("experts: %s routed experts stay in host memory, mapped from the file; a %d MiB GPU cache keeps the ones in use", which, moeCache)
 	}
-
-	// Read the accelerator's free memory before anything is allocated, so the
-	// model's and the context's real costs can be measured rather than guessed.
-	bud := newBudget()
 
 	model := llama.LoadModel(path, mp)
 	// llama.cpp has copied both lists into the model by now; until then they
@@ -362,22 +380,32 @@ func Open(path string, opts Options) (*Engine, error) {
 	// Whatever the operator left at zero is sized here, from the model's
 	// shape and the memory the weights actually left — see autosize.go.
 	sized := opts.Slots <= 0 || opts.ContextSize <= 0
-	shape, _ := store.ReadShape(path)
 	// llama.cpp throws on a MoE cache for a model with no experts, which would
 	// fail every context; a server serving several models is told it once.
-	moeCache := opts.MoeCache
 	if moeCache > 0 && shape.Experts == 0 {
 		log.Printf("experts: %s has none, so -moe-cache does not apply to it", filepath.Base(path))
 		moeCache = 0
+	}
+	// The MoE cache is allocated with each context, so what the context may
+	// cost is what the weights left less the cache.
+	left := sub(bud.afterModel, uint64(moeCache)<<20)
+
+	// A placed model's GPU holds the room placement kept and little more: the
+	// context is sized to what that room was kept for, not to half of what is
+	// left, which would leave the pass to be the first thing the measurement
+	// below takes back.
+	ctx, slotsWant := opts.ContextSize, opts.Slots
+	if placed.HostExperts != 0 {
+		ctx = cmp.Or(ctx, placed.Tokens)
+		slotsWant = placed.Slots
 	}
 
 	// Slots given and the context left to us, with flex on: the total the
 	// slots share is sized per model the way Ollama sizes one request's
 	// context (SizeTotal), and flex gives one long prompt all of it.
-	byTotal := opts.Slots > 0 && opts.ContextSize <= 0 && !opts.FixedLayout
-	ctx := opts.ContextSize
+	byTotal := opts.Slots > 0 && ctx <= 0 && !opts.FixedLayout
 	if byTotal {
-		t, err := SizeTotal(shape, bud.dev.Total, bud.afterModel, opts.Slots)
+		t, err := SizeTotal(shape, bud.dev.Total, left, opts.Slots)
 		if err != nil {
 			llama.FreeModel(model)
 			return nil, err
@@ -389,10 +417,10 @@ func Open(path string, opts Options) (*Engine, error) {
 		}
 		log.Printf("sizing: %d tokens of context for %d slots of %d — Ollama would give one request %d here; "+
 			"the cache should cost about %s of the %s left. -ctx overrides this.",
-			t.PerSeq*t.Slots, t.Slots, t.PerSeq, one, gib(uint64(t.Estimated)), gib(bud.afterModel))
+			t.PerSeq*t.Slots, t.Slots, t.PerSeq, one, gib(uint64(t.Estimated)), gib(left))
 	}
 
-	plan, err := AutoSize(shape, bud.afterModel, opts.Slots, opts.PrefixSlots, ctx)
+	plan, err := AutoSize(shape, left, slotsWant, opts.PrefixSlots, ctx)
 	if err != nil {
 		llama.FreeModel(model)
 		return nil, err
@@ -411,14 +439,14 @@ func Open(path string, opts Options) (*Engine, error) {
 	ubAuto := opts.Batch <= 0
 	ub := min(max(opts.Batch, 1), maxBatch)
 	if ubAuto {
-		ub = autoUbatch(longest, sub(bud.atStart, bud.afterModel)+uint64(plan.Estimated), bud.atStart)
+		ub = autoUbatch(longest, sub(bud.atStart, left)+uint64(plan.Estimated), bud.atStart)
 		// Experts in host memory are read again by every pass of a prompt,
 		// and a pass of 2048 reads them a quarter as often as one of 512: on
 		// the MacBook Pro, Flash-Next with 24 layers' experts on the host read
 		// a 7,753-token prompt at 73 tok/s in passes of 512 and 162 in passes
 		// of 2048 (kinfer's patched llama.cpp makes it 502). The context
 		// measured below takes it back down when it costs too much.
-		if opts.HostExperts != 0 {
+		if hostExperts != 0 {
 			ub = max(ub, ubatchLarge)
 		}
 	}
@@ -432,7 +460,7 @@ func Open(path string, opts Options) (*Engine, error) {
 		}
 		log.Printf("sizing: %d slots + %d prefix x %d tokens each%s — the model was trained for %s, "+
 			"the cache should cost about %s of the %s left. -slots and -ctx override this.",
-			slots, prefix, perSeq, sharedNote(shared), trained, gib(uint64(plan.Estimated)), gib(bud.afterModel))
+			slots, prefix, perSeq, sharedNote(shared), trained, gib(uint64(plan.Estimated)), gib(left))
 	} else if prefixAuto {
 		log.Printf("sizing: %d prefix entries%s around the %d slots x %d tokens asked for — "+
 			"the pool gets only what they leave; -prefix overrides", prefix, sharedNote(shared), slots, perSeq)
@@ -478,8 +506,9 @@ sizing:
 		// them. Halving alone took the box to 4 slots of 4096.
 		switch {
 		// A bigger micro-batch is speed, not capacity: it goes before
-		// anything a conversation would notice.
-		case ubAuto && ub > ubatchDefault:
+		// anything a conversation would notice — unless experts are in host
+		// memory, where every pass reads them again and it goes last.
+		case ubAuto && ub > ubatchDefault && hostExperts == 0:
 			ub = lowerUbatch(ub)
 			log.Printf("%s — a micro-batch of %d instead", measured, ub)
 		case perSeq/2 < floor && slotsAuto && slots > 1:
@@ -499,6 +528,9 @@ sizing:
 		case ctxAuto && perSeq/2 >= 2048:
 			perSeq /= 2
 			log.Printf("%s — halving the context", measured)
+		case ubAuto && ub > ubatchDefault:
+			ub = lowerUbatch(ub)
+			log.Printf("%s — a micro-batch of %d instead", measured, ub)
 		default:
 			break sizing
 		}
@@ -558,12 +590,12 @@ sizing:
 	switch {
 	case !ubAuto:
 		how = "as -batch asked"
-	case opts.HostExperts != 0 && ub < ubatchLarge:
+	case hostExperts != 0 && ub < ubatchLarge:
 		// The headroom is not this process's to spend: on a shared machine
 		// it is what other processes' memory crosses the line with.
 		how = fmt.Sprintf("not %d: the host experts are read again by every pass, and %d would leave less than %s free "+
 			"— a smaller -moe-cache makes room, or -batch %d takes it from that", ubatchLarge, ubatchLarge, gib(thinHeadroom), ubatchLarge)
-	case opts.HostExperts != 0:
+	case hostExperts != 0:
 		how = "sized for experts in host memory, which every pass reads again"
 	}
 	log.Printf("batch: the GPU reads %d prompt tokens a pass, %s — the model and its cache are %s of %s",
