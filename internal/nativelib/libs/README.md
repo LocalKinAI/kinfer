@@ -1,7 +1,7 @@
 # Native libraries live here
 
 This directory holds the llama.cpp shared libraries that get embedded into the
-kinfer binary. It ships empty — they are 8.8 MB of platform-specific binaries
+kinfer binary. It ships empty — they are 12.4 MB of platform-specific binaries
 that change with every llama.cpp release, so they are fetched rather than
 committed:
 
@@ -14,7 +14,7 @@ scripts/fetch-libs.sh -f         # fetch again
 What it does, for when it has to be done by hand:
 
 ```bash
-V=b11175
+V=b11998
 curl -sfL "https://github.com/ggml-org/llama.cpp/releases/download/$V/llama-$V-bin-macos-arm64.tar.gz" \
     | tar xz -C /tmp
 mkdir -p internal/nativelib/libs/darwin_arm64_$V
@@ -32,11 +32,11 @@ is what puts real files under the names the loader will ask for.
 The result is one subdirectory per platform:
 
 ```
-libs/darwin_arm64_b11175/
-    libllama.0.dylib        3.2M
-    libggml-metal.0.dylib   2.2M
-    libmtmd.0.dylib         1.4M
-    …                             8 files, 8.4 MB total
+libs/darwin_arm64_b11998/
+    libggml-metal.0.dylib   5.4M
+    libllama.0.dylib        3.5M
+    libmtmd.0.dylib         1.5M
+    …                             8 files, 12.4 MB total
 ```
 
 `internal/nativelib` embeds the whole tree with `//go:embed all:libs` and
@@ -52,7 +52,9 @@ beside a new one makes which version loads depend on directory order.
 `llama_model_params`, `llama_context_params`, `llama_batch` and
 `llama_sampler_chain_params` field for field. Between b6862 and b10901 both
 param structs changed shape; between b10901 and b11175 nothing kinfer binds
-did (llama.h only gained functions). `bind` asserts each size at startup and
+did (llama.h only gained functions); between b11175 and b11998
+`llama_context_params` gained `moe_cache_size` in its middle, 160 → 168 bytes.
+`bind` asserts each size at startup and
 `Open` verifies `n_ctx` after every load, so a mismatch is a clear error rather
 than silent corruption — but the fix is still to re-transcribe from the new
 `include/llama.h`. Diff it first: `fetch-libs.sh` will fetch any build asked

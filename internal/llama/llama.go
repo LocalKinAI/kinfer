@@ -13,13 +13,17 @@
 // The whole surface kinfer needs is about thirty entry points, so binding them
 // here costs less than working around a mirror that drifts. Every struct below
 // is transcribed from llama.h at the build embedded in internal/nativelib
-// (b11175), and Open verifies the layout at runtime rather than trusting this
+// (b11998), and Open verifies the layout at runtime rather than trusting this
 // comment. Both param structs changed shape between b6862 and b10901 — three
 // new fields in one, two removed and two added in the other — and the size
 // assertions in bind caught it before a single call was made. That is the whole
 // point of having them. From b10901 to b11175 llama.h only gained: an extended
 // batch API and a LoRA loader kinfer does not use, and a vocabulary type added
-// at the end of its enum; ggml-backend.h did not change at all.
+// at the end of its enum; ggml-backend.h did not change at all. From b11175 to
+// b11998 llama_context_params gained moe_cache_size after type_v, moving every
+// field behind it by 8 bytes (160 → 168); the rest was functions, two
+// counters at the end of the perf struct kinfer does not bind, and another
+// vocabulary type at the end of its enum.
 //
 // Still no CGO: purego resolves symbols at runtime, so cross-compilation from a
 // Mac keeps working. Struct arguments and returns go through purego directly —
@@ -86,7 +90,7 @@ type ModelParams struct {
 	LoadMtp              uint8
 }
 
-// ContextParams mirrors struct llama_context_params (160 bytes).
+// ContextParams mirrors struct llama_context_params (168 bytes).
 //
 // This is the struct gollama got wrong. The first field is n_ctx — there is no
 // seed here; sampling owns the seed now.
@@ -121,6 +125,10 @@ type ContextParams struct {
 
 	TypeK int32
 	TypeV int32
+
+	// MoeCacheSize is bytes of device memory caching the experts kept in host
+	// memory, 0 off; new in b11998 and marked experimental there.
+	MoeCacheSize uint64
 
 	AbortCallback     uintptr
 	AbortCallbackData uintptr
@@ -236,7 +244,7 @@ func bind(dir string) error {
 		want uintptr
 	}{
 		{"llama_model_params", unsafe.Sizeof(ModelParams{}), 80},
-		{"llama_context_params", unsafe.Sizeof(ContextParams{}), 160},
+		{"llama_context_params", unsafe.Sizeof(ContextParams{}), 168},
 		{"llama_batch", unsafe.Sizeof(Batch{}), 56},
 		{"llama_sampler_chain_params", unsafe.Sizeof(SamplerChainParams{}), 1},
 	} {

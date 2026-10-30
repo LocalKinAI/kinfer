@@ -6,7 +6,7 @@
 #   scripts/fetch-libs.sh -f         fetch again even if it is already there
 #
 # kinfer binds llama.cpp directly and embeds its eight dynamic libraries
-# (about 8.8 MB) in the binary, so nothing needs installing where it runs. They
+# (about 12.4 MB) in the binary, so nothing needs installing where it runs. They
 # are not committed: every llama.cpp upgrade is a new set, and git would keep
 # each one forever. This is the one command that replaces committing them.
 #
@@ -18,11 +18,11 @@
 # Before moving to another build, diff llama.h against the embedded one:
 # kinfer's structs are transcribed from it (internal/llama), and a field that
 # moved would pass the build and fail at the first call. See the upgrade to
-# b11175 in CHANGELOG.md for how that was checked.
+# b11998 in CHANGELOG.md for how that was checked.
 
 set -euo pipefail
 
-VERSION=b11175 # the build internal/llama was checked against
+VERSION=b11998 # the build internal/llama was checked against
 FORCE=0
 for arg in "$@"; do
   case "$arg" in
@@ -33,7 +33,7 @@ for arg in "$@"; do
     ;;
   b[0-9]*) VERSION=$arg ;;
   *)
-    echo "fetch-libs: unknown argument $arg (want a build like b11175, or -f)" >&2
+    echo "fetch-libs: unknown argument $arg (want a build like b11998, or -f)" >&2
     exit 2
     ;;
   esac

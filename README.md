@@ -334,7 +334,7 @@ silently loading the wrong 7B model is worse than a message.
             │
       purego                    no CGO, so cross-compilation survives
             │
-      libllama + 7 ggml libraries   (llama.cpp b11175, 8.4 MB, embedded)
+      libllama + 7 ggml libraries   (llama.cpp b11998, 12.4 MB, embedded)
 ```
 
 **No CGO anywhere.** The native libraries load at runtime through `purego`,
@@ -350,16 +350,16 @@ onto libffi.
 
 ```bash
 # Fetch llama.cpp's libraries once, into the package that embeds them
-# (8 files, 8.8 MB; they are not committed — every upgrade is a new set).
+# (8 files, 12.4 MB; they are not committed — every upgrade is a new set).
 scripts/fetch-libs.sh
 
-# The libraries end up inside the binary (19 MB in all)
+# The libraries end up inside the binary (24 MB in all)
 go build -o kinfer ./cmd/kinfer
 ```
 
 `scripts/fetch-libs.sh` takes the llama.cpp build kinfer is checked against
-(b11175) from the official release, copies the eight `.0.dylib` files into
-`internal/nativelib/libs/darwin_arm64_b11175/`, and removes any other version
+(b11998) from the official release, copies the eight `.0.dylib` files into
+`internal/nativelib/libs/darwin_arm64_b11998/`, and removes any other version
 there. Run it with `-f` to fetch again, or with a build number to try another
 release — after diffing its `llama.h`; see `internal/nativelib/libs/README.md`.
 
@@ -479,8 +479,8 @@ out why, in order:
   kinfer embedded (byte for byte), ran at 83.8 tok/s. The official b11175 ran
   at 106–108. Ollama ships its own, somewhere between.
 
-kinfer now embeds b11175. llama.h gained functions between the two and changed
-none that kinfer binds. The prompt side also took Ollama's micro-batch: 2048
+kinfer moved to b11175 (and since to b11998; see CHANGELOG.md). llama.h gained
+functions between the two and changed none that kinfer binds. The prompt side also took Ollama's micro-batch: 2048
 tokens a pass where the model and its cache leave room, 512 where they do not
 (see `-batch`). Flash-Next on the same upgrade: 41.9 tok/s alone (was 33.6) and
 66 together at four (was 53), still at 512 a pass since it fills the box.

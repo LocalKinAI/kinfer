@@ -5,6 +5,34 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### llama.cpp b11175 → b11998: DeepSeek-V4.1 and GLM-5.3-Flash load
+
+b11175 did not know `deepseek41` (DeepSeek-V4.1-Flash, merged upstream on
+October 25 as PR #31086) or `glm5-next` (GLM-5.3-Flash). b11998 knows both, and
+reads V4.1's 111 GB Engram table lazily from disk: llama.cpp's default lazy
+mode, which kinfer leaves alone, reads any marked tensor over 4 GiB a row at a
+time instead of loading it. ISTA's GSQ-RCO sets moved to this layout on October
+27 (b11870 or newer): shard 1 is metadata only and the shared Engram file is
+linked in as the last shard.
+
+`llama_context_params` gained `moe_cache_size` after `type_v`, so every field
+behind it moved by 8 bytes and the struct grew from 160 to 168. kinfer's mirror
+gained the field and `bind`'s size check its new number. The rest of llama.h
+only gained functions, two counters at the end of the perf struct kinfer does
+not bind, and a vocabulary type at the end of its enum; nothing kinfer calls in
+ggml-backend.h changed. The RPC protocol went from 7 to 8, so an RPC server
+and its client must come from the same build.
+
+On the box, ornith-1.5:35b, one slot of 16384, temperature 0, four rounds each,
+old and new binaries back to back with nothing else loaded: decode 105.6 →
+108.2 tok/s (median), an 8,438-token prompt read at about 1,950 tok/s by both.
+The libraries grew from 8.8 to 12.4 MB, the binary to 24 MB.
+
+Loading is not serving. llama.cpp's built-in templates include no DeepSeek V4
+family, so a V4.1 conversation would fall through to kinfer's ChatML fallback,
+a format the model was not trained on. V4.1 needs its own renderer before
+kinfer can serve it.
+
 ### llama.cpp b10901 → b11175, and Ollama's micro-batch
 
 Measured against Ollama on the same ornith-1.5-35b file, kinfer decoded one
