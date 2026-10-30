@@ -83,6 +83,9 @@ brew trust --formula localkinai/tap/kinfer
 brew install localkinai/tap/kinfer
 ```
 
+With other taps not trusted yet, Homebrew 7 can end the install with an error
+about one of them, after kinfer is in place: `kinfer version` says whether it is.
+
 ## Commands
 
 ```bash
