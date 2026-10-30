@@ -61,6 +61,20 @@ Plain filenames matter more than it sounds: when something breaks at 2am you
 want `ls ~/.kinfer/models` to tell you what you have, and you want `scp` to be a
 valid way of moving a model to another machine.
 
+## Install
+
+On an Apple Silicon Mac:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LocalKinAI/kinfer/main/scripts/install.sh | sh
+```
+
+It puts the latest release in `~/.local/bin`, checked against its sha256: one
+file with llama.cpp inside, the build that reads experts from the SSD at speed.
+It is not signed. Downloaded this way macOS runs it, and a firewall that is on
+asks once before `serve` or `worker` takes connections from another machine.
+Elsewhere, or to build it yourself, see [Build](#build).
+
 ## Commands
 
 ```bash
@@ -74,6 +88,7 @@ kinfer serve [-addr :11500]  # serve over HTTP; context and slots sized to the m
 kinfer install [serve flags] # keep serve running: at login and after a crash (macOS)
 kinfer uninstall             # stop it and remove the service
 kinfer worker -addr <ip:port> # lend this machine's GPU to a serve -peers on another
+kinfer version               # this build, and the llama.cpp inside it
 ```
 
 What each does, and how serve sizes itself: [docs/serving.md](docs/serving.md).
@@ -144,6 +159,9 @@ for a model whose experts or tables come from the SSD — see
 [When the experts do not fit in memory either](docs/big-models.md#when-the-experts-do-not-fit-in-memory-either);
 with the release set `-host-experts` and `-moe-cache` work as before and there is
 no profile.
+
+`scripts/release.sh v0.1.0` builds what a release ships: those patched
+libraries, the version stamped in, packed with its sha256 into `dist/`.
 
 ## Roadmap
 

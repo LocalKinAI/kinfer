@@ -1,5 +1,6 @@
-# Compiled binaries
+# Compiled binaries, and the releases scripts/release.sh packs
 /kinfer
+/dist/
 /kinfer-probe
 /probe
 /probe2

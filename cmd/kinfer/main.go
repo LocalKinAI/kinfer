@@ -38,6 +38,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer uninstall             stop it and remove the service
   kinfer fit                   what this machine can actually run
   kinfer can-run <hf-repo>     whether a model on Hugging Face will run here
+  kinfer version               this build, and the llama.cpp inside it
 
 Examples:
   kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
@@ -58,6 +59,8 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
+	case "version", "-version", "--version":
+		err = cmdVersion()
 	case "pull":
 		err = cmdPull(os.Args[2:])
 	case "list", "ls":

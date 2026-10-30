@@ -150,6 +150,11 @@ func sameContent(a, b []byte) bool {
 // platformDir finds the embedded directory for this OS/arch. Names look like
 // "darwin_arm64_b6862" — the llama.cpp build number is part of the name, and it
 // is not known at compile time, so match on the prefix.
+// LibrarySet names the llama.cpp libraries this binary carries for this
+// platform: darwin_arm64_b11998 for the release set, darwin_arm64_b11998k2
+// for the one scripts/build-libs.sh patches.
+func LibrarySet() (string, error) { return platformDir() }
+
 func platformDir() (string, error) {
 	prefix := fmt.Sprintf("%s_%s_", runtime.GOOS, runtime.GOARCH)
 

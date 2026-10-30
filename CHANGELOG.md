@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.1.0 — 2026-10-30
+
+The first release: a binary for Apple Silicon with the patched llama.cpp
+inside, installed by `scripts/install.sh`, and `kinfer version` to say which.
 
 Built and measured on a 96 GB Mac Studio (M3 Ultra) and, for the entries on
 experts in host memory and on the SSD, a 48 GB MacBook Pro (M5 Max): the numbers
