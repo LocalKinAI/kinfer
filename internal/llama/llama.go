@@ -325,6 +325,7 @@ func bind(dir string) error {
 	// serves, it just cannot warn about a configuration that will not fit.
 	bindGGML(dir)
 	bindRPC(dir)
+	bindCPU(dir)
 	return nil
 }
 

@@ -1025,6 +1025,51 @@ Network › Firewall › Options). And sizing
 measures only this machine's GPU, while the layers on the other keep their part
 of the KV cache there: give `-ctx` and `-slots` explicitly until it measures both.
 
+## A mixture of experts that does not fit: experts in host memory
+
+A token uses a few experts per layer — 8 of Flash-Next's 512 — so a model too
+big for the GPU can leave some layers' routed experts in host memory, mapped
+from the file, and the CPU computes them; llama.cpp b11998 can also keep the ones
+in use in a GPU cache (`llama-moe-cache.cpp`), so only a miss is copied:
+
+```bash
+kinfer serve -host-experts 12                  # the first 12 layers' experts stay on the host
+kinfer serve -host-experts 12 -moe-cache 4096  # and 4 GiB of GPU memory caches the ones in use
+kinfer serve -host-experts -1 -moe-cache 16384 # every layer's
+```
+
+Measured on the box with Qwen3.8-Flash-Next IQ3_S (48 GB of experts), one slot:
+decode is the third of three 200-token replies, by when a cache is warm; the
+prompt is 2,116 tokens.
+
+| experts on the host | GPU cache | decode | prompt | decode hit rate | GPU memory used |
+|---|---:|---:|---:|---:|---:|
+| none | — | 44.2 tok/s | 770 tok/s | — | 52.3 GiB |
+| 12 of 48 layers (11 GB) | — | 29.6 | 566 | — | 41.6 GiB |
+| 12 of 48 layers | 4 GiB | 32.7 | 511 | 89% | 45.6 GiB |
+| all | — | 14.6 | 235 | — | 5.5 GiB |
+| all | 8 GiB (17%) | 16.8 | 233 | 81% | 13.5 GiB |
+| all | 16 GiB (34%) | 19.9 | 211 | 94% | 21.5 GiB |
+| all | 48 GiB (every expert) | 22.2 | 60 | 98% | 52.4 GiB |
+
+The last row is the one to read. With every expert in the cache and almost every
+lookup a hit, decode is half of what the same weights do on the GPU directly: the
+cache stops at every layer to ask the host which experts the router chose, and a
+prompt's large batches copy experts out of it wholesale. It was built for a card
+with its own VRAM behind PCIe, where host memory is far away. On Apple Silicon
+host memory *is* the GPU's memory, and the cache only adds the copying.
+
+So on a Mac: a model that fits keeps every expert on the GPU. One that does not
+puts the fewest layers' experts on the host (`-host-experts N`), where the CPU
+computes them from the page cache; a small cache on top buys about a tenth more
+decode for a tenth less prompt speed. The host experts are read from the file as
+they are touched, so they need RAM outside the GPU's budget to stay fast — past
+that, from the SSD.
+
+Placing experts on the host also turns off llama.cpp's CPU repacking
+(`--no-repack`): a repacked buffer is not plain host memory, and the cache passed
+over every layer that had one — 39 of Flash-Next's 48.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary
@@ -1034,8 +1079,10 @@ of the KV cache there: give `-ctx` and `-slots` explicitly until it measures bot
       against DeepSeek's encoder; sizing that leaves lazily read tables on disk
 - [x] **Two machines, one model** — `kinfer worker` and `serve -peers`, through
       llama.cpp's RPC backend; measured over USB 2.0 between the box and a MacBook Pro
+- [x] **Experts in host memory** — `-host-experts`, `-moe-cache`; llama.cpp's MoE
+      cache measured on Metal, where it costs more than it saves for a model that fits
 - [ ] **Bigger than one machine, at speed** — a Thunderbolt 5 link, sizing that
-      measures every machine's GPU, and llama.cpp's MoE expert cache on Metal
+      measures every machine's GPU and places overflow experts by itself
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,
       circuit breaking, per-agent model routing
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks

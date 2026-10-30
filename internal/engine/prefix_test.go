@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"fmt"
 	"net"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -318,5 +320,35 @@ func TestDeviceListRefusesAnUnreachableWorker(t *testing.T) {
 	ln.Close() // nothing listens there now
 	if _, _, err := deviceList([]string{addr}, nil); err == nil || !strings.Contains(err.Error(), "not reachable") {
 		t.Errorf("unreachable worker: %v", err)
+	}
+}
+
+// No host experts is no overrides at all: llama.cpp then places every weight
+// itself, as before.
+func TestNoHostExpertsIsNoOverrides(t *testing.T) {
+	if ov, keep, err := hostExpertOverrides(0); ov != nil || keep != nil || err != nil {
+		t.Fatalf("0 layers: %v, %v, %v", ov, keep, err)
+	}
+}
+
+// The per-layer patterns must not reach past their layer: llama.cpp searches
+// tensor names with them, and blk.1 is a prefix of blk.10.
+func TestHostExpertRegexes(t *testing.T) {
+	re := func(p string) *regexp.Regexp { return regexp.MustCompile(p) }
+	one := re(fmt.Sprintf(`blk\.%d%s`, 1, expertsRegex))
+	for name, want := range map[string]bool{
+		"blk.1.ffn_up_exps.weight":      true,
+		"blk.1.ffn_gate_up_exps.weight": true,
+		"blk.1.ffn_down_chexps.weight":  true,
+		"blk.10.ffn_up_exps.weight":     false,
+		"blk.1.ffn_up_shexp.weight":     false, // the shared expert stays on the GPU
+		"blk.1.attn_q.weight":           false,
+	} {
+		if got := one.MatchString(name); got != want {
+			t.Errorf("%s: match %v, want %v", name, got, want)
+		}
+	}
+	if !re(expertsRegex).MatchString("blk.47.ffn_down_exps.weight") {
+		t.Error("the every-layer pattern misses a layer's experts")
 	}
 }

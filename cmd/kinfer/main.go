@@ -385,6 +385,8 @@ type serveOpts struct {
 	batch           int
 	peers           []string
 	split           []float32
+	hostExperts     int
+	moeCache        int
 }
 
 // prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
@@ -444,6 +446,8 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.DurationVar(&o.keepAlive, "keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
 	fs.IntVar(&o.batch, "batch", 0, "prompt tokens the GPU reads in one pass (0 = sized the way Ollama sizes it: 2048, 1024 or 512 by context and memory)")
 	fs.BoolVar(&o.flex, "flex", true, "give a prompt too long for a slot a longer one: fewer slots, the same tokens, while it runs (false = keep the layout)")
+	fs.IntVar(&o.hostExperts, "host-experts", 0, "a mixture of experts' routed experts stay in host memory, mapped from the file, for this many of the first layers (-1 = every layer; 0 = none, all on the GPU)")
+	fs.IntVar(&o.moeCache, "moe-cache", 0, "MiB of GPU memory caching the host experts in use, so only a miss is copied (0 = none)")
 	fs.Func("peers", "kinfer workers on other machines (host:port, comma-separated) whose GPUs take the first layers of each model", func(v string) error {
 		o.peers = nil
 		for _, p := range strings.Split(v, ",") {
@@ -486,6 +490,7 @@ func cmdServe(args []string) error {
 		GPULayers: o.ngl, ContextSize: o.nCtx, Slots: o.slots, PrefixSlots: int(o.prefix),
 		MaxQueue: o.queue, MaxGenerate: noLimit(o.maxGen), MaxWait: noLimit(o.maxWait),
 		FixedLayout: !o.flex, Batch: o.batch, Peers: o.peers, Split: o.split,
+		HostExperts: o.hostExperts, MoeCache: o.moeCache,
 	})
 	srv.SetKeepAlive(o.keepAlive)
 	defer srv.Close()

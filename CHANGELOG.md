@@ -5,6 +5,31 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### Experts in host memory, and llama.cpp's MoE cache measured on Metal
+
+`serve -host-experts N` leaves the routed experts of a mixture of experts' first
+N layers (`-1`: every layer) in host memory, mapped from the file, as llama.cpp's
+`--n-cpu-moe` does; `-moe-cache MiB` gives llama.cpp b11998's MoE cache that much
+GPU memory for the ones in use. A model with no experts ignores the cache rather
+than failing every context on llama.cpp's "MoE cache requires a MoE model".
+
+The first run cached 9 of Flash-Next's 48 layers: llama.cpp had repacked every
+IQ4_NL down projection for the CPU (CPU_REPACK), a repacked buffer is not plain
+host memory, and the cache only takes layers whose experts all are. Placing
+experts on the host now turns repacking off (`--no-repack`).
+
+Measured on the box with Flash-Next IQ3_S (48 GB of experts), decode the warm
+third of three replies, a 2,116-token prompt: everything on the GPU 44.2 tok/s
+and 770; 12 of 48 layers' experts on the host 29.6 and 566, with a 4 GiB cache
+32.7 and 511 (89% hits); every layer's on the host 14.6 and 235, with an 8 GiB
+cache 16.8 (81%), 16 GiB 19.9 (94%), and a cache holding every expert 22.2 and
+60 (98%). The last says what the cache costs on Apple Silicon: half the speed of
+the same weights on the GPU, at almost no misses — a host round trip at every
+layer to learn the router's choice, and a prompt's large batches copying experts
+out of it. It was built for VRAM behind PCIe; on unified memory host memory is
+the GPU's. A model that fits keeps its experts on the GPU; one that does not puts
+the fewest layers' on the host.
+
 ### Two machines, one model: `kinfer worker` and `serve -peers`
 
 `kinfer worker -addr host:port` lends a machine's GPU over llama.cpp's RPC

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -112,6 +113,16 @@ type Options struct {
 	// Split is each device's share of the layers, in that order: the peers',
 	// then this machine's. Empty lets llama.cpp share by free memory.
 	Split []float32
+
+	// HostExperts leaves the routed experts of a mixture of experts' first
+	// HostExperts layers in host memory, mapped from the file, instead of on
+	// the GPU; negative means every layer. See experts.go.
+	HostExperts int
+
+	// MoeCache is MiB of GPU memory caching the host experts in use, so only
+	// a miss is copied; 0 is none. It applies to layers whose experts are all
+	// in host memory.
+	MoeCache int
 }
 
 // GenParams control one generation.
@@ -308,6 +319,24 @@ func Open(path string, opts Options) (*Engine, error) {
 			mp.TensorSplit = uintptr(unsafe.Pointer(&split[0]))
 		}
 	}
+	overrides, patterns, err := hostExpertOverrides(opts.HostExperts)
+	if err != nil {
+		return nil, err
+	}
+	if overrides != nil {
+		mp.TensorBuftOverrides = uintptr(unsafe.Pointer(&overrides[0]))
+		// Left to itself llama.cpp repacks some host weights for faster CPU
+		// arithmetic (CPU_REPACK), and a repacked buffer is not plain host
+		// memory, so the MoE cache passes its layer over: on Flash-Next IQ3_S
+		// every layer with an IQ4_NL down projection, 39 of 48. llama.cpp's
+		// --no-repack, the same switch.
+		mp.UseExtraBufts = 0
+		which := fmt.Sprintf("the first %d layers'", opts.HostExperts)
+		if opts.HostExperts < 0 {
+			which = "every layer's"
+		}
+		log.Printf("experts: %s routed experts stay in host memory, mapped from the file; a %d MiB GPU cache keeps the ones in use", which, opts.MoeCache)
+	}
 
 	// Read the accelerator's free memory before anything is allocated, so the
 	// model's and the context's real costs can be measured rather than guessed.
@@ -318,6 +347,8 @@ func Open(path string, opts Options) (*Engine, error) {
 	// must not be collected.
 	runtime.KeepAlive(devs)
 	runtime.KeepAlive(split)
+	runtime.KeepAlive(overrides)
+	runtime.KeepAlive(patterns)
 	if model == 0 {
 		return nil, fmt.Errorf("load %s: llama.cpp could not read the model (see its output above)", path)
 	}
@@ -327,6 +358,13 @@ func Open(path string, opts Options) (*Engine, error) {
 	// shape and the memory the weights actually left — see autosize.go.
 	sized := opts.Slots <= 0 || opts.ContextSize <= 0
 	shape, _ := store.ReadShape(path)
+	// llama.cpp throws on a MoE cache for a model with no experts, which would
+	// fail every context; a server serving several models is told it once.
+	moeCache := opts.MoeCache
+	if moeCache > 0 && shape.Experts == 0 {
+		log.Printf("experts: %s has none, so -moe-cache does not apply to it", filepath.Base(path))
+		moeCache = 0
+	}
 
 	// Slots given and the context left to us, with flex on: the total the
 	// slots share is sized per model the way Ollama sizes one request's
@@ -394,7 +432,7 @@ func Open(path string, opts Options) (*Engine, error) {
 	var lctx llama.Context
 sizing:
 	for {
-		lctx = newContext(model, slots, prefix, perSeq, shared, ub)
+		lctx = newContext(model, slots, prefix, perSeq, shared, ub, moeCache)
 		if lctx == 0 {
 			llama.FreeModel(model)
 			return nil, fmt.Errorf("create context for %s", path)
@@ -510,7 +548,7 @@ sizing:
 		ub, how, gib(sub(bud.atStart, bud.afterCtx)), gib(bud.atStart))
 	var fx *flex
 	if !opts.FixedLayout {
-		fx = newFlex(home, shape.TrainedCtx, contextBuilder(model, home, bud))
+		fx = newFlex(home, shape.TrainedCtx, contextBuilder(model, home, bud, moeCache))
 	}
 	if fx != nil {
 		log.Printf("slots: %d tokens of context as %s; a prompt that needs a longer slot gets %s while it runs "+
@@ -535,10 +573,10 @@ sizing:
 // holds the same tokens, so it should cost about the same; if it does not, the
 // place to find out is here, before any batch runs in it — a batch that cannot
 // allocate retires the whole model (see thinHeadroom).
-func contextBuilder(model llama.Model, home layout, bud *budget) func(layout) (llama.Context, uint64, error) {
+func contextBuilder(model llama.Model, home layout, bud *budget, moeCache int) func(layout) (llama.Context, uint64, error) {
 	floor := sub(min(bud.afterCtx, thinHeadroom), reshapeSlack)
 	return func(l layout) (llama.Context, uint64, error) {
-		lctx := newContext(model, l.slots, l.prefix, l.perSeq, l.shared, l.ubatch)
+		lctx := newContext(model, l.slots, l.prefix, l.perSeq, l.shared, l.ubatch, moeCache)
 		if lctx == 0 {
 			return 0, 0, errors.New("llama.cpp could not create it (see its output above)")
 		}
@@ -558,8 +596,9 @@ func contextBuilder(model llama.Model, home layout, bud *budget) func(layout) (l
 // newContext asks llama.cpp for a cache holding slots+prefix sequences of
 // perSeq tokens each — or, when the pool is shared, slots conversations' worth
 // of tokens that the pool's sequences borrow from.
-func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatch int) llama.Context {
+func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatch, moeCache int) llama.Context {
 	cp := llama.DefaultContextParams()
+	cp.MoeCacheSize = uint64(moeCache) << 20
 	// Pooled prefixes live in sequence ids above the slots, and each needs a
 	// sequence's worth of cache unless it borrows the slots'.
 	cp.NSeqMax = uint32(slots + prefix)
