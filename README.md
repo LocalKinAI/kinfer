@@ -73,6 +73,7 @@ kinfer ps                    # what the daemon is holding right now
 kinfer serve [-addr :11500]  # serve over HTTP; context and slots sized to the model
 kinfer install [serve flags] # keep serve running: at login and after a crash (macOS)
 kinfer uninstall             # stop it and remove the service
+kinfer worker -addr <ip:port> # lend this machine's GPU to a serve -peers on another
 ```
 
 ### `kinfer run` keeps the model warm
@@ -978,6 +979,52 @@ says so, because a hybrid architecture holds per-sequence state that does not
 scale with context and costs more than the arithmetic predicts at high slot
 counts.
 
+## One model on two machines
+
+A model can take a second machine's GPU for some of its layers, through
+llama.cpp's RPC backend. The other machine runs a worker; this one names it:
+
+```bash
+# on the MacBook Pro: its end of the cable between the two
+kinfer worker -addr 169.254.85.249:50052
+
+# on the box: 15% of the layers there, the rest and the output here
+kinfer serve -peers 169.254.85.249:50052 -split 0.15,0.85 -slots 1 -ctx 16384
+```
+
+The worker is kinfer itself, not llama.cpp's `rpc-server`, because both ends
+must be the same llama.cpp build — the protocol went from 7 to 8 between b11175
+and b11998 — and one binary on both machines cannot disagree with itself. The
+protocol has no authentication, so a worker belongs on the cable between the two
+machines (a Thunderbolt bridge, a USB link), never on a LAN address; it defaults
+to loopback. The worker keeps every tensor it is sent in `~/.kinfer/rpc-cache`,
+by hash, so a model's second load sends hashes instead of weights.
+
+Measured with Qwen3.8-Flash-Next IQ3_S between the box (M3 Ultra) and a MacBook
+Pro (M5 Max), joined by a USB-C cable that negotiated USB 2.0 — 1.2 ms round
+trip, 343 Mb/s:
+
+| | box alone | 2 layers on the laptop | 8 layers on the laptop |
+|---|---:|---:|---:|
+| model on the box | 50.7 GiB | 48.8 GiB | 42.6 GiB |
+| first load | — | — | 248 s (8 GB over USB) |
+| next load, from the worker's cache | — | 7.1 s | 21.9 s |
+| decode | 44.5 tok/s | 26.3 tok/s | 23.7 tok/s |
+| a 7,016-token prompt | 666 tok/s | 284 tok/s | 283 tok/s |
+
+Two layers cost almost as much as eight: what slows a token is crossing the
+link — about 16 ms of round trips each — not the laptop's share of the work,
+which is about 0.6 ms per layer. Reading a prompt is the cable's bandwidth, the
+same however the layers are split. Both are costs of USB 2.0; a Thunderbolt link
+has a fraction of the latency and a hundred times the bandwidth.
+
+Two things to know. A Mac with its firewall on can hold a new worker's incoming
+connections until the program is allowed — on the MacBook Pro they sat unanswered
+until `kinfer` showed up as permitted in the firewall's list (System Settings ›
+Network › Firewall › Options). And sizing
+measures only this machine's GPU, while the layers on the other keep their part
+of the KV cache there: give `-ctx` and `-slots` explicitly until it measures both.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary
@@ -985,8 +1032,10 @@ counts.
 - [x] **Phase 1** — `fit` / `pull` / `list` / `rm` / `run` / `serve`
 - [x] **DeepSeek-V4.1** — its own prompt renderer and DSML tool calls, checked
       against DeepSeek's encoder; sizing that leaves lazily read tables on disk
-- [ ] **Bigger than one machine** — llama.cpp RPC across the box and the
-      MacBook Pro, and llama.cpp's MoE expert cache on Metal
+- [x] **Two machines, one model** — `kinfer worker` and `serve -peers`, through
+      llama.cpp's RPC backend; measured over USB 2.0 between the box and a MacBook Pro
+- [ ] **Bigger than one machine, at speed** — a Thunderbolt 5 link, sizing that
+      measures every machine's GPU, and llama.cpp's MoE expert cache on Metal
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,
       circuit breaking, per-agent model routing
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"flag"
+	"io"
 	"strings"
 	"testing"
 )
@@ -59,6 +61,24 @@ func TestInstallRefusesFlagsServeWouldRefuse(t *testing.T) {
 	} {
 		if err := checkServeFlags(bad); err == nil {
 			t.Errorf("checkServeFlags(%q) = nil, want an error — launchd would retry this forever", bad)
+		}
+	}
+}
+
+// -peers and -split are checked as they are parsed, so install refuses a bad
+// one before launchd retries it forever.
+func TestServeFlagsTakePeersAndSplit(t *testing.T) {
+	fs, o := serveFlags(flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse([]string{"-peers", "169.254.85.249:50052, 10.0.0.2:50052", "-split", "0.15,0.05,0.8"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(o.peers) != 2 || o.peers[1] != "10.0.0.2:50052" || len(o.split) != 3 || o.split[0] != 0.15 {
+		t.Errorf("peers %v, split %v", o.peers, o.split)
+	}
+	for _, bad := range [][]string{{"-peers", "169.254.85.249"}, {"-split", "a,b"}, {"-split", "-0.5,1.5"}} {
+		if err := checkServeFlags(bad); err == nil {
+			t.Errorf("checkServeFlags(%q) = nil, want an error", bad)
 		}
 	}
 }

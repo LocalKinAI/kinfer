@@ -27,12 +27,18 @@ type Device struct {
 }
 
 // DeviceType mirrors enum ggml_backend_dev_type.
+//
+// IGPU sits between GPU and ACCEL in ggml's enum; this mirror once skipped it,
+// so BLAS (ACCEL, 3) read as nothing in particular and an integrated GPU (2)
+// as an accelerator. Metal reports GPU, which is why nothing showed it.
 type DeviceType int32
 
 const (
 	DeviceCPU DeviceType = iota
 	DeviceGPU
+	DeviceIGPU
 	DeviceAccel
+	DeviceMeta
 )
 
 func (t DeviceType) String() string {
@@ -41,8 +47,12 @@ func (t DeviceType) String() string {
 		return "CPU"
 	case DeviceGPU:
 		return "GPU"
+	case DeviceIGPU:
+		return "iGPU"
 	case DeviceAccel:
 		return "accel"
+	case DeviceMeta:
+		return "meta"
 	default:
 		return fmt.Sprintf("type(%d)", int32(t))
 	}
@@ -116,7 +126,7 @@ func Devices() []Device {
 // with neither, where there is no budget to police.
 func Accelerator() (Device, bool) {
 	devs := Devices()
-	for _, want := range []DeviceType{DeviceGPU, DeviceAccel} {
+	for _, want := range []DeviceType{DeviceGPU, DeviceIGPU, DeviceAccel} {
 		for _, d := range devs {
 			if d.Type == want && d.Total > 0 {
 				return d, true

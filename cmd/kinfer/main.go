@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,6 +33,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer ps                    show which model is loaded right now
   kinfer plan <model>          what -slots and -ctx to serve it with
   kinfer serve                 serve models over HTTP
+  kinfer worker                lend this machine's GPU to a serve on another (-peers)
   kinfer install [serve flags] keep serve running: at login, and after a crash (macOS)
   kinfer uninstall             stop it and remove the service
   kinfer fit                   what this machine can actually run
@@ -68,6 +70,8 @@ func main() {
 		err = cmdPS(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "worker":
+		err = cmdWorker(os.Args[2:])
 	case "install":
 		err = cmdInstall(os.Args[2:])
 	case "uninstall":
@@ -379,6 +383,8 @@ type serveOpts struct {
 	keepAlive       time.Duration
 	flex            bool
 	batch           int
+	peers           []string
+	split           []float32
 }
 
 // prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
@@ -438,6 +444,28 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.DurationVar(&o.keepAlive, "keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
 	fs.IntVar(&o.batch, "batch", 0, "prompt tokens the GPU reads in one pass (0 = sized the way Ollama sizes it: 2048, 1024 or 512 by context and memory)")
 	fs.BoolVar(&o.flex, "flex", true, "give a prompt too long for a slot a longer one: fewer slots, the same tokens, while it runs (false = keep the layout)")
+	fs.Func("peers", "kinfer workers on other machines (host:port, comma-separated) whose GPUs take the first layers of each model", func(v string) error {
+		o.peers = nil
+		for _, p := range strings.Split(v, ",") {
+			p = strings.TrimSpace(p)
+			if _, _, err := net.SplitHostPort(p); err != nil {
+				return fmt.Errorf("%q is not host:port", p)
+			}
+			o.peers = append(o.peers, p)
+		}
+		return nil
+	})
+	fs.Func("split", "each device's share of the layers, comma-separated: every peer's, then this machine's (default: by free memory)", func(v string) error {
+		o.split = nil
+		for _, f := range strings.Split(v, ",") {
+			x, err := strconv.ParseFloat(strings.TrimSpace(f), 32)
+			if err != nil || x < 0 {
+				return fmt.Errorf("%q is not a share", f)
+			}
+			o.split = append(o.split, float32(x))
+		}
+		return nil
+	})
 	return fs, o
 }
 
@@ -457,7 +485,7 @@ func cmdServe(args []string) error {
 	srv := server.New(st, engine.Options{
 		GPULayers: o.ngl, ContextSize: o.nCtx, Slots: o.slots, PrefixSlots: int(o.prefix),
 		MaxQueue: o.queue, MaxGenerate: noLimit(o.maxGen), MaxWait: noLimit(o.maxWait),
-		FixedLayout: !o.flex, Batch: o.batch,
+		FixedLayout: !o.flex, Batch: o.batch, Peers: o.peers, Split: o.split,
 	})
 	srv.SetKeepAlive(o.keepAlive)
 	defer srv.Close()

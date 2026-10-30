@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"net"
+	"strings"
 	"testing"
 
 	"github.com/LocalKinAI/kinfer/internal/llama"
@@ -291,5 +293,30 @@ func TestExactPoolCopiesWholeSequences(t *testing.T) {
 	}
 	if p0, p1 := copyBounds(false, 1234); p0 != 0 || p1 != 1234 {
 		t.Errorf("attention-only pool copies [%d, %d), want [0, 1234)", p0, p1)
+	}
+}
+
+// Without peers llama.cpp chooses the devices itself; a split then has nothing
+// to split across.
+func TestDeviceListWithoutPeers(t *testing.T) {
+	if devs, split, err := deviceList(nil, nil); devs != nil || split != nil || err != nil {
+		t.Errorf("no peers: %v, %v, %v", devs, split, err)
+	}
+	if _, _, err := deviceList(nil, []float32{0.5, 0.5}); err == nil {
+		t.Error("a split without peers was accepted")
+	}
+}
+
+// A worker that cannot be reached is an error kinfer returns: ggml would abort
+// the whole process on it.
+func TestDeviceListRefusesAnUnreachableWorker(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // nothing listens there now
+	if _, _, err := deviceList([]string{addr}, nil); err == nil || !strings.Contains(err.Error(), "not reachable") {
+		t.Errorf("unreachable worker: %v", err)
 	}
 }

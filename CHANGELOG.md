@@ -5,6 +5,41 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### Two machines, one model: `kinfer worker` and `serve -peers`
+
+`kinfer worker -addr host:port` lends a machine's GPU over llama.cpp's RPC
+backend; `kinfer serve -peers host:port -split a,b` puts the first layers of
+each model there, in llama.cpp's own order (peers first, this machine's GPU
+last, with the output). The worker is kinfer, not llama.cpp's rpc-server, so
+both ends are always the same build; the protocol has no authentication, so it
+defaults to loopback and belongs on the cable between two machines. It keeps the
+tensors it is sent, by hash, in `~/.kinfer/rpc-cache`. kinfer hands llama.cpp
+the device list itself rather than registering the remote devices globally,
+which leaves every local memory reading as it was. ggml aborts the whole process
+when it cannot connect (`rpc_dispatcher::start`), which took the first test
+server down; kinfer now dials each worker itself first, so a worker that is
+unreachable — a laptop asleep — is a failed load rather than a dead server. One
+that accepts and then fails the handshake still aborts, in ggml.
+
+Measured with Qwen3.8-Flash-Next IQ3_S between the box and a MacBook Pro M5 Max
+over a USB-C cable that negotiated USB 2.0 (1.2 ms round trip, 343 Mb/s):
+
+- 8 layers on the laptop: 42.6 GiB stays on the box (50.7 alone); the first
+  load took 248 s, nearly all of it 8 GB crossing the cable; the second, from
+  the worker's cache, 21.9 s. Decode 23.7 tok/s, a 7,016-token prompt at
+  283 tok/s — against 44.5 and 666 on the box alone.
+- 2 layers: decode 26.3 tok/s, the same prompt at 284. So the cost is the link,
+  about 16 ms of round trips a token, not the laptop's share of the work (about
+  0.6 ms a layer); prompt reading is the cable's bandwidth. Thunderbolt is the
+  next measurement.
+
+The laptop's firewall held the worker's first connections, unanswered, until
+the binary appeared as permitted in its list.
+
+Also: `llama.DeviceType` skipped ggml's IGPU, so BLAS (3) read as unknown and an
+integrated GPU (2) as an accelerator. Metal reports GPU, which is why nothing
+showed it.
+
 ### Sizing counts what stays in memory, not what is on disk
 
 llama.cpp leaves one table of three architectures on disk and reads it a few rows

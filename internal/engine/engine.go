@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/llama"
@@ -100,6 +102,16 @@ type Options struct {
 	// 512, by the context and by how much of the memory the model and its
 	// cache take. See autoUbatch.
 	Batch int
+
+	// Peers are other machines' kinfer workers ("host:port"), whose GPUs
+	// take some of the model's layers; see llama.RPCDevices. They come first
+	// in the device list, as llama.cpp orders them, and this machine's GPU
+	// last.
+	Peers []string
+
+	// Split is each device's share of the layers, in that order: the peers',
+	// then this machine's. Empty lets llama.cpp share by free memory.
+	Split []float32
 }
 
 // GenParams control one generation.
@@ -286,11 +298,26 @@ func Open(path string, opts Options) (*Engine, error) {
 	mp := llama.DefaultModelParams()
 	mp.NGpuLayers = int32(opts.GPULayers)
 
+	devs, split, err := deviceList(opts.Peers, opts.Split)
+	if err != nil {
+		return nil, err
+	}
+	if devs != nil {
+		mp.Devices = uintptr(unsafe.Pointer(&devs[0]))
+		if split != nil {
+			mp.TensorSplit = uintptr(unsafe.Pointer(&split[0]))
+		}
+	}
+
 	// Read the accelerator's free memory before anything is allocated, so the
 	// model's and the context's real costs can be measured rather than guessed.
 	bud := newBudget()
 
 	model := llama.LoadModel(path, mp)
+	// llama.cpp has copied both lists into the model by now; until then they
+	// must not be collected.
+	runtime.KeepAlive(devs)
+	runtime.KeepAlive(split)
 	if model == 0 {
 		return nil, fmt.Errorf("load %s: llama.cpp could not read the model (see its output above)", path)
 	}

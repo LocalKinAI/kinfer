@@ -324,6 +324,7 @@ func bind(dir string) error {
 	// working-set budget, and it is best-effort: a build without it still
 	// serves, it just cannot warn about a configuration that will not fit.
 	bindGGML(dir)
+	bindRPC(dir)
 	return nil
 }
 
