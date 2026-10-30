@@ -141,8 +141,17 @@ back to back, and the same reply from all three:
 
 The settings are not the difference; kinfer's build of llama.cpp is. It reads
 the experts the cache misses with a pool of threads instead of a page fault at a
-time, reads the next ones ahead, and streams a prompt's passes. How it works,
-and every measurement behind it: [docs/big-models.md](docs/big-models.md).
+time, reads the next ones ahead, and streams a prompt's passes.
+
+The way there is Strata's, whose own engine runs a mixture of experts from the
+SSD on a Mac: a GPU cache of the experts in use with the rest read from the
+file, misses read by a pool of threads, the next layer's experts guessed from
+its router and read ahead, and a profile of the experts generation uses filling
+the cache at load. kinfer does those in llama.cpp, whose MoE cache it patches,
+and adds its own: a prompt's passes streamed through host memory, the rows of a
+per-layer table read in parallel (most of what made prompts fast), and the
+model placed by itself, on one machine or across several. How it works, and
+every measurement behind it: [docs/big-models.md](docs/big-models.md).
 
 ## What else it does
 
