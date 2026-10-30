@@ -384,10 +384,10 @@ go build -o kinfer ./cmd/kinfer
 there. Run it with `-f` to fetch again, or with a build number to try another
 release — after diffing its `llama.h`; see `internal/nativelib/libs/README.md`.
 
-`scripts/build-libs.sh` instead builds b11998 from source with kinfer's patch to
-the MoE cache (`patches/llama.cpp/b11998/`; about two minutes, cmake and Xcode's
-command line tools) into `darwin_arm64_b11998k1/`, replacing the release set. It
-matters only for a mixture of experts whose experts come from the SSD — see
+`scripts/build-libs.sh` instead builds b11998 from source with kinfer's patch
+(`patches/llama.cpp/b11998/`; about two minutes, cmake and Xcode's command line
+tools) into `darwin_arm64_b11998k2/`, replacing the release set. It matters only
+for a model whose experts or tables come from the SSD — see
 [When the experts do not fit in memory either](#when-the-experts-do-not-fit-in-memory-either);
 with the release set `-host-experts` and `-moe-cache` work as before and there is
 no profile.
@@ -1084,20 +1084,30 @@ All of that holds while the host experts stay in the page cache. On a MacBook Pr
 (48 GB, 40 GiB of it the GPU's) Flash-Next IQ3_S does not fit at all, and what is
 not on the GPU comes from the SSD. There the cache earns its place: the GPU keeps
 the experts in use and the SSD serves the rest. Only, llama.cpp copies a miss out
-of the mapped file one page fault at a time, about 0.6 GB/s from an SSD that does
-several, so it spends most of its time waiting. kinfer's build of llama.cpp
+of the mapped file one page fault at a time, about 0.6 GB/s from an SSD that reads
+13 GB/s, so it spends most of its time waiting. kinfer's build of llama.cpp
 (`scripts/build-libs.sh`, the patch in `patches/llama.cpp/`) adds what Strata
 does on a Mac:
 
-- a layer's misses are asked of the kernel at once (`madvise`) and paged in by
-  sixteen threads before they are copied;
-- the next cached layer's experts are guessed by running its router on this
-  layer's input, and asked for while the GPU computes the layers in between;
+- what stays mapped from the model file is read with `pread` by a pool of
+  sixteen threads, in requests of up to 2 MB, instead of copied out of the
+  mapping one page fault at a time; the file and offset come from the mapping
+  itself, checked against it;
+- a layer's misses are read that way before they are copied, and the next cached
+  layer's experts are guessed by running its router on this layer's input and
+  read into the page cache while the GPU computes the layers in between;
 - the experts generation selects are counted into
   `~/.kinfer/profiles/<model>.moeprof` whenever a context is freed (older counts
   halved), and a model loads with its cache already holding the ones counted
   most;
-- a prompt's large batches page in the experts they copy the same way.
+- a prompt's large batches use most experts of every layer, so every pass reads
+  the host experts again: each weight is read into one of three slots of host
+  memory past the page cache, the next two while the GPU computes, and copied
+  into the GPU's copy of it by every thread, the experts the cache holds from the
+  cache;
+- the rows a batch needs of a per-layer embedding table (Flash-Next's 27 GiB
+  n-gram table, DeepSeek-V4.1's) are read the same way before the pass, where
+  the CPU would page in one random row at a time.
 
 Measured on the MacBook Pro, one slot: decode is three 200-token replies in
 order, the prompt 2,116 tokens. The reply is the same, word for word, in every
@@ -1107,21 +1117,49 @@ row.
 |---|---:|---|---|---:|---:|
 | 16 of 48 layers | — | release | 4.2 / 4.2 / 4.4 | 47 | 130 MB |
 | 24 of 48 layers | 8 GiB | release | 6.2 / 8.8 / 9.1 | 38 | 39 MB |
-| 24 of 48 layers | 8 GiB | kinfer, no profile yet | 19.3 / 23.2 / 22.9 | 103 | 57 MB |
-| 24 of 48 layers | 8 GiB | kinfer, with a profile | 23.1 / 22.7 / 23.1 | 104 | 58 MB |
+| 24 of 48 layers | 8 GiB | kinfer k1, no profile yet | 19.3 / 23.2 / 22.9 | 103 | 57 MB |
+| 24 of 48 layers | 8 GiB | kinfer k1, with a profile | 23.1 / 22.7 / 23.1 | 104 | 58 MB |
+| 24 of 48 layers | 8 GiB | kinfer k2, with a profile | 32.3 / 31.0 / 31.3 | 415 | 53 MB |
+
+A longer prompt — the first 7,753 tokens of this README — run back to back with
+each build, the same 32-token reply from all of them:
+
+| build | GPU cache | pass | prompt |
+|---|---:|---:|---:|
+| release | 8 GiB | 2048 | 62 tok/s |
+| kinfer k1 | 8 GiB | 2048 | 159 tok/s |
+| kinfer k2 | 8 GiB | 2048 | 705 tok/s |
+| kinfer k2 | 6 GiB | 4096 | 740 tok/s |
+
+The 2,116-token prompt above is read in passes of 512: with an 8 GiB cache a
+pass of 2048 leaves the laptop's GPU less than the 2 GiB kinfer keeps free, so
+the automatic micro-batch steps down and says so. `-batch 2048` takes the room
+from that headroom, a smaller `-moe-cache` makes it. A pass of 4096 makes the
+GPU's own work faster too (more tokens for each expert), and costs 2.2 GiB more
+of it — here the cache's: with 6 GiB decode is 28 tok/s instead of 31.
+
+Most of what k2 gains on a prompt came from two places that were not the experts.
+The per-layer table: 16 random rows of 90 bytes per token, which llama.cpp only
+`madvise`s before the CPU looks them up — 4 s of page faults for a pass of 4096,
+0.3 s read by the pool. And the copies from the cache: llama.cpp copies each run
+of cached experts on the GPU with three command buffers, 6.4 s of host time per
+prompt while the GPU waited. The SSD reads 13.2 GB/s in requests of a few MB;
+the mapping had read it at 1.1-1.5.
 
 An 8 GiB cache over 22.7 GiB of experts hits 94% of the time in generation; the
 other 6% is all the SSD reads, and the read-ahead guesses a third of them. The
 guess is as wide as the router's choice (10 experts): half as wide again caught
 44% of the misses instead of 34%, but read twice as much and decoded at 21.7, and
-twice as wide at 19.6 — reads that go unused slow the ones that are needed.
-Filling the cache from the profile reads 8 GiB and adds 5 s to the load; a
-context rebuilt for a longer prompt does not refill it, since warming up by
-itself costs less than that.
+twice as wide at 19.6 — reads that go unused slow the ones that are needed; with
+`pread` half as wide again catches 46% for no gain. Three slots and not four:
+the laptop had 5-6 GB in swap, and a fourth slot of 450 MB made the copies ten
+times slower through the memory compressor. Filling the cache from the profile
+reads 8 GiB in about a second; a context rebuilt for a longer prompt does not
+refill it, since warming up by itself costs less than that.
 
 For comparison, the same model with that third on the box's GPU over USB 2.0
-instead (`-peers`) decodes at 25.6 tok/s and reads a prompt at 254: another
-machine's memory is still faster than the SSD, but no longer by six times.
+instead (`-peers`) decodes at 25.6 tok/s and reads a prompt at 254: the SSD is
+now the faster of the two.
 
 ## Roadmap
 
@@ -1136,6 +1174,9 @@ machine's memory is still faster than the SSD, but no longer by six times.
       cache measured on Metal, where it costs more than it saves for a model that fits
 - [x] **Experts from the SSD, at speed** — a patched MoE cache: parallel reads,
       next-layer read-ahead, a profile that warms it; 9 → 23 tok/s on a MacBook Pro
+- [x] **Prompts from the SSD, at speed** — `pread` for everything mapped, large
+      batches streamed through host memory, per-layer tables read ahead; a prompt
+      62 → 705 tok/s and decode 23 → 31 on the same laptop
 - [ ] **Bigger than one machine, at speed** — a Thunderbolt 5 link, sizing that
       measures every machine's GPU and places overflow experts by itself
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,

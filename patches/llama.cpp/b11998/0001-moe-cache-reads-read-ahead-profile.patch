@@ -18,33 +18,154 @@ index ae54e66..fae02ae 100644
      LLAMA_API size_t llama_state_seq_get_size(
              struct llama_context * ctx,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 33ad784..3339c11 100644
+index 33ad784..6ea5f1d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -2826,6 +2826,22 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
-         st.ids = ids;
+@@ -563,6 +563,23 @@ llama_context::llama_context(
+             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
+         }
+ 
++        // large batches stream the experts kept in host memory, see llama_moe_stream; their copies are expected in the
++        // order of the layers, gate before up as the graph has them (build_moe_ffn), the stream learns any other
++        std::vector<const ggml_tensor *> host_experts;
++        for (const auto & layer : model.layers) {
++            for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
++                if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer) &&
++                        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                    host_experts.push_back(t);
++                }
++            }
++        }
++        const char * stream_slots = getenv("LLAMA_MOE_STREAM_SLOTS");
++        const int n_stream_slots = stream_slots != nullptr ? atoi(stream_slots) : 3;
++        if (!host_experts.empty() && !model.no_alloc() && n_stream_slots > 0) {
++            moe_stream = std::make_unique<llama_moe_stream>(moe_cache.get(), host_experts, n_stream_slots);
++        }
++
+         sched_reserve();
+ 
+         if (!cparams.flash_attn) {
+@@ -587,6 +604,11 @@ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
++    if (copy_experts.read_size > 0) {
++        LLAMA_LOG_INFO("%s: large batches read %.2f GiB of host experts in %.1f s and uploaded them in %.1f s\n", __func__,
++            copy_experts.read_size/1024.0/1024.0/1024.0, copy_experts.read_ms/1000.0, copy_experts.upload_ms/1000.0);
++    }
++
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.no_alloc() && !opt_ctx) {
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+@@ -2782,6 +2804,12 @@ ggml_status llama_context::graph_compute(
+     return status;
+ }
+ 
++static bool llama_backend_is_rpc(ggml_backend_t backend) {
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
++    return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0;
++}
++
+ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+     auto * lctx = static_cast<llama_context *>(user_data);
+ 
+@@ -2809,6 +2837,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     const int64_t n_expert    = src->ne[2];
+     const size_t  expert_size = src->nb[2];
+ 
++    // the stream writes dst from a pool of threads, which a device behind the network cannot take at once
++    const bool stream = lctx->moe_stream && !llama_backend_is_rpc(backend);
++
+     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+@@ -2827,6 +2858,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
      }
  
-+    // page in the experts to upload with all threads first, consecutive ones together
-+    st.ranges.clear();
-+    for (int64_t e = 0; e < n_expert; ) {
-+        if (!st.used[e] || (lctx->moe_cache && lctx->moe_cache->cached(backend, src, e))) {
-+            e++;
-+            continue;
-+        }
-+        int64_t n = 1;
-+        while (e + n < n_expert && st.used[e + n] && !(lctx->moe_cache && lctx->moe_cache->cached(backend, src, e + n))) {
-+            n++;
-+        }
-+        st.ranges.push_back({ (const uint8_t *) src->data + e*expert_size, n*expert_size });
-+        e += n;
-+    }
-+    llama_moe_cache_read(st.ranges);
-+
      // group consecutive experts and copy them together
++    st.uploads.clear();
++    st.cached.clear();
      for (int64_t first = 0; first < n_expert; ) {
          if (!st.used[first]) {
-@@ -4529,6 +4545,22 @@ bool llama_save_session_file(llama_context * ctx, const char * path_session, con
+             first++;
+@@ -2837,16 +2870,27 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+             last++;
+         }
+ 
+-        // the experts in the MoE cache are copied from device memory, the others are uploaded
++        // the experts in the MoE cache are copied from device memory, the others are uploaded; streamed, the copies are
++        // made by the stream with the uploads: a device copy for each run of cached experts costs the host more time
+         int64_t next = first;
+         for (int64_t e = first; e <= last && lctx->moe_cache; ) {
+-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
++            int64_t n = 0;
++            if (stream) {
++                ggml_tensor * bank = nullptr;
++                int64_t       slot = 0;
++                n = lctx->moe_cache->cached_run(backend, src, e, last, &bank, &slot);
++                if (n > 0) {
++                    st.cached.push_back({ bank, slot, e, n });
++                }
++            } else {
++                n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
++            }
+             if (n == 0) {
+                 e++;
+                 continue;
+             }
+             if (next < e) {
+-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
++                st.uploads.push_back({ (size_t) next*expert_size, (size_t) (e - next)*expert_size });
+             }
+             e   += n;
+             next = e;
+@@ -2857,12 +2901,43 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+         const size_t size    = (last + 1 - next)*expert_size + padding;
+         if (size > 0) {
+-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
++            st.uploads.push_back({ offset, size });
+         }
+ 
+         first = last + 1;
+     }
+ 
++    if (stream) {
++        // the batch selects most experts of the layer when it selects twice as many as there are: worth reading ahead
++        const bool ahead = ids->ne[0]*ids->ne[1] >= 2*n_expert;
++        lctx->moe_stream->upload(backend, src, dst, st.uploads, st.cached, ahead);
++        return true;
++    }
++
++    // the experts uploaded from the host are read first with all threads, from the model file past the page cache when src
++    // is mapped from it, so the upload copies them from memory
++    size_t used = 0;
++    st.at.resize(st.uploads.size());
++    for (size_t i = 0; i < st.uploads.size(); ++i) {
++        st.at[i] = llama_moe_cache_place(used, (const uint8_t *) src->data + st.uploads[i].offset, st.uploads[i].size);
++    }
++    uint8_t * base = llama_moe_cache_stage(st.stage, used);
++    st.reads.clear();
++    for (size_t i = 0; i < st.uploads.size(); ++i) {
++        st.reads.push_back({ (const uint8_t *) src->data + st.uploads[i].offset, st.uploads[i].size, base + st.at[i] });
++    }
++    const int64_t t_read = ggml_time_us();
++    llama_moe_cache_read(st.reads, true);
++    const int64_t t_upload = ggml_time_us();
++    for (size_t i = 0; i < st.uploads.size(); ++i) {
++        ggml_backend_tensor_set_async(backend, dst, base + st.at[i], st.uploads[i].offset, st.uploads[i].size);
++    }
++    st.read_ms   += (t_upload - t_read)/1000.0;
++    st.upload_ms += (ggml_time_us() - t_upload)/1000.0;
++    for (const auto & u : st.uploads) {
++        st.read_size += u.size;
++    }
++
+     return true;
+ }
+ 
+@@ -4529,6 +4604,22 @@ bool llama_save_session_file(llama_context * ctx, const char * path_session, con
      return llama_state_save_file(ctx, path_session, tokens, n_token_count);
  }
  
@@ -68,7 +189,7 @@ index 33ad784..3339c11 100644
  // Intended to be used when saving to state to a buffer.
  size_t llama_state_get_size(llama_context * ctx) {
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 6938fb1..a489fd4 100644
+index 6938fb1..9f9823e 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -262,6 +262,9 @@ public:
@@ -81,19 +202,77 @@ index 6938fb1..a489fd4 100644
  private:
      llm_graph_result * get_gf_res_prev();
  
-@@ -377,6 +380,7 @@ private:
-         const ggml_tensor *  ids = nullptr;
+@@ -308,6 +311,7 @@ private:
+ 
+     llama_memory_ptr memory;
+     llama_moe_cache_ptr moe_cache;
++    std::unique_ptr<llama_moe_stream> moe_stream; // after moe_cache, which it reads
+ 
+     // decode output (2-dimensional array: [n_outputs][n_vocab])
+     buffer_view<float> logits = {nullptr, 0};
+@@ -378,6 +382,18 @@ private:
          std::vector<int32_t> ids_data;
          std::vector<bool>    used;
-+        std::vector<std::pair<const void *, size_t>> ranges; // experts to page in before the upload
  
++        // the parts of the copy uploaded from the host, read into host memory first
++        std::vector<llama_moe_upload> uploads;
++        std::vector<llama_moe_cached> cached; // with a stream
++        std::vector<size_t>           at; // in stage, without a stream
++        std::vector<llama_moe_read>   reads;
++        std::vector<uint8_t>          stage;
++
++        // over the life of the context
++        double read_ms   = 0.0;
++        double upload_ms = 0.0;
++        size_t read_size = 0;
++
          void reset() {
              ids = nullptr;
+             ids_data.clear();
+diff --git a/src/llama-impl.cpp b/src/llama-impl.cpp
+index 4ca836c..147230a 100644
+--- a/src/llama-impl.cpp
++++ b/src/llama-impl.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-impl.h"
+ #include "llama-mmap.h"
++#include "llama-moe-cache.h"
+ 
+ #include "ggml-backend.h"
+ #include "gguf.h"
+@@ -29,14 +30,23 @@ void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_
+     const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+     const auto * base = (const char *) tensor->data;
+ 
+-    std::vector<llama_memory_range> mr;
+-    mr.reserve(n_rows);
++    // read with a pool of threads, and waited for: a table this large stays mapped from the file, where the get_rows
++    // that follows would page the rows in one fault at a time, a random read of the SSD each; on a MacBook Pro the 65536
++    // rows of a batch of 4096 tokens (an n-gram table with 16 heads) took 4 s that way and take 0.3 s this one
++    std::vector<const char *> addrs(n_rows);
+     for (size_t i = 0; i < n_rows; ++i) {
+         GGML_ASSERT(rows[i] >= 0 && rows[i] < tensor->ne[1]);
+-        mr.push_back({ base + (size_t) rows[i] * tensor->nb[1], row_bytes });
++        addrs[i] = base + (size_t) rows[i] * tensor->nb[1];
+     }
++    std::sort(addrs.begin(), addrs.end());
++    addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
+ 
+-    llama_prefetch(std::move(mr));
++    std::vector<llama_moe_read> reads;
++    reads.reserve(addrs.size());
++    for (const char * a : addrs) {
++        reads.push_back({ a, row_bytes, nullptr });
++    }
++    llama_moe_cache_read(reads, false);
+ }
+ 
+ time_meas::time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
-index 6a343a7..b3078ea 100644
+index 6a343a7..733ea69 100644
 --- a/src/llama-moe-cache.cpp
 +++ b/src/llama-moe-cache.cpp
-@@ -7,12 +7,228 @@
+@@ -7,12 +7,454 @@
  #include "ggml-cpp.h"
  
  #include <algorithm>
@@ -112,29 +291,134 @@ index 6a343a7..b3078ea 100644
  #include <vector>
  
 +#ifndef _WIN32
++#include <cerrno>
++#include <fcntl.h>
 +#include <sys/mman.h>
 +#include <unistd.h>
 +#endif
 +
++#if defined(__APPLE__)
++#include <libproc.h>
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
++#endif
++
  namespace {
  
-+// pages in host experts before they are uploaded
-+// experts mapped from a file are read one page fault at a time when the upload copies them, so the kernel is asked
-+// for all of them at once and a pool of threads touches their pages until they are in; experts guessed for the next
-+// layer are only asked for, and arrive while the device computes
++// the files host experts are mapped from
++// a copy from memory mapped from a file pages it in one fault at a time, about 1.5 GB/s with sixteen threads faulting,
++// while the SSD of a MacBook Pro reads 13 GB/s given requests of a few MB from a few threads; so experts are read from
++// the file with pread when the mapping can be traced back to it, and copied from the mapping when it cannot
++struct moe_cache_files {
++    struct region {
++        uintptr_t begin      = 0;
++        uintptr_t end        = 0;
++        uint64_t  off        = 0;  // offset in the file of begin
++        int       fd         = -1; // -1 if the region is not mapped from a file that reads back what is mapped
++        int       fd_nocache = -1; // the same file, read past the page cache
++    };
++
++    std::mutex mutex;
++    std::vector<region> regions; // sorted by begin
++    std::unordered_map<std::string, std::pair<int, int>> fds;
++
++    // shared by every context and never freed, like the files it keeps open
++    static moe_cache_files & get() {
++        static moe_cache_files * res = new moe_cache_files();
++        return *res;
++    }
++
++    // the region of p, or one of size bytes that is not read from a file if p is in none
++    region find(const void * p, size_t size) {
++        const uintptr_t a = (uintptr_t) p;
++        auto after = [](uintptr_t v, const region & r) { return v < r.begin; };
++        std::lock_guard<std::mutex> lock(mutex);
++        auto it = std::upper_bound(regions.begin(), regions.end(), a, after);
++        if (it != regions.begin() && a < std::prev(it)->end) {
++            return *std::prev(it);
++        }
++        region r;
++        if (!lookup(p, r)) {
++            r = {};
++            r.begin = a;
++            r.end   = a + size;
++            return r;
++        }
++        regions.insert(std::upper_bound(regions.begin(), regions.end(), r.begin, after), r);
++        return r;
++    }
++
++private:
++    bool lookup(const void * p, region & r) {
++#if defined(__APPLE__)
++        mach_vm_address_t addr = (mach_vm_address_t) (uintptr_t) p;
++        mach_vm_size_t    size = 0;
++        vm_region_basic_info_data_64_t info;
++        mach_msg_type_number_t count  = VM_REGION_BASIC_INFO_COUNT_64;
++        mach_port_t            object = MACH_PORT_NULL;
++        if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t) &info, &count, &object) != KERN_SUCCESS ||
++                addr > (mach_vm_address_t) (uintptr_t) p) {
++            return false;
++        }
++        r.begin = (uintptr_t) addr;
++        r.end   = (uintptr_t) (addr + size);
++
++        char path[PROC_PIDPATHINFO_MAXSIZE];
++        if (proc_regionfilename(getpid(), (uint64_t) (uintptr_t) p, path, sizeof(path)) <= 0) {
++            return true; // not mapped from a file
++        }
++        auto it = fds.find(path);
++        if (it == fds.end()) {
++            const int fd = open(path, O_RDONLY | O_CLOEXEC);
++            int fd_nocache = open(path, O_RDONLY | O_CLOEXEC);
++            if (fd_nocache >= 0 && fcntl(fd_nocache, F_NOCACHE, 1) != 0) {
++                close(fd_nocache);
++                fd_nocache = -1;
++            }
++            it = fds.emplace(path, std::make_pair(fd, fd_nocache >= 0 ? fd_nocache : fd)).first;
++        }
++        if (it->second.first < 0) {
++            return true;
++        }
++
++        // the file must still hold what is mapped
++        uint8_t buf[256];
++        const size_t   n   = std::min<size_t>(sizeof(buf), r.end - (uintptr_t) p);
++        const uint64_t off = info.offset + ((uintptr_t) p - r.begin);
++        if (pread(it->second.first, buf, n, (off_t) off) != (ssize_t) n || std::memcmp(buf, p, n) != 0) {
++            return true;
++        }
++        r.off        = info.offset;
++        r.fd         = it->second.first;
++        r.fd_nocache = it->second.second;
++        return true;
++#else
++        GGML_UNUSED(p);
++        GGML_UNUSED(r);
++        return false;
++#endif
++    }
++};
++
++// reads host experts into host memory with a pool of threads, in requests of up to chunk bytes, ahead of anything
++// queued to be read ahead; experts guessed for the next layer are read into the page cache while the device computes
 +struct moe_cache_reader {
-+    static constexpr size_t chunk = 64*1024;
++    static constexpr size_t chunk = 2*1024*1024;
 +    static constexpr size_t page  = 4096;
 +
-+    struct range {
-+        const uint8_t * data;
-+        size_t size;
++    struct read {
++        const uint8_t * src;
++        size_t          size;
++        uint8_t       * dst; // nullptr: into the page cache only, for a later read of src
 +    };
 +
 +    struct job {
-+        range r;
-+        bool now;
-+        std::function<void()> fn; // runs instead of reading r
++        read     r;
++        int      fd;  // -1: copied from the mapping
++        uint64_t off; // in the file
++        bool     now;
++        std::function<void()> fn;   // runs instead of a read
++        std::function<void()> done; // runs after the read
 +    };
 +
 +    std::vector<std::thread> threads;
@@ -170,33 +454,67 @@ index 6a343a7..b3078ea 100644
 +        shutdown();
 +    }
 +
-+    // start reading the pages of r without waiting for them
-+    static void advise(const range & r) {
++    // start paging in memory that is not read from a file, without waiting for it
++    static void advise(const uint8_t * data, size_t size) {
 +#ifndef _WIN32
 +        static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
-+        const uintptr_t begin = (uintptr_t) r.data & ~(pg - 1);
-+        const uintptr_t end   = (uintptr_t) r.data + r.size;
++        const uintptr_t begin = (uintptr_t) data & ~(pg - 1);
++        const uintptr_t end   = (uintptr_t) data + size;
 +        if (end > begin) {
 +            madvise((void *) begin, end - begin, MADV_WILLNEED);
 +        }
 +#else
-+        GGML_UNUSED(r);
++        GGML_UNUSED(data);
++        GGML_UNUSED(size);
 +#endif
 +    }
 +
-+    static void touch(const range & r) {
-+        const volatile uint8_t * p = r.data;
++    static void touch(const uint8_t * data, size_t size) {
++        const volatile uint8_t * p = data;
 +        uint8_t sum = 0;
-+        for (size_t o = 0; o < r.size; o += page) {
++        for (size_t o = 0; o < size; o += page) {
 +            sum += p[o];
 +        }
-+        if (r.size > 0) {
-+            sum += p[r.size - 1];
++        if (size > 0) {
++            sum += p[size - 1];
 +        }
 +        (void) sum;
 +    }
 +
++    static void exec(const job & j, std::vector<uint8_t> & scratch) {
++#ifndef _WIN32
++        if (j.fd >= 0) {
++            uint8_t * dst = j.r.dst;
++            if (dst == nullptr) {
++                scratch.resize(chunk);
++                dst = scratch.data();
++            }
++            size_t done = 0;
++            while (done < j.r.size) {
++                const ssize_t n = pread(j.fd, dst + done, j.r.size - done, (off_t) (j.off + done));
++                if (n > 0) {
++                    done += (size_t) n;
++                } else if (n < 0 && errno == EINTR) {
++                    continue;
++                } else {
++                    break;
++                }
++            }
++            if (done == j.r.size) {
++                return;
++            }
++            // a failed read is copied from the mapping instead
++        }
++#endif
++        if (j.r.dst != nullptr) {
++            std::memcpy(j.r.dst, j.r.src, j.r.size);
++        } else {
++            touch(j.r.src, j.r.size);
++        }
++    }
++
 +    void run() {
++        std::vector<uint8_t> scratch;
 +        std::unique_lock<std::mutex> lock(mutex);
 +        while (true) {
 +            cv_job.wait(lock, [&] { return stop || !jobs.empty(); });
@@ -209,7 +527,10 @@ index 6a343a7..b3078ea 100644
 +            if (j.fn) {
 +                j.fn();
 +            } else {
-+                touch(j.r);
++                exec(j, scratch);
++                if (j.done) {
++                    j.done();
++                }
 +            }
 +            lock.lock();
 +            if (j.now && --n_now == 0) {
@@ -218,32 +539,48 @@ index 6a343a7..b3078ea 100644
 +        }
 +    }
 +
-+    static void split(const std::vector<range> & ranges, bool now, std::vector<job> & out) {
-+        for (const range & r : ranges) {
-+            for (size_t o = 0; o < r.size; o += chunk) {
-+                out.push_back({ { r.data + o, std::min(chunk, r.size - o) }, now, nullptr });
++    // requests end at multiples of chunk in the file, so the requests of a large read are aligned
++    static void split(const std::vector<read> & reads, bool now, bool nocache, std::vector<job> & out) {
++        moe_cache_files & files = moe_cache_files::get();
++        moe_cache_files::region reg; // the last one found, likely the region of the next read too
++        for (const read & r : reads) {
++            for (size_t o = 0; o < r.size; ) {
++                const uint8_t * src = r.src + o;
++                if ((uintptr_t) src < reg.begin || (uintptr_t) src >= reg.end) {
++                    reg = files.find(src, r.size - o);
++                }
++                const size_t    n   = std::min(r.size - o, (size_t) (reg.end - (uintptr_t) src));
++                const int       fd  = nocache ? reg.fd_nocache : reg.fd;
++                const uint64_t  off = reg.off + ((uintptr_t) src - reg.begin);
++                if (fd < 0) {
++                    advise(src, n);
++                }
++                for (size_t c = 0; c < n; ) {
++                    const size_t m = std::min(n - c, chunk - (size_t) ((off + c) % chunk));
++                    out.push_back({ { src + c, m, r.dst != nullptr ? r.dst + o + c : nullptr }, fd, off + c, now, nullptr, nullptr });
++                    c += m;
++                }
++                o += n;
 +            }
 +        }
 +    }
 +
-+    // read the ranges with every thread, ahead of anything queued to be read ahead, and wait for them
-+    void read_now(const std::vector<range> & ranges) {
-+        for (const range & r : ranges) {
-+            advise(r);
-+        }
-+        if (threads.empty()) {
-+            for (const range & r : ranges) {
-+                touch(r);
-+            }
-+            return;
-+        }
++    // read with every thread, past the page cache if nocache, and wait for the reads
++    void read_now(const std::vector<read> & reads, bool nocache) {
 +        std::vector<job> js;
-+        split(ranges, true, js);
++        split(reads, true, nocache, js);
 +        if (js.empty()) {
 +            return;
 +        }
++        if (threads.empty()) {
++            std::vector<uint8_t> scratch;
++            for (const job & j : js) {
++                exec(j, scratch);
++            }
++            return;
++        }
 +        std::unique_lock<std::mutex> lock(mutex);
-+        jobs.insert(jobs.begin(), js.begin(), js.end());
++        jobs.insert(jobs.begin(), std::make_move_iterator(js.begin()), std::make_move_iterator(js.end()));
 +        n_now += js.size();
 +        cv_job.notify_all();
 +        cv_done.wait(lock, [&] { return n_now == 0; });
@@ -256,17 +593,85 @@ index 6a343a7..b3078ea 100644
 +        }
 +        std::lock_guard<std::mutex> lock(mutex);
 +        jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [](const job & j) { return !j.now; }), jobs.end());
-+        jobs.push_back({ { nullptr, 0 }, false, std::move(fn) });
++        jobs.push_back({ { nullptr, 0, nullptr }, -1, 0, false, std::move(fn), nullptr });
 +        cv_job.notify_one();
 +    }
 +
-+    // ask for the ranges to be read, without waiting for them
-+    void ahead(const std::vector<range> & ranges) {
-+        for (const range & r : ranges) {
-+            advise(r);
++    // read in the background, behind what is queued, past the page cache if nocache; done runs after each request
++    // returns the number of requests
++    size_t queue(const std::vector<read> & reads, bool nocache, const std::function<void()> & done) {
++        std::vector<job> js;
++        split(reads, false, nocache, js);
++        if (threads.empty()) {
++            std::vector<uint8_t> scratch;
++            for (const job & j : js) {
++                exec(j, scratch);
++                done();
++            }
++            return js.size();
 +        }
++        std::lock_guard<std::mutex> lock(mutex);
++        for (job & j : js) {
++            j.done = done;
++            jobs.push_back(std::move(j));
++        }
++        cv_job.notify_all();
++        return js.size();
++    }
++
++    // run fns with every thread, ahead of everything queued, and wait for them
++    void run_now(std::vector<std::function<void()>> & fns) {
++        if (fns.empty()) {
++            return;
++        }
++        if (threads.empty()) {
++            for (auto & fn : fns) {
++                fn();
++            }
++            return;
++        }
++        std::unique_lock<std::mutex> lock(mutex);
++        for (auto it = fns.rbegin(); it != fns.rend(); ++it) {
++            jobs.push_front({ { nullptr, 0, nullptr }, -1, 0, true, std::move(*it), nullptr });
++        }
++        n_now += fns.size();
++        cv_job.notify_all();
++        cv_done.wait(lock, [&] { return n_now == 0; });
++    }
++
++    // read into the page cache, without waiting for the reads
++    void ahead(const std::vector<read> & reads) {
++        if (threads.empty()) {
++            return;
++        }
++        std::vector<job> js;
++        split(reads, false, false, js);
++        std::lock_guard<std::mutex> lock(mutex);
++        for (job & j : js) {
++            jobs.push_back(std::move(j));
++        }
++        cv_job.notify_all();
 +    }
 +};
++
++// where in host memory to read size bytes from src: at the same offset within a 16 KiB page, which is the offset the
++// file has them at, so the aligned middle of a large read can go straight from the SSD into it
++static size_t moe_cache_place(size_t & used, const void * src, size_t size) {
++    constexpr size_t align = 16384;
++    const size_t o = used + ((uintptr_t) src % align + align - used % align) % align;
++    used = o + size;
++    return o;
++}
++
++// host memory of at least size bytes, aligned to 16 KiB
++static uint8_t * moe_cache_stage(std::vector<uint8_t> & buf, size_t size) {
++    constexpr size_t align = 16384;
++    if (buf.size() < size + align) {
++        std::vector<uint8_t>().swap(buf);
++        buf.resize(size + align);
++    }
++    return (uint8_t *) (((uintptr_t) buf.data() + align - 1) & ~(uintptr_t) (align - 1));
++}
 +
 +// the router of a cached layer on the host, to guess from the input of one layer which experts the next one selects
 +struct moe_cache_router {
@@ -322,7 +727,7 @@ index 6a343a7..b3078ea 100644
  // SLRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
  struct moe_cache_slru {
      int32_t n_expert = 0;
-@@ -253,6 +469,29 @@ struct llama_moe_cache::impl {
+@@ -253,6 +695,40 @@ struct llama_moe_cache::impl {
      // views used by copy_experts
      ggml_context_ptr ctx_views;
  
@@ -345,14 +750,25 @@ index 6a343a7..b3078ea 100644
 +    std::vector<std::vector<uint8_t>> ahead_set;   // [n_layer][n_expert_model] experts read ahead for the layer
 +    std::mutex ahead_mutex;                        // ahead_set and st_read.read_ahead
 +    stats_read st_read;
-+    std::vector<moe_cache_reader::range> ranges;
++
++    // misses are read into host memory and uploaded from there, consecutive experts going to consecutive slots together
++    struct upload {
++        size_t  ip;     // expert tensor
++        int32_t expert;
++        int32_t slot;
++        size_t  n;
++        size_t  at;     // in stage
++    };
++    std::vector<upload> uploads;
++    std::vector<moe_cache_reader::read> reads;
++    std::vector<uint8_t> stage;
 +
 +    moe_cache_reader reader; // last, so its threads stop before what they use goes away
 +
      impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
              n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
          for (size_t i = 0; i < backends.size(); ++i) {
-@@ -466,6 +705,57 @@ struct llama_moe_cache::impl {
+@@ -466,6 +942,57 @@ struct llama_moe_cache::impl {
                  }
              }
          }
@@ -410,7 +826,7 @@ index 6a343a7..b3078ea 100644
      }
  
      ggml_backend_t backend(int32_t il) const {
-@@ -473,6 +763,7 @@ struct llama_moe_cache::impl {
+@@ -473,6 +1000,7 @@ struct llama_moe_cache::impl {
      }
  
      ~impl() {
@@ -418,7 +834,7 @@ index 6a343a7..b3078ea 100644
          log_stats();
      }
  
-@@ -494,6 +785,16 @@ struct llama_moe_cache::impl {
+@@ -494,6 +1022,36 @@ struct llama_moe_cache::impl {
          return it != bindings.end() ? it->second.cached : nullptr;
      }
  
@@ -432,13 +848,35 @@ index 6a343a7..b3078ea 100644
 +        return backend == devices[g.id].backend && slots != nullptr && slots[e] >= 0;
 +    }
 +
++    int64_t cached_run(ggml_backend_t backend, const ggml_tensor * w, int64_t e, int64_t last, ggml_tensor ** bank, int64_t * slot) const {
++        const auto it = bindings.find(w);
++        if (it == bindings.end()) {
++            return 0;
++        }
++        const binding & b = it->second;
++        const group & g = groups[layers[b.il].ig];
++        const int32_t * slots = g.slru.slot_map[b.il];
++        if (backend != devices[g.id].backend || slots == nullptr || slots[e] < 0) {
++            return 0;
++        }
++        int64_t n = 1;
++        while (e + n <= last && slots[e + n] == slots[e] + n) {
++            n++;
++        }
++        *bank = g.banks[b.ip];
++        *slot = slots[e];
++        return n;
++    }
++
      int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
          const auto it = bindings.find(w);
          if (it == bindings.end()) {
-@@ -571,6 +872,38 @@ struct llama_moe_cache::impl {
+@@ -571,22 +1129,62 @@ struct llama_moe_cache::impl {
              GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
          }
  
+-        // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+-        size_t bytes = 0;
 +        for (int32_t id : ids) {
 +            counts[(size_t) il*n_expert_model + id] += 1.0f;
 +        }
@@ -453,28 +891,57 @@ index 6a343a7..b3078ea 100644
 +            }
 +        }
 +
-+        // page in the missing experts with all threads, so the upload copies them from memory
-+        ranges.clear();
-+        for (const ggml_tensor * w : l.experts) {
-+            const size_t expert_size = w->nb[2];
-+            for (size_t i = 0; i < fills.size();) {
-+                size_t n = 1;
-+                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n) {
-+                    n++;
-+                }
-+                ranges.push_back({ (const uint8_t *) w->data + fills[i].expert*expert_size, n*expert_size });
-+                i += n;
-+            }
-+        }
-+        const auto t_read = std::chrono::steady_clock::now();
-+        reader.read_now(ranges);
-+        st_read.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_read).count();
-+        st_read.n_uploads++;
-+
-         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
-         size_t bytes = 0;
++        // read the missing experts into host memory with all threads, from the model file when they are mapped from it,
++        // and upload them from there, in rounds of up to 128 MiB; the backend is idle, synchronized to read the selection
++        uploads.clear();
          for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-@@ -596,9 +929,271 @@ struct llama_moe_cache::impl {
+-            const ggml_tensor * w    = l.experts[ip];
+-            ggml_tensor       * bank = g.banks[ip];
+-            const size_t expert_size = w->nb[2];
+             for (size_t i = 0; i < fills.size();) {
+                 size_t n = 1;
+                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                     n++;
+                 }
+-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+-                bytes += n*expert_size;
++                uploads.push_back({ ip, fills[i].expert, fills[i].slot, n, 0 });
+                 i += n;
+             }
+         }
++        constexpr size_t round = 128u*1024*1024;
++        size_t bytes = 0;
++        for (size_t u0 = 0; u0 < uploads.size(); ) {
++            size_t used = 0;
++            size_t u1   = u0;
++            for (; u1 < uploads.size() && (u1 == u0 || used < round); ++u1) {
++                upload & u = uploads[u1];
++                const ggml_tensor * w = l.experts[u.ip];
++                u.at = moe_cache_place(used, (const uint8_t *) w->data + u.expert*w->nb[2], u.n*w->nb[2]);
++            }
++            uint8_t * base = moe_cache_stage(stage, used);
++            reads.clear();
++            for (size_t k = u0; k < u1; ++k) {
++                const upload & u = uploads[k];
++                const ggml_tensor * w = l.experts[u.ip];
++                reads.push_back({ (const uint8_t *) w->data + u.expert*w->nb[2], u.n*w->nb[2], base + u.at });
++            }
++            const auto t_read = std::chrono::steady_clock::now();
++            reader.read_now(reads, false);
++            st_read.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_read).count();
++            for (size_t k = u0; k < u1; ++k) {
++                const upload & u = uploads[k];
++                const size_t expert_size = l.experts[u.ip]->nb[2];
++                ggml_backend_tensor_set(g.banks[u.ip], base + u.at, u.slot*expert_size, u.n*expert_size);
++                bytes += u.n*expert_size;
++            }
++            u0 = u1;
++        }
++        st_read.n_uploads++;
+ 
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+@@ -596,9 +1194,281 @@ struct llama_moe_cache::impl {
          // the next copy synchronizes the backend before it changes the slot map again
          ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
  
@@ -520,7 +987,8 @@ index 6a343a7..b3078ea 100644
 +        const int64_t n_embd = r.n_embd;
 +        const int32_t n_exp  = n_expert_model;
 +        // as many as are selected: on Flash-Next a guess half as wide again caught 44% of the misses instead of 34%
-+        // but read twice as many experts, and the unused reads slowed the ones that were needed (21.7 against 23.1 tok/s)
++        // but read twice as many experts, and the unused reads slowed the ones that were needed (21.7 against 23.1 tok/s);
++        // with misses read by pread it caught 46% for no gain (31.1 against 30.9), twice as wide was slower (29.1)
 +        const int32_t k = std::min<int32_t>(n_exp, n_expert_used);
 +
 +        std::vector<float>   s(n_exp);
@@ -583,7 +1051,7 @@ index 6a343a7..b3078ea 100644
 +            }
 +        }
 +
-+        std::vector<moe_cache_reader::range> rs;
++        std::vector<moe_cache_reader::read> rs;
 +        size_t n_read = 0;
 +        for (int32_t e = 0; e < n_exp; ++e) {
 +            if (!want[e] || slots[e] >= 0) {
@@ -592,7 +1060,7 @@ index 6a343a7..b3078ea 100644
 +            }
 +            n_read++;
 +            for (const ggml_tensor * w : layers[il].experts) {
-+                rs.push_back({ (const uint8_t *) w->data + (size_t) e*w->nb[2], w->nb[2] });
++                rs.push_back({ (const uint8_t *) w->data + (size_t) e*w->nb[2], w->nb[2], nullptr });
 +            }
 +        }
 +        {
@@ -712,25 +1180,34 @@ index 6a343a7..b3078ea 100644
 +                g.slru.move(s, s < g.n_slots/2);
 +            }
 +
-+            // in batches, each read and copied before the next: read all at once, the first experts would be evicted
-+            // again before they are copied when the cache is larger than the memory the page cache has left
++            // read past the page cache into host memory and uploaded from there, in batches of 512 MiB
 +            constexpr size_t batch = 512u*1024*1024;
++            std::vector<uint8_t> buf;
++            std::vector<size_t>  at;
 +            for (int32_t s0 = 0; s0 < n; ) {
-+                ranges.clear();
-+                size_t bytes = 0;
++                size_t used = 0;
++                at.clear();
 +                int32_t s1 = s0;
-+                for (; s1 < n && bytes < batch; ++s1) {
++                for (; s1 < n && used < batch; ++s1) {
 +                    for (const ggml_tensor * w : layers[items[s1].il].experts) {
-+                        ranges.push_back({ (const uint8_t *) w->data + (size_t) items[s1].e*w->nb[2], w->nb[2] });
-+                        bytes += w->nb[2];
++                        at.push_back(moe_cache_place(used, (const uint8_t *) w->data + (size_t) items[s1].e*w->nb[2], w->nb[2]));
 +                    }
 +                }
-+                reader.read_now(ranges);
++                uint8_t * base = moe_cache_stage(buf, used);
++                reads.clear();
++                size_t k = 0;
++                for (int32_t s = s0; s < s1; ++s) {
++                    for (const ggml_tensor * w : layers[items[s].il].experts) {
++                        reads.push_back({ (const uint8_t *) w->data + (size_t) items[s].e*w->nb[2], w->nb[2], base + at[k++] });
++                    }
++                }
++                reader.read_now(reads, true);
++                k = 0;
 +                for (int32_t s = s0; s < s1; ++s) {
 +                    const layer & l = layers[items[s].il];
 +                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
 +                        const ggml_tensor * w = l.experts[ip];
-+                        ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + (size_t) items[s].e*w->nb[2], (size_t) s*w->nb[2], w->nb[2]);
++                        ggml_backend_tensor_set(g.banks[ip], base + at[k++], (size_t) s*w->nb[2], w->nb[2]);
 +                    }
 +                }
 +                s0 = s1;
@@ -746,7 +1223,7 @@ index 6a343a7..b3078ea 100644
      void log_stats() const {
          auto log = [](const char * name, const stats & st) {
              const size_t n = st.hits + st.misses;
-@@ -613,6 +1208,11 @@ struct llama_moe_cache::impl {
+@@ -613,6 +1483,11 @@ struct llama_moe_cache::impl {
          if (stats_copy.hits > 0) {
              LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
          }
@@ -758,27 +1235,301 @@ index 6a343a7..b3078ea 100644
      }
  };
  
-@@ -642,6 +1242,33 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor
+@@ -642,6 +1517,307 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor
      return pimpl->copy_experts(backend, w, dst, e, last);
  }
  
-+void llama_moe_cache_read(const std::vector<std::pair<const void *, size_t>> & ranges) {
++bool llama_moe_cache::cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const {
++    return pimpl->cached(backend, w, e);
++}
++
++int64_t llama_moe_cache::cached_run(ggml_backend_t backend, const ggml_tensor * w, int64_t e, int64_t last, ggml_tensor ** bank, int64_t * slot) const {
++    return pimpl->cached_run(backend, w, e, last, bank, slot);
++}
++
++struct llama_moe_stream::impl {
++    static constexpr size_t align = 16384;
++    static constexpr size_t chunk = moe_cache_reader::chunk;
++
++    // host memory a weight is read into, laid out like the weight from a 16 KiB boundary on, past the offset of the
++    // weight within its page: the offset the file has it at, so the aligned middle of a read goes straight from the SSD
++    struct slot {
++        const ggml_tensor *  t = nullptr;
++        std::vector<uint8_t> buf;
++        uint8_t *            base = nullptr;
++        std::vector<uint8_t> staged;      // [n_expert] experts read, or being read, into it
++        size_t               pending = 0; // requests still being read into it, under mutex
++        uint64_t             used    = 0; // when it was last uploaded from
++
++        uint8_t * at(size_t offset) const {
++            return base + (uintptr_t) t->data % align + offset;
++        }
++    };
++
++    struct stats {
++        size_t n_uploads  = 0;
++        size_t read_now   = 0; // bytes read when the upload needed them
++        size_t read_ahead = 0; // bytes read ahead of the upload
++        size_t copied     = 0; // bytes written to the device
++        size_t cached     = 0; // of which copied from the cache
++        double wait_ms    = 0.0;
++        double copy_ms    = 0.0;
++    };
++
++    const llama_moe_cache * cache;
++    const size_t slot_size;
++
++    std::vector<slot> slots;
++    std::vector<const ggml_tensor *> order; // host weights in the order of their last copies for large batches
++    size_t   pos   = 0;
++    uint64_t clock = 0;
++
++    // the experts the last upload of each weight used, which the next one reads ahead
++    std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> last;
++
++    std::vector<moe_cache_reader::read> reads;
++    std::vector<std::function<void()>>  fns;
++    ggml_context_ptr ctx_views; // of the copies from the cache
++    size_t n_views = 0;
++
++    std::mutex mutex; // pending
++    std::condition_variable cv;
++    stats st;
++
++    // last, so their threads stop before what they use goes away; the copies have threads of their own, which the
++    // reads queued ahead would otherwise keep busy
++    moe_cache_reader reader;
++    moe_cache_reader copier;
++
++    impl(const llama_moe_cache * cache, const std::vector<const ggml_tensor *> & weights, size_t max_weight, int n_slots) :
++            cache(cache), slot_size(align + max_weight), slots(std::max(n_slots, 2)), order(weights), pos(weights.empty() ? 0 : weights.size() - 1) {
++        const int n_threads = std::clamp((int) std::thread::hardware_concurrency(), 4, 16);
++        reader.start(n_threads);
++        copier.start(n_threads);
++    }
++
++    ~impl() {
++        reader.shutdown();
++        copier.shutdown();
++        if (st.n_uploads > 0) {
++            LLAMA_LOG_INFO("llama_moe_stream: %zu uploads of %.2f GiB (%.2f GiB from the cache) in %.1f s; %.2f GiB read ahead and %.2f GiB when needed, waited for %.1f s\n",
++                st.n_uploads, st.copied/1024.0/1024.0/1024.0, st.cached/1024.0/1024.0/1024.0, st.copy_ms/1000.0,
++                st.read_ahead/1024.0/1024.0/1024.0, st.read_now/1024.0/1024.0/1024.0, st.wait_ms/1000.0);
++        }
++    }
++
++    void wait(slot & s) {
++        std::unique_lock<std::mutex> lock(mutex);
++        cv.wait(lock, [&] { return s.pending == 0; });
++    }
++
++    // the slot holding t, or the one used longest ago of those not holding a weight in keep, emptied for t
++    slot & take(const ggml_tensor * t, const std::vector<const ggml_tensor *> & keep) {
++        for (slot & s : slots) {
++            if (s.t == t) {
++                return s;
++            }
++        }
++        slot * victim = nullptr;
++        for (slot & s : slots) {
++            if (s.t != nullptr && std::find(keep.begin(), keep.end(), s.t) != keep.end()) {
++                continue;
++            }
++            if (victim == nullptr || s.used < victim->used) {
++                victim = &s;
++            }
++        }
++        GGML_ASSERT(victim != nullptr);
++        wait(*victim);
++        victim->t    = t;
++        victim->base = moe_cache_stage(victim->buf, std::max(slot_size, align + ggml_nbytes(t)));
++        victim->staged.assign(t->ne[2], 0);
++        return *victim;
++    }
++
++    // read the experts of the weight in s that its last upload used, or all of them, in the background, but for those in
++    // the cache
++    void read_ahead(ggml_backend_t backend, slot & s) {
++        const ggml_tensor * t = s.t;
++        const size_t  expert_size = t->nb[2];
++        const int64_t n_expert    = t->ne[2];
++        const auto it = last.find(t);
++        const std::vector<uint8_t> * want = it != last.end() ? &it->second : nullptr;
++        reads.clear();
++        size_t bytes = 0;
++        auto skip = [&](int64_t e) {
++            return s.staged[e] || (want != nullptr && !(*want)[e]) || (cache != nullptr && cache->cached(backend, t, e));
++        };
++        for (int64_t e = 0; e < n_expert; ) {
++            if (skip(e)) {
++                e++;
++                continue;
++            }
++            int64_t n = 0;
++            while (e + n < n_expert && !skip(e + n)) {
++                s.staged[e + n] = 1;
++                n++;
++            }
++            reads.push_back({ (const uint8_t *) t->data + e*expert_size, n*expert_size, s.at(e*expert_size) });
++            bytes += n*expert_size;
++            e += n;
++        }
++        if (reads.empty()) {
++            return;
++        }
++        // the requests are counted under the lock their completions take
++        std::lock_guard<std::mutex> lock(mutex);
++        s.pending += reader.queue(reads, true, [this, &s] {
++            std::lock_guard<std::mutex> lock(mutex);
++            if (--s.pending == 0) {
++                cv.notify_all();
++            }
++        });
++        st.read_ahead += bytes;
++    }
++
++    void upload(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<llama_moe_upload> & ups,
++            const std::vector<llama_moe_cached> & cached, bool ahead) {
++        // the order the copies come in, as the copies themselves have it: src goes after the last one, wherever it was
++        size_t want = order.empty() ? 0 : pos + 1;
++        if (want == order.size() && !order.empty() && order[0] == src) {
++            want = 0; // the next batch
++        } else if (want == order.size() || order[want] != src) {
++            const auto it = std::find(order.begin(), order.end(), src);
++            if (it != order.end()) {
++                const size_t j = it - order.begin();
++                order.erase(it);
++                if (j < want) {
++                    want--;
++                }
++            }
++            order.insert(order.begin() + want, src);
++        }
++        pos = want;
++
++        // the weights that come next, one for each other slot, keep the slots they are read into
++        const size_t n_next = std::min(slots.size() - 1, order.size() - 1);
++        std::vector<const ggml_tensor *> next(n_next);
++        for (size_t k = 0; k < n_next; ++k) {
++            next[k] = order[(pos + 1 + k) % order.size()];
++        }
++
++        const auto t_start = ggml_time_us();
++        slot & s = take(src, next);
++
++        // read now what the upload needs that is not in the slot yet: whole experts, and the parts of experts that pad
++        const size_t expert_size = src->nb[2];
++        std::vector<uint8_t> & used = last[src];
++        used.assign(src->ne[2], 0);
++        reads.clear();
++        size_t bytes = 0;
++        for (const llama_moe_upload & u : ups) {
++            for (size_t o = u.offset; o < u.offset + u.size; ) {
++                const size_t e     = o/expert_size;
++                const size_t begin = e*expert_size;
++                const size_t end   = std::min(begin + expert_size, u.offset + u.size);
++                const bool   whole = o == begin && end == begin + expert_size;
++                used[e] |= whole;
++                if (!s.staged[e]) {
++                    s.staged[e] = whole;
++                    if (!reads.empty() && reads.back().src + reads.back().size == (const uint8_t *) src->data + o) {
++                        reads.back().size += end - o;
++                    } else {
++                        reads.push_back({ (const uint8_t *) src->data + o, end - o, s.at(o) });
++                    }
++                    bytes += end - o;
++                }
++                o = end;
++            }
++        }
++        for (const llama_moe_cached & c : cached) {
++            std::fill(used.begin() + c.expert, used.begin() + c.expert + c.n, 1);
++        }
++        reader.read_now(reads, true);
++        wait(s);
++        st.read_now += bytes;
++        const auto t_copy = ggml_time_us();
++        st.wait_ms += (t_copy - t_start)/1000.0;
++
++        // the device is idle, so the host can write dst: the scheduler waits for it before every copy of an input with
++        // a single device, which this does again for the others
++        ggml_backend_synchronize(backend);
++        fns.clear();
++        for (const llama_moe_upload & u : ups) {
++            for (size_t o = 0; o < u.size; o += chunk) {
++                const size_t n = std::min(chunk, u.size - o);
++                const uint8_t * p = s.at(u.offset + o);
++                const size_t  off = u.offset + o;
++                fns.push_back([dst, p, off, n] { ggml_backend_tensor_set(dst, p, off, n); });
++            }
++            st.copied += u.size;
++        }
++        // and the experts in the cache from its banks, which large batches only read
++        if (!ctx_views || n_views < 2*cached.size()) {
++            n_views = 2*std::max(cached.size(), (size_t) src->ne[2]);
++            ggml_init_params params = { n_views*ggml_tensor_overhead(), nullptr, true };
++            ctx_views.reset(ggml_init(params));
++        }
++        ggml_reset(ctx_views.get());
++        for (const llama_moe_cached & c : cached) {
++            ggml_tensor * sv = ggml_view_3d(ctx_views.get(), c.bank, c.bank->ne[0], c.bank->ne[1], c.n, c.bank->nb[1], c.bank->nb[2], c.slot*c.bank->nb[2]);
++            ggml_tensor * dv = ggml_view_3d(ctx_views.get(), dst, dst->ne[0], dst->ne[1], c.n, dst->nb[1], dst->nb[2], c.expert*dst->nb[2]);
++            ggml_backend_view_init(sv);
++            ggml_backend_view_init(dv);
++            fns.push_back([sv, dv] { ggml_backend_tensor_copy(sv, dv); });
++            st.copied += ggml_nbytes(sv);
++            st.cached += ggml_nbytes(sv);
++        }
++        copier.run_now(fns);
++        st.copy_ms += (ggml_time_us() - t_copy)/1000.0;
++        st.n_uploads++;
++        s.used = ++clock;
++
++        // and the weights that come next are read while the device computes this one
++        if (ahead) {
++            for (size_t k = 0; k < n_next; ++k) {
++                read_ahead(backend, take(next[k], next));
++            }
++        }
++    }
++};
++
++llama_moe_stream::llama_moe_stream(const llama_moe_cache * cache, const std::vector<const ggml_tensor *> & weights, int n_slots) {
++    size_t max_weight = 0;
++    for (const ggml_tensor * w : weights) {
++        max_weight = std::max(max_weight, ggml_nbytes(w));
++    }
++    pimpl.reset(new impl(cache, weights, max_weight, n_slots));
++}
++
++llama_moe_stream::~llama_moe_stream() = default;
++
++void llama_moe_stream::upload(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<llama_moe_upload> & ups,
++        const std::vector<llama_moe_cached> & cached, bool ahead) {
++    pimpl->upload(backend, src, dst, ups, cached, ahead);
++}
++
++void llama_moe_cache_read(const std::vector<llama_moe_read> & reads, bool nocache) {
 +    // shared by every context and never freed: it holds no state of theirs, and threads still waiting at exit are harmless
 +    static moe_cache_reader * reader = [] {
 +        auto * r = new moe_cache_reader();
 +        r->start(std::clamp((int) std::thread::hardware_concurrency(), 4, 16));
 +        return r;
 +    }();
-+    std::vector<moe_cache_reader::range> rs;
-+    rs.reserve(ranges.size());
-+    for (const auto & [data, size] : ranges) {
-+        rs.push_back({ (const uint8_t *) data, size });
++    std::vector<moe_cache_reader::read> rs;
++    rs.reserve(reads.size());
++    for (const llama_moe_read & r : reads) {
++        rs.push_back({ (const uint8_t *) r.src, r.size, (uint8_t *) r.dst });
 +    }
-+    reader->read_now(rs);
++    reader->read_now(rs, nocache);
 +}
 +
-+bool llama_moe_cache::cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const {
-+    return pimpl->cached(backend, w, e);
++size_t llama_moe_cache_place(size_t & used, const void * src, size_t size) {
++    return moe_cache_place(used, src, size);
++}
++
++uint8_t * llama_moe_cache_stage(std::vector<uint8_t> & buf, size_t size) {
++    return moe_cache_stage(buf, size);
 +}
 +
 +bool llama_moe_cache::save_profile(const char * path) {
@@ -793,30 +1544,47 @@ index 6a343a7..b3078ea 100644
      std::map<ggml_backend_buffer_type_t, size_t> res;
      for (const auto & d : pimpl->devices) {
 diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
-index 6c8e365..397e19f 100644
+index 6c8e365..97930f5 100644
 --- a/src/llama-moe-cache.h
 +++ b/src/llama-moe-cache.h
-@@ -8,6 +8,9 @@
+@@ -8,6 +8,22 @@
  
  struct llama_model;
  
-+// pages in host memory with a pool of threads, so a copy from memory mapped from a file does not wait for one page fault at a time
-+void llama_moe_cache_read(const std::vector<std::pair<const void *, size_t>> & ranges);
++// a read of size bytes of host memory at src into host memory at dst
++struct llama_moe_read {
++    const void * src;
++    size_t       size;
++    void       * dst;
++};
++
++// reads host memory with a pool of threads: from the file it is mapped from with pread when it is, past the page cache
++// if nocache, instead of the page faults of a copy from the mapping, which come one at a time
++void llama_moe_cache_read(const std::vector<llama_moe_read> & reads, bool nocache);
++
++// where to read size bytes from src into host memory that starts at a 16 KiB boundary, used bytes of which are taken
++// (see moe_cache_place); and that memory, at least size bytes of buf, valid until buf grows again
++size_t    llama_moe_cache_place(size_t & used, const void * src, size_t size);
++uint8_t * llama_moe_cache_stage(std::vector<uint8_t> & buf, size_t size);
 +
  // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
  // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
  class llama_moe_cache {
-@@ -25,6 +28,9 @@ public:
+@@ -25,6 +41,13 @@ public:
      // the experts of w in the cache, nullptr if w is not cached
      ggml_tensor * get_experts(const ggml_tensor * w) const;
  
 +    // whether expert e of w is in the cache of backend
 +    bool cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const;
 +
++    // for large batches: the experts of w from e up to last that are in consecutive slots, starting at slot of bank
++    // returns how many, 0 if expert e is not in the cache
++    int64_t cached_run(ggml_backend_t backend, const ggml_tensor * w, int64_t e, int64_t last, ggml_tensor ** bank, int64_t * slot) const;
++
      // ggml_backend_sched copy callback, returns false if src is not a slot map
      bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
  
-@@ -34,6 +40,13 @@ public:
+@@ -34,9 +57,50 @@ public:
  
      std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
  
@@ -830,3 +1598,40 @@ index 6c8e365..397e19f 100644
  private:
      struct impl;
      std::unique_ptr<impl> pimpl;
+ };
+ 
+ using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
++
++// bytes [offset, offset + size) of a host weight, uploaded to its copy on the device
++struct llama_moe_upload {
++    size_t offset;
++    size_t size;
++};
++
++// experts [expert, expert + n) of a host weight, copied to its copy on the device from slots [slot, slot + n) of bank
++struct llama_moe_cached {
++    ggml_tensor * bank;
++    int64_t       slot;
++    int64_t       expert;
++    int64_t       n;
++};
++
++// the uploads of host experts for large batches, which select most experts of every layer: each weight is read into
++// one of n_slots slots of host memory past the page cache, and the weights whose copies come next, as the order of the
++// copies so far has them, are read into the others while the device computes, the experts their last uploads used but
++// for those in the cache; the upload is then a copy from memory with every thread, from the slot and from the cache
++class llama_moe_stream {
++public:
++    // cache may be nullptr; weights are the host weights, in the order their copies are expected to come in
++    llama_moe_stream(const llama_moe_cache * cache, const std::vector<const ggml_tensor *> & weights, int n_slots);
++    ~llama_moe_stream();
++
++    // write ups of src to its copy dst on backend from the slot of src, and cached from the cache; the device must be
++    // idle; ahead reads the weights that come next
++    void upload(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<llama_moe_upload> & ups,
++        const std::vector<llama_moe_cached> & cached, bool ahead);
++
++private:
++    struct impl;
++    std::unique_ptr<impl> pimpl;
++};

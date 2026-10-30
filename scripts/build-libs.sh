@@ -7,11 +7,13 @@
 #
 # The release libraries (fetch-libs.sh) do everything kinfer needs except serve
 # a mixture of experts whose experts do not all fit on the GPU well. For that,
-# kinfer patches llama.cpp's MoE cache (patches/llama.cpp/$VERSION): misses are
-# read by a pool of threads instead of one page fault at a time, the next
-# layer's experts are guessed and read ahead, and a profile of the experts
-# generation used fills a fresh cache. The libraries land in
-# internal/nativelib/libs/darwin_arm64_${VERSION}k1, which replaces the release
+# kinfer patches llama.cpp (patches/llama.cpp/$VERSION): what stays mapped from
+# the model file is read with pread by a pool of threads instead of one page
+# fault at a time — the MoE cache's misses, the experts a prompt's large
+# batches upload, which are read ahead while the GPU computes, and the rows of
+# a per-layer embedding table — and a profile of the experts generation used
+# fills a fresh cache. The libraries land in
+# internal/nativelib/libs/darwin_arm64_${VERSION}k2, which replaces the release
 # set the way one release replaces another (see fetch-libs.sh).
 #
 # Needs cmake, ninja and Xcode's command line tools; about two minutes on an M4.
@@ -20,12 +22,12 @@
 set -euo pipefail
 
 VERSION=b11998 # the release the patches are made against
-LEVEL=k1       # bumped when the patches change, so a cached copy is not reused
+LEVEL=k2       # bumped when the patches change, so a cached copy is not reused
 SRC=""
 for arg in "$@"; do
   case "$arg" in
   -h | --help)
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *) SRC=$arg ;;

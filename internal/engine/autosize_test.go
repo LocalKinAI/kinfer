@@ -298,3 +298,23 @@ func TestAutoUbatchIsOllamas(t *testing.T) {
 		}
 	}
 }
+
+// A micro-batch that does not fit is halved, so one of 4096 tries 2048 before
+// 1024, and never goes below 512.
+func TestLowerUbatchHalves(t *testing.T) {
+	for _, c := range [][2]int{{8192, 4096}, {4096, 2048}, {2048, 1024}, {1024, 512}, {512, 512}} {
+		if got := lowerUbatch(c[0]); got != c[1] {
+			t.Errorf("lowerUbatch(%d) = %d, want %d", c[0], got, c[1])
+		}
+	}
+}
+
+// A forward pass holds a whole micro-batch when it is larger than
+// batchCapacity, or llama.cpp would cut the micro-batch down to the pass.
+func TestBatchHoldsTheMicroBatch(t *testing.T) {
+	for _, c := range [][2]int{{0, batchCapacity}, {512, batchCapacity}, {2048, batchCapacity}, {4096, 4096}, {8192, 8192}} {
+		if got := batchFor(c[0]); got != c[1] {
+			t.Errorf("batchFor(%d) = %d, want %d", c[0], got, c[1])
+		}
+	}
+}

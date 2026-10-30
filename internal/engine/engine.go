@@ -99,9 +99,10 @@ type Options struct {
 	FixedLayout bool
 
 	// Batch is how many tokens of a prompt the GPU takes in one pass
-	// (llama.cpp's n_ubatch). 0 sizes it the way Ollama does: 2048, 1024 or
-	// 512, by the context and by how much of the memory the model and its
-	// cache take. See autoUbatch.
+	// (llama.cpp's n_ubatch), up to maxBatch. 0 sizes it the way Ollama does:
+	// 2048, 1024 or 512, by the context and by how much of the memory the
+	// model and its cache take (see autoUbatch); 2048 with HostExperts, which
+	// every pass reads again, unless the context leaves too little memory.
 	Batch int
 
 	// Peers are other machines' kinfer workers ("host:port"), whose GPUs
@@ -247,8 +248,12 @@ const (
 	DefaultMaxQueue = 128
 
 	// batchCapacity bounds one forward pass: a full prefill chunk plus a token
-	// for every slot, with room to spare.
+	// for every slot, with room to spare. A micro-batch larger than it makes
+	// the pass that large instead (see batchFor).
 	batchCapacity = 2048
+
+	// maxBatch is the largest micro-batch -batch may ask for.
+	maxBatch = 8192
 
 	// maxFragBuffer caps the per-request fragment queue.
 	maxFragBuffer = 2048
@@ -404,9 +409,18 @@ func Open(path string, opts Options) (*Engine, error) {
 		}
 	}
 	ubAuto := opts.Batch <= 0
-	ub := min(max(opts.Batch, 1), batchCapacity)
+	ub := min(max(opts.Batch, 1), maxBatch)
 	if ubAuto {
 		ub = autoUbatch(longest, sub(bud.atStart, bud.afterModel)+uint64(plan.Estimated), bud.atStart)
+		// Experts in host memory are read again by every pass of a prompt,
+		// and a pass of 2048 reads them a quarter as often as one of 512: on
+		// the MacBook Pro, Flash-Next with 24 layers' experts on the host read
+		// a 7,753-token prompt at 73 tok/s in passes of 512 and 162 in passes
+		// of 2048 (kinfer's patched llama.cpp makes it 502). The context
+		// measured below takes it back down when it costs too much.
+		if opts.HostExperts != 0 {
+			ub = max(ub, ubatchLarge)
+		}
 	}
 	// What was left for us to choose. An explicit flag is never overridden, so
 	// each shrinking step below is taken only where the operator gave no number.
@@ -541,8 +555,16 @@ sizing:
 
 	home := layout{slots: slots, prefix: prefix, perSeq: e.nCtx, shared: shared, ubatch: ub}
 	how := "sized the way Ollama sizes it"
-	if !ubAuto {
+	switch {
+	case !ubAuto:
 		how = "as -batch asked"
+	case opts.HostExperts != 0 && ub < ubatchLarge:
+		// The headroom is not this process's to spend: on a shared machine
+		// it is what other processes' memory crosses the line with.
+		how = fmt.Sprintf("not %d: the host experts are read again by every pass, and %d would leave less than %s free "+
+			"— a smaller -moe-cache makes room, or -batch %d takes it from that", ubatchLarge, ubatchLarge, gib(thinHeadroom), ubatchLarge)
+	case opts.HostExperts != 0:
+		how = "sized for experts in host memory, which every pass reads again"
 	}
 	log.Printf("batch: the GPU reads %d prompt tokens a pass, %s — the model and its cache are %s of %s",
 		ub, how, gib(sub(bud.atStart, bud.afterCtx)), gib(bud.atStart))
@@ -559,7 +581,7 @@ sizing:
 	profile := newExpertProfile(path, moeCache)
 	profile.load(lctx)
 
-	e.sched = newScheduler(lctx, home, vocab, tpl, batchCapacity, queue,
+	e.sched = newScheduler(lctx, home, vocab, tpl, batchFor(ub), queue,
 		deadlines{
 			generate: pick(opts.MaxGenerate, DefaultMaxGenerate),
 			wait:     pick(opts.MaxWait, DefaultMaxWait),
@@ -597,6 +619,13 @@ func contextBuilder(model llama.Model, home layout, bud *budget, moeCache int) f
 	}
 }
 
+// batchFor is how many tokens one forward pass may hold with a micro-batch of
+// ubatch: batchCapacity, or a whole micro-batch when that is larger, so that a
+// prompt is read a micro-batch at a time.
+func batchFor(ubatch int) int {
+	return max(batchCapacity, ubatch)
+}
+
 // newContext asks llama.cpp for a cache holding slots+prefix sequences of
 // perSeq tokens each — or, when the pool is shared, slots conversations' worth
 // of tokens that the pool's sequences borrow from.
@@ -608,11 +637,11 @@ func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatc
 	cp.NSeqMax = uint32(slots + prefix)
 	// llama.cpp divides n_ctx between sequences, so ask for the total.
 	cp.NCtx = uint32(perSeq * Plan{Slots: slots, Prefix: prefix, SharedPool: shared}.Cells())
-	if cp.NBatch < uint32(batchCapacity) {
-		cp.NBatch = uint32(batchCapacity)
+	if cp.NBatch < uint32(batchFor(ubatch)) {
+		cp.NBatch = uint32(batchFor(ubatch))
 	}
 	if ubatch > 0 {
-		cp.NUbatch = uint32(min(ubatch, batchCapacity))
+		cp.NUbatch = uint32(ubatch)
 	}
 	if prefix > 0 {
 		// A cell can only belong to several sequences in the unified buffer,

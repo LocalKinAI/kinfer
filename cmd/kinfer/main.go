@@ -444,7 +444,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.DurationVar(&o.maxGen, "max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
 	fs.DurationVar(&o.maxWait, "max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
 	fs.DurationVar(&o.keepAlive, "keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
-	fs.IntVar(&o.batch, "batch", 0, "prompt tokens the GPU reads in one pass (0 = sized the way Ollama sizes it: 2048, 1024 or 512 by context and memory)")
+	fs.IntVar(&o.batch, "batch", 0, "prompt tokens the GPU reads in one pass, up to 8192 (0 = sized the way Ollama sizes it: 2048, 1024 or 512 by context and memory; 2048 with -host-experts unless memory is short)")
 	fs.BoolVar(&o.flex, "flex", true, "give a prompt too long for a slot a longer one: fewer slots, the same tokens, while it runs (false = keep the layout)")
 	fs.IntVar(&o.hostExperts, "host-experts", 0, "a mixture of experts' routed experts stay in host memory, mapped from the file, for this many of the first layers (-1 = every layer; 0 = none, all on the GPU)")
 	fs.IntVar(&o.moeCache, "moe-cache", 0, "MiB of GPU memory caching the host experts in use, so only a miss is copied (0 = none)")

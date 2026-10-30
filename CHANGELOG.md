@@ -5,6 +5,56 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### Prompts from the SSD at speed: reads with pread, a stream for large batches
+
+The patched cache made generation fast and left prompts slow. On the MacBook Pro,
+Flash-Next with 24 of 48 layers' experts on the host read a 7,753-token prompt
+(the top of the README) at 73 tok/s in passes of 512 tokens, 117 in passes of
+1024 and 162 in passes of 2048: every pass uses most experts of every layer, so
+the host experts are read again for each, and the reads ran at 1.1-1.5 GB/s from
+an SSD that does 13.2 given requests of a few MB from a few threads. The patch
+(`patches/llama.cpp/b11998`, libraries `darwin_arm64_b11998k2`) now:
+
+- reads what stays mapped from the model file with `pread` from a pool of
+  threads, in requests of up to 2 MB, past the page cache for bulk reads, instead
+  of copying it out of the mapping one page fault at a time — the file and offset
+  are found from the mapping itself (`mach_vm_region`, `proc_regionfilename`) and
+  checked against it;
+- streams the experts of large batches (`llama_moe_stream`): each weight is read
+  into one of three slots of host memory, the next two while the GPU computes the
+  current one, in the order the copies came last time (seeded from the layers) and
+  only the experts the previous pass used, then copied into the GPU's copy of the
+  weight by every thread. The experts the MoE cache holds are copied from its
+  banks the same way: a GPU copy for each run of them, three command buffers each,
+  had cost 6.4 s of host time per prompt while the GPU waited;
+- reads the rows of a per-layer embedding table the same way before each pass.
+  Flash-Next's is a 27 GiB n-gram table, 16 random rows of 90 bytes per token, and
+  `llama_prefetch_rows` only `madvise`d them: the CPU's `get_rows` then paged them
+  in one fault at a time, 4 s for a pass of 4096 tokens, against 0.3 s now.
+  DeepSeek-V4.1's table is read through the same call.
+
+A device behind the network (`-peers`) keeps the single-threaded copies, since
+its socket takes one request at a time; `LLAMA_MOE_STREAM_SLOTS` sets the number
+of slots, 0 turns the stream off. Where k1 only added to llama.cpp, k2 also
+changes two of its functions, `sched_copy_experts` and `llama_prefetch_rows`
+(1,380 lines added, 15 replaced).
+
+kinfer's own part: a pass may be as large as `-batch` asks, up to 8192 (the step
+was capped at 2048 before), and with `-host-experts` the automatic micro-batch
+starts at 2048, stepped down while the context leaves less than 2 GiB free.
+
+Same laptop, same model, the builds run back to back on the 7,753-token prompt
+in passes of 2048 with the 8 GiB cache: the release libraries 62 tok/s, last
+night's k1 159, k2 705; in passes of 4096 with a 6 GiB cache k2 reads it at 740.
+The 32-token reply is the same, byte for byte, from every build at every pass.
+Decode is 32.3 / 31.0 / 31.3 tok/s with the 8 GiB cache (23.1 / 22.7 / 23.1 with
+k1) and 28 with 6 GiB. Single runs on this laptop wander by a quarter as it
+heats and swaps, so only runs side by side are compared. Three slots and not
+four: the laptop had 5-6 GB in swap, and the fourth slot's 450 MB made the copies
+ten times slower through the memory compressor. A model without experts is
+unchanged (qwen2.5-0.5b, 172.0 / 171.4 against 166.4 / 173.7 tok/s, the same
+text).
+
 ### Experts from the SSD at speed: a patched MoE cache
 
 On a MacBook Pro (48 GB, 40 GiB for the GPU) Flash-Next IQ3_S does not fit, so

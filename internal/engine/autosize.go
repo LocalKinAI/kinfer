@@ -281,11 +281,9 @@ func ubatchFits(b int, predicted, available uint64) bool {
 	return true
 }
 
+// lowerUbatch is the next smaller micro-batch: half, down to ubatchDefault.
 func lowerUbatch(b int) int {
-	if b > ubatchMedium {
-		return ubatchMedium
-	}
-	return ubatchDefault
+	return max(b/2, ubatchDefault)
 }
 
 // spendableOf is what the cache may cost: half of what the weights left, and

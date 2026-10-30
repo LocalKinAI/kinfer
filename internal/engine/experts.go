@@ -17,14 +17,18 @@ import (
 // touched and kept in the page cache while they are used — and keep the ones
 // in use in a GPU cache (llama-moe-cache.cpp, b11998): only a miss is copied
 // over. It caches only layers whose experts are all in host memory, and only
-// batches of up to 32 tokens; a prompt's larger batches read what the cache
-// holds and leave the rest to the CPU.
+// batches of up to 32 tokens; a prompt's larger batches copy the experts they
+// use to the GPU for each pass, those the cache holds from the cache.
 //
 // It is what Strata does on a Mac with its own engine. kinfer's build of
 // llama.cpp (patches/llama.cpp) adds Strata's other three parts: misses read
-// by a pool of threads instead of one page fault at a time, the next layer's
-// experts guessed from this layer's input and read ahead, and a warm start
-// from the experts generation used last time (expertProfile below).
+// with pread by a pool of threads instead of one page fault at a time, the
+// next layer's experts guessed from this layer's input and read ahead, and a
+// warm start from the experts generation used last time (expertProfile
+// below). It also streams a prompt's larger batches, which read most experts
+// of every layer each pass: the next weights are read ahead into host memory
+// while the GPU computes, and copied to it by every thread. A bigger pass reads
+// them fewer times, which is why -host-experts asks for one (see Open).
 
 // expertsRegex names a layer's routed experts, as llama.cpp's own --cpu-moe
 // does (LLM_FFN_EXPS_REGEX in common/common.h).
