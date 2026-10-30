@@ -79,6 +79,10 @@ const (
 	// FunctionXML is a nested <function=name><parameter=key> form, also inside
 	// <tool_call> tags.
 	FunctionXML
+
+	// DSML is DeepSeek V4.1's own markup; see dsml.go. Detect never returns it:
+	// the V4.1 template is chosen by architecture and names it itself.
+	DSML
 )
 
 func (f Format) String() string {
@@ -87,6 +91,8 @@ func (f Format) String() string {
 		return "hermes"
 	case FunctionXML:
 		return "function-xml"
+	case DSML:
+		return "dsml"
 	default:
 		return "none"
 	}
@@ -119,6 +125,9 @@ func Detect(chatTemplate string) Format {
 func (f Format) Declare(ts []Tool) string {
 	if len(ts) == 0 || f == None {
 		return ""
+	}
+	if f == DSML {
+		return "\n\n" + dsmlToolPrompt(ts)
 	}
 
 	var b strings.Builder
@@ -164,6 +173,12 @@ func writeToolJSON(b *strings.Builder, ts []Tool) {
 // RenderCalls turns an assistant's tool calls back into the text the model
 // produced, so a later turn sees its own earlier output verbatim.
 func (f Format) RenderCalls(calls []Call) string {
+	if f == DSML {
+		if len(calls) == 0 {
+			return ""
+		}
+		return renderDSMLCalls(calls)
+	}
 	var b strings.Builder
 	for _, c := range calls {
 		args := string(c.Arguments)
@@ -196,6 +211,9 @@ func (f Format) RenderCalls(calls []Call) string {
 // what made this package's own mismatch legible — a model answering in the
 // wrong convention showed up as visible garbage instead of silence.
 func (f Format) Parse(reply string) (content string, calls []Call) {
+	if f == DSML {
+		return parseDSML(reply)
+	}
 	if f == None || !strings.Contains(reply, openTag) {
 		return reply, nil
 	}

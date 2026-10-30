@@ -340,6 +340,11 @@ type ollamaMsg struct {
 	Content   string       `json:"content"`
 	Thinking  string       `json:"thinking,omitempty"`
 	ToolCalls []ollamaCall `json:"tool_calls,omitempty"`
+
+	// ReasoningContent is where OpenAI-dialect clients built against DeepSeek's
+	// API send an earlier turn's thinking back. Read only; replies carry it in
+	// their own field.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // ollamaCall is a tool call on the wire. Both dialects nest the call under a
@@ -391,6 +396,16 @@ func wantThinking(raw json.RawMessage) bool {
 	return json.Unmarshal(raw, &s) == nil && s != "" && s != "false"
 }
 
+// thinkLevel is the effort a "think" level string names ("low", "high", …),
+// or "" for a boolean or nothing at all.
+func thinkLevel(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil || s == "true" || s == "false" {
+		return ""
+	}
+	return s
+}
+
 func wireCalls(calls []tools.Call) []ollamaCall {
 	if len(calls) == 0 {
 		return nil
@@ -407,7 +422,10 @@ func wireCalls(calls []tools.Call) []ollamaCall {
 func toChatMessages(in []ollamaMsg) []chat.Message {
 	out := make([]chat.Message, len(in))
 	for i, m := range in {
-		out[i] = chat.Message{Role: m.Role, Content: m.Content}
+		out[i] = chat.Message{Role: m.Role, Content: m.Content, Thinking: m.Thinking}
+		if out[i].Thinking == "" {
+			out[i].Thinking = m.ReasoningContent
+		}
 		for _, c := range m.ToolCalls {
 			out[i].ToolCalls = append(out[i].ToolCalls, c.Function)
 		}
@@ -528,6 +546,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	params := applyOllamaOptions(engine.DefaultGenParams(), req.Options)
 	params.Tools = req.Tools
 	params.NoThink = thinkOff(req.Think)
+	params.Effort = thinkLevel(req.Think)
 
 	if len(req.Tools) > 0 && eng.ToolFormat() == tools.None {
 		// Declaring functions to a model that was never trained on this
@@ -806,6 +825,10 @@ type openAIChatRequest struct {
 	Tools       []tools.Tool    `json:"tools"`
 	Think       json.RawMessage `json:"think"`
 
+	// ReasoningEffort is OpenAI's thinking knob: "none" turns thinking off,
+	// any other level is passed to models that take an effort.
+	ReasoningEffort string `json:"reasoning_effort"`
+
 	// StreamOptions is where a streaming caller asks for token counts. OpenAI
 	// sends usage on a stream only when include_usage is set, in one extra
 	// chunk after the last content — so a client that did not ask must not get
@@ -850,6 +873,14 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	params := engine.DefaultGenParams()
 	params.Tools = req.Tools
 	params.NoThink = thinkOff(req.Think)
+	params.Effort = thinkLevel(req.Think)
+	switch req.ReasoningEffort {
+	case "":
+	case "none":
+		params.NoThink = true
+	default:
+		params.Effort = req.ReasoningEffort
+	}
 	if req.Temperature != nil {
 		params.Temperature = float32(*req.Temperature)
 	}

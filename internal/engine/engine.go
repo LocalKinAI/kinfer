@@ -121,6 +121,16 @@ type GenParams struct {
 	// showing the thinking: hidden thinking still costs every token and every
 	// second it takes, which with a token budget leaves nothing for the reply.
 	NoThink bool
+
+	// Effort is how hard a reasoning model that takes a budget should think:
+	// "low", "high", "max", or a number from 1 to 100. Empty is the model's
+	// default. Templates without such a budget ignore it.
+	Effort string
+}
+
+// thinking is the reasoning a job asked for, in the form templates take.
+func (p GenParams) thinking() chat.Thinking {
+	return chat.Thinking{Off: p.NoThink, Effort: p.Effort}
 }
 
 // Stats are the token counts and timings for one reply.

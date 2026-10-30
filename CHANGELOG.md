@@ -5,6 +5,42 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### DeepSeek-V4.1 prompts, rendered by kinfer
+
+Loading V4.1 was not serving it. llama.cpp has no V4 chat family, and matched
+against the ones it has, V4.1's template passes for DeepSeek-V3's: no system
+token, no think markers, no DSML. Close enough to answer, wrong in every turn.
+
+So a model whose GGUF says `deepseek41` now gets a renderer ported from the
+encoder DeepSeek ships with the model (`encoding/encoding.py` in
+deepseek-ai/DeepSeek-V4.1-Flash-1017). It is checked byte for byte against
+four of the five conversations DeepSeek publishes with that encoder, now in
+`internal/chat/testdata/deepseek-v4.1`; the fifth hangs its tools on a system
+message mid-conversation, which kinfer's API cannot say. The assertions of
+DeepSeek's encoder tests are ported as well. Where its server library,
+deepseek-recipe, differs from the model's own encoder, the encoder wins; the
+only difference that reaches kinfer is whether a running tool loop keeps its
+reasoning when no functions are declared (the encoder keeps it).
+
+- **Tool calls in DSML**, V4.1's markup: declared in DeepSeek's words, written
+  back into history as the model wrote them, parsed out of replies. The parser
+  takes V4's unspaced tags too, as DeepSeek's server does, and keeps arguments
+  valid JSON even when the model flags a non-JSON value as JSON. Schemas and
+  non-string arguments are printed as Python's `json.dumps` prints them —
+  `", "`, key order kept, `1e-05`, non-ASCII as is — because the encoder is
+  Python and that is the spelling the model read in training.
+- **The think block the prompt opens.** V4.1's prompt ends in
+  `<｜Assistant｜><think>`, so the model writes only `</think>`. The engine
+  reports the opening tag in front of the reply, and every splitter downstream
+  works unchanged. Checked on a real model with the template forced: thinking
+  on, the reply begins `<think>`; off, it does not.
+- **Reasoning effort.** `"think": "low"|"high"|"max"` and OpenAI's
+  `reasoning_effort` (where `"none"` is off) reach the engine; V4.1 states the
+  budget as 50, 75 or 100, or a number from 1 to 100. Other templates ignore it.
+- **Earlier thinking.** An assistant turn's `thinking`, or DeepSeek's
+  `reasoning_content`, is kept and rendered where V4.1 expects it.
+- `llama.ModelMeta` reads GGUF metadata, which is how the architecture is known.
+
 ### llama.cpp b11175 → b11998: DeepSeek-V4.1 and GLM-5.3-Flash load
 
 b11175 did not know `deepseek41` (DeepSeek-V4.1-Flash, merged upstream on
@@ -29,9 +65,7 @@ old and new binaries back to back with nothing else loaded: decode 105.6 →
 The libraries grew from 8.8 to 12.4 MB, the binary to 24 MB.
 
 Loading is not serving. llama.cpp's built-in templates include no DeepSeek V4
-family, so a V4.1 conversation would fall through to kinfer's ChatML fallback,
-a format the model was not trained on. V4.1 needs its own renderer before
-kinfer can serve it.
+family; V4.1 needs a renderer of its own, which the entry above adds.
 
 ### llama.cpp b10901 → b11175, and Ollama's micro-batch
 

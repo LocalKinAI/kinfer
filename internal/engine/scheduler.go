@@ -15,6 +15,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/llama"
 	"github.com/LocalKinAI/kinfer/internal/sampling"
+	"github.com/LocalKinAI/kinfer/internal/tools"
 )
 
 // Prefill is first-come, first-served, not fair-shared.
@@ -478,12 +479,17 @@ func (s *scheduler) prepare(j *job) bool {
 
 // tokenizer renders and tokenizes a conversation the way j asked for it.
 func (s *scheduler) tokenizer(j *job) func([]chat.Message) ([]llama.Token, error) {
-	render := s.tpl.Render
-	if j.params.NoThink {
-		render = s.tpl.RenderNoThink
-	}
+	render := s.renderer(j)
 	return func(msgs []chat.Message) ([]llama.Token, error) {
 		return llama.Tokenize(s.vocab, render(msgs, j.params.Tools), true, true)
+	}
+}
+
+// renderer renders a conversation with the thinking j asked for.
+func (s *scheduler) renderer(j *job) func([]chat.Message, []tools.Tool) string {
+	th := j.params.thinking()
+	return func(msgs []chat.Message, ts []tools.Tool) string {
+		return s.tpl.RenderWith(msgs, ts, th)
 	}
 }
 
@@ -492,10 +498,7 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 		return
 	}
 
-	render := s.tpl.Render
-	if j.params.NoThink {
-		render = s.tpl.RenderNoThink
-	}
+	render := s.renderer(j)
 	tokenize := s.tokenizer(j)
 	// fitMessages renders the whole conversation first, and prepare already
 	// did exactly that; the cuts after it render afresh.
@@ -625,6 +628,12 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	sl.maxGen = maxGen
 	sl.emitted = 0
 	sl.out.Reset()
+	if s.tpl.OpensThink(j.params.thinking()) {
+		// The prompt opened the think block, so the model writes only its
+		// close. Reported from here, the reply reads as every other reasoning
+		// model's does, and the splitters downstream need no exception.
+		sl.out.WriteString("<think>")
+	}
 	sl.logitIdx = -1
 	sl.admitted = time.Now()
 	sl.evalStart = time.Time{}

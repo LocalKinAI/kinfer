@@ -209,6 +209,7 @@ var (
 	modelChatTemplate    func(m Model, name *byte) *byte
 	chatApplyTemplate    func(tmpl *byte, msgs *chatMessage, n uint64, addAss bool, buf *byte, length int32) int32
 	chatBuiltinTemplates func(out **byte, n uint64) int32
+	modelMetaValStr      func(m Model, key *byte, buf *byte, size uint64) int32
 )
 
 // chatMessage mirrors struct llama_chat_message: two C strings.
@@ -309,6 +310,7 @@ func bind(dir string) error {
 		{&modelChatTemplate, "llama_model_chat_template"},
 		{&chatApplyTemplate, "llama_chat_apply_template"},
 		{&chatBuiltinTemplates, "llama_chat_builtin_templates"},
+		{&modelMetaValStr, "llama_model_meta_val_str"},
 	} {
 		// RegisterLibFunc panics on a missing symbol, which would abort the
 		// program on an unexpected llama.cpp build. Convert it to an error so
@@ -725,6 +727,26 @@ func ChatTemplate(m Model) string {
 		return ""
 	}
 	return goString(p)
+}
+
+// ModelMeta returns a GGUF metadata value as text, such as
+// "general.architecture", or "" when the key is absent.
+func ModelMeta(m Model, key string) string {
+	k := append([]byte(key), 0)
+	buf := make([]byte, 256)
+	n := modelMetaValStr(m, &k[0], &buf[0], uint64(len(buf)))
+	if n < 0 {
+		return ""
+	}
+	if int(n) >= len(buf) {
+		// The return is the full length, as snprintf's is; ask again with room.
+		buf = make([]byte, n+1)
+		n = modelMetaValStr(m, &k[0], &buf[0], uint64(len(buf)))
+		if n < 0 {
+			return ""
+		}
+	}
+	return string(buf[:n])
 }
 
 // ApplyChatTemplate renders a conversation the way the model was fine-tuned to

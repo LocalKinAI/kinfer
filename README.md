@@ -726,13 +726,26 @@ signatures join the end of the system prompt, an assistant's calls become
 template then has nothing unusual left to render.
 
 **There is no single convention**, so kinfer reads which one a model knows out
-of its own chat template and both declares and parses in that one. Two are
+of its own chat template and both declares and parses in that one. Three are
 implemented:
 
 | | declaration | a call looks like |
 |---|---|---|
 | **hermes** | "You may call one or more functions…" | `<tool_call>{"name":…,"arguments":{…}}</tool_call>` |
 | **function-xml** | "You have access to the following functions:" | `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>` |
+| **dsml** | "## Tools … You can invoke tools by writing a…" | `<｜DSML｜ calls><｜DSML｜ invoke name="f"><｜DSML｜ parameter name="k" string="true">v</｜DSML｜ parameter>…</｜DSML｜ calls>` |
+
+DSML is DeepSeek V4.1's, and it comes with a prompt format llama.cpp has no
+family for: matched against its built-in templates, V4.1's would pass for
+DeepSeek-V3's, without the system token, the think markers or DSML. So for a
+`deepseek41` model kinfer renders the whole prompt itself, porting the encoder
+DeepSeek ships with the model (`encoding/encoding.py`), and is tested byte for
+byte against the conversations DeepSeek publishes beside it
+(`internal/chat/testdata/deepseek-v4.1`). The prompt opens the reply's think
+block, so kinfer reports the `<think>` the model never writes, and the reply
+reads like any other reasoning model's. Earlier turns' thinking, sent back as
+`thinking` or as DeepSeek's `reasoning_content`, is rendered where V4.1 expects
+it: in every turn when functions are declared, in the current one otherwise.
 
 Getting this wrong is not a near miss. Told to answer in JSON when it had been
 taught the XML form, `ornith-1.5:35b` produced `{"name":_get_weather"` —
@@ -779,6 +792,12 @@ as it does from Ollama; `content` is the answer and nothing else either way.
 `"think": false` keeps the model out of its think block altogether. Dropping the
 thinking when the field was absent — the old behaviour — returned an empty reply
 with nothing to show for it whenever a reasoning model ran out of time.
+
+A level — `"think": "low"`, `"high"` or `"max"`, or OpenAI's
+`"reasoning_effort"`, where `"none"` is off — is passed to models that take a
+reasoning budget. DeepSeek V4.1 does, as a line at the top of its prompt
+("Reasoning Effort: 50", 75 or 100, or any number from 1 to 100); models
+without one ignore it.
 
 A reasoning model can spend an entire token budget thinking and return an empty
 answer, so a reply cut short by the budget reports `done_reason: "length"` —

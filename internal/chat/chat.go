@@ -33,6 +33,19 @@ type Message struct {
 
 	// ToolCalls are the functions an assistant turn asked to have run.
 	ToolCalls []tools.Call
+
+	// Thinking is an earlier assistant turn's working out, as the client sent
+	// it back. Most templates drop it; DeepSeek V4.1 renders it again inside a
+	// tool loop, where the model reads its own reasoning before the next call.
+	Thinking string
+}
+
+// Thinking is how a reply should reason: not at all, or with an effort level
+// ("low", "high", "max", or a number from 1 to 100) for the models that take
+// one. The zero value is a reasoning model's default.
+type Thinking struct {
+	Off    bool
+	Effort string
 }
 
 // Template renders a conversation and reports the model's stop markers.
@@ -72,7 +85,32 @@ type Template struct {
 	// its own template. Declaring functions in another one makes the model
 	// fight its training rather than answer.
 	toolFmt tools.Format
+
+	// renderAll, when set, renders the whole conversation itself — tools,
+	// thinking and effort included — instead of going through fold and
+	// render. A template that needs more than {role, content} uses it.
+	renderAll func(msgs []Message, ts []tools.Tool, th Thinking) string
+
+	// opensThink says the prompt itself opens the think block when thinking
+	// is on, so the reply begins inside it with no <think> of its own.
+	opensThink bool
 }
+
+// RenderWith renders the conversation for a reply that reasons as th says.
+func (t *Template) RenderWith(msgs []Message, ts []tools.Tool, th Thinking) string {
+	if t.renderAll != nil {
+		return t.renderAll(msgs, ts, th)
+	}
+	if th.Off {
+		return t.RenderNoThink(msgs, ts)
+	}
+	return t.Render(msgs, ts)
+}
+
+// OpensThink reports that a reply rendered with th starts inside a think
+// block the prompt opened. Whatever reads the reply must then treat it as
+// thinking until </think>, though no <think> ever arrives.
+func (t *Template) OpensThink(th Thinking) bool { return t.opensThink && !th.Off }
 
 // Render builds the prompt, ending in the assistant's opening so the model
 // continues as the assistant rather than inventing another user turn.
@@ -83,12 +121,18 @@ type Template struct {
 // through the C API — but the convention they encode can be reproduced, and
 // then the template has nothing unusual left to render.
 func (t *Template) Render(msgs []Message, ts []tools.Tool) string {
+	if t.renderAll != nil {
+		return t.renderAll(msgs, ts, Thinking{})
+	}
 	return t.render(fold(msgs, ts, t.toolFmt))
 }
 
 // RenderNoThink is Render with the model told not to think first. For a model
 // whose template has no thinking switch it is Render exactly.
 func (t *Template) RenderNoThink(msgs []Message, ts []tools.Tool) string {
+	if t.renderAll != nil {
+		return t.renderAll(msgs, ts, Thinking{Off: true})
+	}
 	return t.Render(msgs, ts) + t.noThink
 }
 
@@ -228,9 +272,10 @@ var mistral = &Template{
 }
 
 var families = map[string]*Template{
-	chatml.Name:  chatml,
-	llama3.Name:  llama3,
-	mistral.Name: mistral,
+	chatml.Name:      chatml,
+	llama3.Name:      llama3,
+	mistral.Name:     mistral,
+	deepseekV41.Name: deepseekV41,
 }
 
 // Get returns a template by family name.
@@ -259,6 +304,13 @@ func Get(name string) (*Template, error) {
 func FromModel(model llama.Model, path string) *Template {
 	if model == 0 {
 		return Detect(path)
+	}
+	// llama.cpp has no V4 family. It would match V4.1's template to its
+	// DeepSeek-V3 one, which has no system token, no think markers and no
+	// DSML: close enough to answer, wrong in every turn. So the architecture
+	// decides, before the template is asked.
+	if llama.ModelMeta(model, "general.architecture") == "deepseek41" {
+		return deepseekV41
 	}
 	tmpl := llama.ChatTemplate(model)
 	if tmpl == "" {

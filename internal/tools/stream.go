@@ -25,8 +25,9 @@ type CallSplitter struct {
 
 // openMarkers are the ways a call can begin. Both conventions Detect knows
 // open with <tool_call>; the XML one is also recognisable by its first element,
-// which some models emit without the outer tag.
-var openMarkers = []string{openTag, "<function="}
+// which some models emit without the outer tag. DeepSeek V4.1's every DSML tag
+// begins <｜DSML｜.
+var openMarkers = []string{openTag, "<function=", dsmlOpen}
 
 // Next takes the next fragment and returns whatever prose can be shown now.
 func (s *CallSplitter) Next(frag string) string {
@@ -70,6 +71,20 @@ func (s *CallSplitter) Flush() string {
 	s.held.Reset()
 	if j := strings.LastIndex(held, closeTag); j >= 0 {
 		return held[j+len(closeTag):]
+	}
+	if strings.HasPrefix(held, dsmlOpen) {
+		// After the last DSML block, which may close in either spelling.
+		tail, closed := held, false
+		for {
+			_, after, ok := findDSMLTag(tail, true, "tool_calls>", "calls>")
+			if !ok {
+				break
+			}
+			tail, closed = tail[after:], true
+		}
+		if closed {
+			return tail
+		}
 	}
 	return held
 }
