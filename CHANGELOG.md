@@ -9,7 +9,10 @@ the SSD on a Mac, did first what kinfer's patch does in llama.cpp's MoE cache:
 the misses read by a pool of threads, the next layer's experts guessed from its
 router and read ahead, a profile of the experts generation uses filling the
 cache at load. kinfer's own are the streamed prompt passes, the per-layer table
-read in parallel, and the placement on one machine or several.
+read in parallel, and the placement on one machine or several. The README
+gives each step's share of the 7,753-token prompt on the MacBook Pro: 62 tok/s
+with the release, 159 with Strata's three parts, 306 reading with pread, then
+kinfer's own 391, 445 and 701. Decode is mostly Strata's way: 9, 23, 31.
 
 ### Measured against Ollama on the MacBook Pro
 

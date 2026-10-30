@@ -143,15 +143,30 @@ The settings are not the difference; kinfer's build of llama.cpp is. It reads
 the experts the cache misses with a pool of threads instead of a page fault at a
 time, reads the next ones ahead, and streams a prompt's passes.
 
-The way there is Strata's, whose own engine runs a mixture of experts from the
-SSD on a Mac: a GPU cache of the experts in use with the rest read from the
-file, misses read by a pool of threads, the next layer's experts guessed from
-its router and read ahead, and a profile of the experts generation uses filling
-the cache at load. kinfer does those in llama.cpp, whose MoE cache it patches,
-and adds its own: a prompt's passes streamed through host memory, the rows of a
-per-layer table read in parallel (most of what made prompts fast), and the
-model placed by itself, on one machine or across several. How it works, and
-every measurement behind it: [docs/big-models.md](docs/big-models.md).
+Part of the way there is Strata's, whose own engine runs a mixture of experts
+from the SSD on a Mac: a GPU cache of the experts in use with the rest read from
+the file, misses read by a pool of threads, the next layer's experts guessed
+from its router and read ahead, and a profile of the experts generation uses
+filling the cache at load. kinfer does those in llama.cpp, whose MoE cache it
+patches; the rest is its own. Step by step on the MacBook Pro, the 7,753-token
+prompt (each step measured as it was made, and the laptop wanders by a quarter
+from run to run):
+
+| step | whose | prompt |
+|---|---|---:|
+| llama.cpp's release, 24 layers' experts on the host, an 8 GiB cache | | 62 tok/s |
+| misses read in parallel, the next layer read ahead, a profile at load | Strata's | 159 tok/s |
+| everything mapped read with `pread` by a pool of threads | Strata's way, kinfer's code | 306 tok/s |
+| a prompt's passes streamed through host memory, cached experts copied on the host | kinfer | 391 tok/s |
+| passes of 4096 | kinfer | 445 tok/s |
+| the rows of the per-layer table read in parallel | kinfer | 701 tok/s |
+| placed by itself, no flags | kinfer | 706-726 tok/s |
+
+Decode is mostly Strata's way: 9 tok/s with the release, 23 with its three
+parts, 31 once misses were read with `pread`. Reading a prompt is mostly
+kinfer's, and so is choosing where the model goes, on one machine or across
+several. How it works, and every measurement behind it:
+[docs/big-models.md](docs/big-models.md).
 
 ## What else it does
 
