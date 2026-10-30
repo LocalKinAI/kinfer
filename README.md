@@ -182,11 +182,12 @@ $ kinfer plan Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S          on the box, 77.8 GiB bud
   left for cache    26.7 GB
 ```
 
-Counted as weights, that file was 117.8 MB too large for the box — which is why
-it sat there unused from October 11, when it was downloaded to try, until
-October 29. Loaded, it takes 50.7 GiB, leaves 27 GiB for 8 slots + 4 prefix x
-32768, and decodes at 44.5 tok/s: a better quantisation of the same model than
-the UD-Q2_K_XL the box ran before (41.9 tok/s on b11175), on the one machine.
+Counted as weights, that file was 117.8 MB too large for the box, and `plan` said
+so. `serve` never believed it: it sizes from what the load measures, llama.cpp
+already left the table on disk, and the box's server has run this file since
+the evening it was downloaded — 42 loads from October 11 to 28, 51.0 GiB of model
+each time. Only the estimate was wrong. On b11998 it takes 50.7 GiB, leaves
+27 GiB for 8 slots + 4 prefix x 32768, and decodes at 44.5 tok/s.
 
 ### `-slots` without `-ctx`: each model's context sized the way Ollama sizes one
 
@@ -967,8 +968,8 @@ kinfer plan -ctx 16384 Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S
   For -ctx 16384: kinfer serve -ctx 16384 -slots 8
 ```
 
-The same model's UD-Q2_K_XL, before the n-gram table was left on disk, had
-4.3 GB left for cache and room for two slots of 16384.
+The UD-Q2_K_XL this example used before was 73.5 GB of weights by the same
+arithmetic, with 4.3 GB left for cache and room for two slots of 16384.
 
 `-ctx` is per conversation and gets multiplied by the slot count, which is the
 part that surprises people — raising `-slots` from 2 to 4 doubles the cache. The

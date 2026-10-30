@@ -7,11 +7,13 @@ Everything below was built and measured on one 96 GB Mac Studio against a
 
 ### Sizing counts what stays in memory, not what is on disk
 
-llama.cpp b11998 leaves one table of three architectures on disk and reads it a
-few rows a token: `per_layer_token_embd`, which is DeepSeek-V4.1's 111 GB n-gram
-table, Qwen3.8-Flash-Next's, and Gemma 4's per-layer embeddings — marked
-`TENSOR_READ_LAZY` by their loaders and honoured over 4 GiB. kinfer judged every
-model by its file size, so it counted the table as weights.
+llama.cpp leaves one table of three architectures on disk and reads it a few rows
+a token: `per_layer_token_embd`, which is DeepSeek-V4.1's 111 GB n-gram table
+(the architecture new in b11998), Qwen3.8-Flash-Next's (already in b11175), and
+Gemma 4's per-layer embeddings — marked `TENSOR_READ_LAZY` by their loaders and
+honoured over 4 GiB. `serve` was never fooled: it sizes from what the load
+measures. Everything that estimates beforehand judged a model by its file size,
+and counted the table as weights.
 
 The header now says how big the table is. `store.ReadShape` reads the tensor
 offsets of every shard (a split model's table usually sits in a later one, and
@@ -27,13 +29,16 @@ in ISTA's V4.1 layout that file is a link to a shared one) and reports
 - `/api/ps` reports the loaded model's size without the table, as Ollama's does.
 
 On the box, the ISTA Flash-Next IQ3_S (54.8 + 28.8 GB, the second file its
-n-gram table) had been on disk since October 11, downloaded to try, and never
-loaded: `plan` said it did not fit, by 117.8 MB. It now counts 51.1 GiB of
-weights and 26.8 read from disk, and loaded it takes 50.7 GiB of the 77.8 GiB
-budget, leaving 27 GiB for 8 slots + 4 prefix x 32768 and 5.8 free. It decodes
-at 44.5 tok/s and reads a 7,024-token prompt at 666 tok/s — a better
-quantisation than the UD-Q2_K_XL the box ran before, which decoded at 41.9 on
-b11175 and left 4.3 GB for cache. Nothing was downloaded to find this out.
+n-gram table) is the model the server has run since the evening it was
+downloaded: 42 loads from October 11 to 28, each 51.0 GiB of model by the load's
+own measurement. All that time `plan` said it did not fit, by 117.8 MB. It now
+counts 51.1 GiB of weights and 26.8 read from disk. Loaded with b11998 it takes
+50.7 GiB of the 77.8 GiB budget, leaving 27 GiB for 8 slots + 4 prefix x 32768
+and 5.8 free; it decodes at 44.5 tok/s and reads a 7,024-token prompt at
+666 tok/s.
+
+An earlier version of this entry, and commit ea62147, said the file had sat
+unused until now. It had not; the server's own log says otherwise.
 
 ### An exact prefix pool copies whole sequences, and says so
 
