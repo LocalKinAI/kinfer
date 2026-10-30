@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Measured against Ollama on the MacBook Pro
+
+Ollama 0.40.13 runs Flash-Next IQ3_S on the laptop. As it sets itself up,
+llama.cpp's own fit with 13.2 GiB of experts for the CPU, it reads the
+7,753-token prompt at 17 tok/s and decodes at 7-8. Its `llama-server` given
+kinfer's hand-tuned MoE settings (24 layers' experts on the host, an 8 GiB
+cache, passes of 2048) reads it at 81 and still decodes at 6-8. kinfer with no
+flags: 716 and 28. The same reply from all three; the tables are in the README
+and docs/big-models.md.
+
 ## v0.1.0 — 2026-10-30
 
 The first release: a binary for Apple Silicon with the patched llama.cpp

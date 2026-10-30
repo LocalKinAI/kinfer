@@ -128,8 +128,21 @@ rows a token — with no flags; a 7,753-token prompt and three 200-token replies
 experts from the SSD at that speed takes kinfer's build of llama.cpp
 (`scripts/build-libs.sh`, below); with the release libraries the MacBook Pro
 decoded at 9 tok/s. Over that USB 2.0 cable the laptop's own SSD beat the other
-machine's GPU; a Thunderbolt 5 link is the next measurement. How it works, and
-every measurement behind it: [docs/big-models.md](docs/big-models.md).
+machine's GPU; a Thunderbolt 5 link is the next measurement.
+
+Against Ollama on the same MacBook Pro, from the same files, the same requests
+back to back, and the same reply from all three:
+
+| | prompt | decode |
+|---|---:|---:|
+| Ollama 0.40.13, as it sets itself up | 17 tok/s | 6.9-8.4 tok/s |
+| Ollama's `llama-server` with kinfer's hand-tuned settings (`--n-cpu-moe 24 --moe-cache-mib 8192 -ub 2048`) | 81 tok/s | 6.3-8.2 tok/s |
+| kinfer, no flags | 716 tok/s | 27.9-28.4 tok/s |
+
+The settings are not the difference; kinfer's build of llama.cpp is. It reads
+the experts the cache misses with a pool of threads instead of a page fault at a
+time, reads the next ones ahead, and streams a prompt's passes. How it works,
+and every measurement behind it: [docs/big-models.md](docs/big-models.md).
 
 ## What else it does
 

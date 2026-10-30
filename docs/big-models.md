@@ -248,3 +248,29 @@ will not fit. The rule was tuned where the host experts come from the SSD; where
 they would fit in host memory instead, it has not been measured against the
 fewest layers and no cache. With `-peers`, placement decides the split as well:
 see [Split by itself](#split-by-itself).
+
+### Against Ollama on the same laptop
+
+Ollama 0.40.13 runs Flash-Next IQ3_S on the MacBook Pro too, imported from the
+same two files: `FROM` the directory that holds them, since `FROM` the first
+file alone fails ("has 1 shards, expected 2"). It runs llama.cpp's own
+`llama-server`, which fits the model by itself: 37.8 GiB on the GPU, 13.2 GiB of
+experts in host memory for the CPU to compute, the 27 GiB table mapped, passes
+of 512. Ollama passes it no MoE settings, but its `llama-server` takes the ones
+kinfer was tuned with by hand, so it was also run directly with them:
+`-ngl 99 --fit off --n-cpu-moe 24 --moe-cache-mib 8192 -b 2048 -ub 2048`.
+
+Back to back, the 7,753-token prompt and three 200-token replies, thinking off,
+the same reply from all three:
+
+| | prompt | decode |
+|---|---:|---:|
+| Ollama 0.40.13, as it sets itself up | 17 tok/s (459 s) | 6.9 / 7.0 / 8.4 tok/s |
+| Ollama's `llama-server` with kinfer's hand-tuned settings | 81 tok/s (96 s) | 6.3 / 6.7 / 8.2 tok/s |
+| kinfer v0.1.0, no flags | 716 tok/s (11 s) | 28.4 / 27.9 / 28.3 tok/s |
+
+The settings lift Ollama's prompt fivefold and leave its decode where it was:
+with the experts in host memory, upstream llama.cpp reads a miss from the SSD
+one page fault at a time, about 0.6 GB/s. The rest of the difference is
+kinfer's patch, described above.
+
