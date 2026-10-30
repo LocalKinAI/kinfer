@@ -75,6 +75,14 @@ It is not signed. Downloaded this way macOS runs it, and a firewall that is on
 asks once before `serve` or `worker` takes connections from another machine.
 Elsewhere, or to build it yourself, see [Build](#build).
 
+Or with Homebrew, which upgrades it with everything else (`brew upgrade`):
+
+```bash
+brew tap localkinai/tap
+brew trust --formula localkinai/tap/kinfer
+brew install localkinai/tap/kinfer
+```
+
 ## Commands
 
 ```bash
@@ -162,6 +170,9 @@ no profile.
 
 `scripts/release.sh v0.1.0` builds what a release ships: those patched
 libraries, the version stamped in, packed with its sha256 into `dist/`.
+`scripts/brew-formula.sh v0.1.0 > ../homebrew-tap/Formula/kinfer.rb` writes the
+formula for that release into the tap,
+[LocalKinAI/homebrew-tap](https://github.com/LocalKinAI/homebrew-tap).
 
 ## Roadmap
 
