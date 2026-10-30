@@ -5,6 +5,47 @@
 Everything below was built and measured on one 96 GB Mac Studio against a
 73.4 GiB model, which is why the numbers are specific.
 
+### Across machines, the peers take only what does not fit here
+
+With `-peers` and no `-split`, llama.cpp split a model by free memory while
+sizing measured only this machine. On the box with the MacBook Pro as its peer,
+that put 16 of Flash-Next's layers on the laptop with their share of a context
+sized from the box's 88 GiB — 15.5 GiB of weights, 7.7 of KV cache and a 35.5
+GiB compute buffer on a 40 GiB GPU; the first prompt ran it out of memory
+(`kIOGPUCommandBufferCallbackErrorOutOfMemory`), the worker aborted, and the
+server with it. Placement now makes the split:
+
+- `engine.PlaceDevices`: this machine keeps what it can hold with the room
+  placement keeps; each peer in turn takes the next of the first layers, only
+  while the rest would not fit here, keeping 2 GiB and a pass's activations of
+  its own free; what still does not fit stays in this machine's host memory —
+  the routed experts of its own last layers with a GPU cache, never the layers a
+  peer computes. A model that fits here gives the peers nothing, since a layer
+  behind the cable costs every token a round trip.
+- The split is a `tensor_split` whose boundaries fall half a layer before each
+  device's first layer: llama.cpp puts layer il where il/(n+1) falls, the output
+  counting as a layer, and an exact boundary could round either way. Host
+  experts can start at any layer (`hostExpertOverrides(first, n)`), and the
+  header now totals each layer's tensors (`LayerBytes`).
+- A model split this way sizes its context and pass to the room kept, as on one
+  machine. `-split` chooses by hand; `-place=false` is llama.cpp's split again.
+
+Over the USB 2.0 cable, Flash-Next IQ3_S, the 7,753-token prompt and three
+200-token replies, back to back: the box with the laptop as its peer placed
+nothing on the laptop, 729 tok/s and 43 tok/s (the box alone: 748 and 43);
+`-place=false` ran the laptop out of memory as above. The laptop with the box as
+its peer placed layers 0-17 on the box, 258 tok/s and 23 tok/s; the laptop
+alone, its experts from the SSD, 720 and 28. On this cable the SSD beats the
+other machine's GPU, and kinfer still uses the peers it is given; a Thunderbolt
+5 link is the next measurement.
+
+Connecting to a worker waits half a second after kinfer's own reachability
+check. The worker serves one connection at a time with a queue of one, and
+ggml-rpc connecting at once was refused or reset over the cable from the laptop
+to the box (`Connection reset by peer` in the hello, ggml then aborting the
+server) in nearly every load in a row; with the pause, and in a plain RPC hello
+sent 0.5 s after a check, it connected every time.
+
 ### A model the GPU cannot hold, placed by itself
 
 Flash-Next on the MacBook Pro ran fastest with `-host-experts 24 -moe-cache 8192

@@ -205,11 +205,17 @@ func TestReadShapeCountsWeightsAndExpertsByLayer(t *testing.T) {
 	if want := []int64{2 * mib, 6 * mib}; len(sh.ExpertBytes) != 2 || sh.ExpertBytes[0] != want[0] || sh.ExpertBytes[1] != want[1] {
 		t.Errorf("ExpertBytes = %v, want %v", sh.ExpertBytes, want)
 	}
+	// A layer holds its experts, its attention and its router; the embedding
+	// and the output belong to none.
+	if want := []int64{3 * mib, 7 * mib}; len(sh.LayerBytes) != 2 || sh.LayerBytes[0] != want[0] || sh.LayerBytes[1] != want[1] {
+		t.Errorf("LayerBytes = %v, want %v", sh.LayerBytes, want)
+	}
 
 	if err := os.Remove(second); err != nil {
 		t.Fatal(err)
 	}
-	if sh, err := ReadShape(first); err != nil || sh.WeightBytes != 0 || sh.ExpertBytes != nil {
-		t.Errorf("a shard missing: WeightBytes %d, ExpertBytes %v, %v; want nothing counted", sh.WeightBytes, sh.ExpertBytes, err)
+	if sh, err := ReadShape(first); err != nil || sh.WeightBytes != 0 || sh.LayerBytes != nil || sh.ExpertBytes != nil {
+		t.Errorf("a shard missing: WeightBytes %d, LayerBytes %v, ExpertBytes %v, %v; want nothing counted",
+			sh.WeightBytes, sh.LayerBytes, sh.ExpertBytes, err)
 	}
 }

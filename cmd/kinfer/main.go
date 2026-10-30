@@ -449,7 +449,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.BoolVar(&o.flex, "flex", true, "give a prompt too long for a slot a longer one: fewer slots, the same tokens, while it runs (false = keep the layout)")
 	fs.IntVar(&o.hostExperts, "host-experts", 0, "a mixture of experts' routed experts stay in host memory, mapped from the file, for this many of the first layers (-1 = every layer; 0 = as many as -place decides, none for a model that fits)")
 	fs.IntVar(&o.moeCache, "moe-cache", 0, "MiB of GPU memory caching the host experts in use, so only a miss is copied (0 = what -place decides, none for a model that fits)")
-	fs.BoolVar(&o.place, "place", true, "when a mixture of experts does not fit the GPU, keep as many layers' experts in host memory as it must, with a GPU cache for the ones in use, unless -host-experts or -moe-cache say otherwise (false = load it whole)")
+	fs.BoolVar(&o.place, "place", true, "when a mixture of experts does not fit the GPU, keep as many layers' experts in host memory as it must, with a GPU cache for the ones in use, unless -host-experts or -moe-cache say otherwise; with -peers and no -split, give the peers only the layers that do not fit here (false = load it whole, and let llama.cpp split by free memory)")
 	fs.Func("peers", "kinfer workers on other machines (host:port, comma-separated) whose GPUs take the first layers of each model", func(v string) error {
 		o.peers = nil
 		for _, p := range strings.Split(v, ",") {
@@ -461,7 +461,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 		}
 		return nil
 	})
-	fs.Func("split", "each device's share of the layers, comma-separated: every peer's, then this machine's (default: by free memory)", func(v string) error {
+	fs.Func("split", "each device's share of the layers, comma-separated: every peer's, then this machine's (default: the peers take only what does not fit here; with -place=false, by free memory)", func(v string) error {
 		o.split = nil
 		for _, f := range strings.Split(v, ",") {
 			x, err := strconv.ParseFloat(strings.TrimSpace(f), 32)

@@ -11,6 +11,10 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
 
+// peerSettle is how long deviceList waits after its own check before llama.cpp
+// connects to a worker; see there.
+const peerSettle = 500 * time.Millisecond
+
 // deviceList is the device list a model loads onto when it is split across
 // machines: every peer's devices, then this machine's GPU, then the zero
 // llama.cpp reads as the end — and the split as llama.cpp takes it, one share
@@ -37,6 +41,11 @@ func deviceList(peers []string, split []float32) ([]uintptr, []float32, error) {
 			return nil, nil, fmt.Errorf("worker %s is not reachable: %w", p, err)
 		}
 		c.Close()
+		// The worker serves one connection at a time and keeps a queue of
+		// one, and connecting again at once was refused or reset over the
+		// cable from the MacBook Pro to the box, most loads in a row; half a
+		// second later every time.
+		time.Sleep(peerSettle)
 		d, err := llama.RPCDevices(p)
 		if err != nil {
 			return nil, nil, err

@@ -996,8 +996,8 @@ llama.cpp's RPC backend. The other machine runs a worker; this one names it:
 # on the MacBook Pro: its end of the cable between the two
 kinfer worker -addr 169.254.85.249:50052
 
-# on the box: 15% of the layers there, the rest and the output here
-kinfer serve -peers 169.254.85.249:50052 -split 0.15,0.85 -slots 1 -ctx 16384
+# on the box: the layers that do not fit here go there, the rest and the output stay
+kinfer serve -peers 169.254.85.249:50052
 ```
 
 The worker is kinfer itself, not llama.cpp's `rpc-server`, because both ends
@@ -1026,12 +1026,44 @@ which is about 0.6 ms per layer. Reading a prompt is the cable's bandwidth, the
 same however the layers are split. Both are costs of USB 2.0; a Thunderbolt link
 has a fraction of the latency and a hundred times the bandwidth.
 
-Two things to know. A Mac with its firewall on can hold a new worker's incoming
-connections until the program is allowed — on the MacBook Pro they sat unanswered
-until `kinfer` showed up as permitted in the firewall's list (System Settings ›
-Network › Firewall › Options). And sizing
-measures only this machine's GPU, while the layers on the other keep their part
-of the KV cache there: give `-ctx` and `-slots` explicitly until it measures both.
+A Mac with its firewall on can hold a new worker's incoming connections until the
+program is allowed — on the MacBook Pro they sat unanswered until `kinfer` showed
+up as permitted in the firewall's list (System Settings › Network › Firewall ›
+Options).
+
+### Split by itself
+
+Given `-peers` and no `-split`, kinfer splits the model itself, from the header
+and every device's free memory: this machine keeps what it can hold with the room
+placement keeps (see [Placed by itself](#placed-by-itself)); each peer in turn
+takes the next of the first layers only while the rest would not fit here,
+keeping 2 GiB and a pass's activations of its own free; what still does not fit
+stays in this machine's host memory — the routed experts of its own last layers,
+with a GPU cache. A model that fits here leaves the peers nothing: a layer behind
+the cable costs every token a round trip.
+
+llama.cpp left to itself splits by free memory, and sizing measured only this
+machine. On the box with the laptop as its peer, that put 16 of Flash-Next's
+layers (15.5 GiB) on the laptop with their share of a context sized from the
+box's memory — 7.7 GiB of KV cache and a 35.5 GiB compute buffer, 59 GiB on a
+40 GiB GPU. The laptop ran out of memory on the first prompt, its worker
+aborted, and the server with it. `-place=false` still does that; `-split` still
+chooses by hand.
+
+Over the same USB 2.0 cable, Flash-Next IQ3_S, the 7,753-token prompt and three
+200-token replies, the same reply from every row that answered:
+
+| this machine | peer | placed | prompt | decode |
+|---|---|---|---:|---:|
+| box | laptop | nothing on the laptop | 729 tok/s | 43 tok/s |
+| box | laptop | llama.cpp's split (`-place=false`): 16 layers on the laptop | — | — (the laptop ran out of memory) |
+| box | — | — | 748 tok/s | 43 tok/s |
+| laptop | box | layers 0-17 on the box | 258 tok/s | 23 tok/s |
+| laptop | — | 28 layers' experts in host memory | 720 tok/s | 28 tok/s |
+
+On this cable the laptop's own SSD beats the box's GPU. kinfer still uses the
+peers it is given, so leave them out where the link is this slow; whether a
+Thunderbolt 5 link turns that round is the next measurement.
 
 ## A mixture of experts that does not fit: experts in host memory
 
@@ -1199,8 +1231,8 @@ and qwen3.8-27b load as before. A dense model that does not fit, or a mixture
 whose shared part alone does not, is loaded as it is, with a line saying why it
 will not fit. The rule was tuned where the host experts come from the SSD; where
 they would fit in host memory instead, it has not been measured against the
-fewest layers and no cache. With `-peers` the split decides where layers go,
-and placement stays out of it for now.
+fewest layers and no cache. With `-peers`, placement decides the split as well:
+see [Split by itself](#split-by-itself).
 
 ## Roadmap
 
@@ -1221,8 +1253,10 @@ and placement stays out of it for now.
 - [x] **Placed by itself** — a mixture of experts the GPU cannot hold leaves as
       many layers' experts in host memory as it must, with a cache sized for
       them: no flags on the MacBook Pro, as fast as the hand-tuned ones
-- [ ] **Bigger than one machine, at speed** — a Thunderbolt 5 link, and placement
-      across every machine's GPU
+- [x] **Split by itself** — with `-peers`, the peers take only the layers that do
+      not fit here, and what does not fit anywhere stays in this machine's host memory
+- [ ] **Bigger than one machine, at speed** — a Thunderbolt 5 link, and choosing
+      between a peer's GPU and this machine's SSD by what each costs a token
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,
       circuit breaking, per-agent model routing
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks

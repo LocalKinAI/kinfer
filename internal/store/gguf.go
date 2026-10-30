@@ -55,12 +55,14 @@ type Shape struct {
 	Vocab int
 
 	// WeightBytes is what the model's tensors hold in memory, every shard
-	// counted and LazyBytes left out. ExpertBytes is the part of it that is
-	// each layer's routed experts, by layer: what a GPU short of memory can
-	// leave in host memory (see engine.Place). Both are zero when a shard
-	// could not be read, since a model counted in part would look smaller
-	// than it is.
+	// counted and LazyBytes left out. LayerBytes is the part of it in each
+	// layer — what a device holding that layer holds — and ExpertBytes the
+	// part of that which is the layer's routed experts: what a GPU short of
+	// memory can leave in host memory (see engine.Place). All are zero when a
+	// shard could not be read, since a model counted in part would look
+	// smaller than it is.
 	WeightBytes int64
+	LayerBytes  []int64
 	ExpertBytes []int64
 }
 
@@ -136,12 +138,17 @@ func (h Header) eachTensor(fn func(name string, size int64)) {
 	}
 }
 
-// expertTensor names a layer's routed experts and captures the layer, as
-// llama.cpp's --cpu-moe matches them (LLM_FFN_EXPS_REGEX in common/common.h).
-var expertTensor = regexp.MustCompile(`^blk\.(\d+)\.ffn_(up|down|gate|gate_up)_(ch|)exps\.`)
+// layerTensor names a tensor of a layer and captures the layer;
+// expertTensor names a layer's routed experts, as llama.cpp's --cpu-moe
+// matches them (LLM_FFN_EXPS_REGEX in common/common.h).
+var (
+	layerTensor  = regexp.MustCompile(`^blk\.(\d+)\.`)
+	expertTensor = regexp.MustCompile(`^blk\.\d+\.ffn_(up|down|gate|gate_up)_(ch|)exps\.`)
+)
 
 // account adds this file's tensors to sh, a model of arch: what is read
-// lazily, what is held in memory, and of that what is routed experts.
+// lazily, what is held in memory, and of that what each layer holds and how
+// much of it is routed experts.
 func (h Header) account(sh *Shape, arch string) {
 	h.eachTensor(func(name string, size int64) {
 		if isLazy(arch, name, size) {
@@ -149,11 +156,17 @@ func (h Header) account(sh *Shape, arch string) {
 			return
 		}
 		sh.WeightBytes += size
-		if m := expertTensor.FindStringSubmatch(name); m != nil {
-			layer, _ := strconv.Atoi(m[1])
-			for len(sh.ExpertBytes) <= layer {
-				sh.ExpertBytes = append(sh.ExpertBytes, 0)
-			}
+		m := layerTensor.FindStringSubmatch(name)
+		if m == nil {
+			return
+		}
+		layer, _ := strconv.Atoi(m[1])
+		for len(sh.LayerBytes) <= layer {
+			sh.LayerBytes = append(sh.LayerBytes, 0)
+			sh.ExpertBytes = append(sh.ExpertBytes, 0)
+		}
+		sh.LayerBytes[layer] += size
+		if expertTensor.MatchString(name) {
 			sh.ExpertBytes[layer] += size
 		}
 	})
@@ -248,7 +261,7 @@ func ReadShape(path string) (Shape, error) {
 		oh.account(&sh, sh.Arch)
 	}
 	if !whole {
-		sh.WeightBytes, sh.ExpertBytes = 0, nil
+		sh.WeightBytes, sh.LayerBytes, sh.ExpertBytes = 0, nil, nil
 	}
 	return sh, nil
 }

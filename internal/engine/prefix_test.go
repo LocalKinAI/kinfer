@@ -326,7 +326,7 @@ func TestDeviceListRefusesAnUnreachableWorker(t *testing.T) {
 // No host experts is no overrides at all: llama.cpp then places every weight
 // itself, as before.
 func TestNoHostExpertsIsNoOverrides(t *testing.T) {
-	if ov, keep, err := hostExpertOverrides(0); ov != nil || keep != nil || err != nil {
+	if ov, keep, err := hostExpertOverrides(0, 0); ov != nil || keep != nil || err != nil {
 		t.Fatalf("0 layers: %v, %v, %v", ov, keep, err)
 	}
 }

@@ -34,11 +34,11 @@ import (
 // does (LLM_FFN_EXPS_REGEX in common/common.h).
 const expertsRegex = `\.ffn_(up|down|gate|gate_up)_(ch|)exps`
 
-// hostExpertOverrides places the routed experts of the first n layers in host
-// memory, or of every layer when n is negative, as --n-cpu-moe and --cpu-moe
-// do. keep holds the C strings the overrides point at; both must outlive the
-// model load.
-func hostExpertOverrides(n int) (ov []llama.TensorBuftOverride, keep [][]byte, err error) {
+// hostExpertOverrides places the routed experts of n layers from first in
+// host memory, or of every layer when n is negative, as --n-cpu-moe and
+// --cpu-moe do. keep holds the C strings the overrides point at; both must
+// outlive the model load.
+func hostExpertOverrides(first, n int) (ov []llama.TensorBuftOverride, keep [][]byte, err error) {
 	if n == 0 {
 		return nil, nil, nil
 	}
@@ -49,7 +49,7 @@ func hostExpertOverrides(n int) (ov []llama.TensorBuftOverride, keep [][]byte, e
 	patterns := []string{expertsRegex}
 	if n > 0 {
 		patterns = patterns[:0]
-		for i := 0; i < n; i++ {
+		for i := first; i < first+n; i++ {
 			// blk\.1\. cannot match blk.10.: the dot after the number anchors it.
 			patterns = append(patterns, fmt.Sprintf(`blk\.%d%s`, i, expertsRegex))
 		}

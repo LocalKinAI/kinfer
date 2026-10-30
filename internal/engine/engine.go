@@ -126,11 +126,12 @@ type Options struct {
 	// in host memory.
 	MoeCache int
 
-	// NoPlace loads every weight on the GPU even when it cannot hold them.
-	// Without it, a mixture of experts the GPU cannot hold, given neither
-	// HostExperts nor MoeCache, leaves as many layers' experts in host memory
-	// as it must, with a GPU cache for the ones in use: see Place. Not with
-	// Peers, whose split decides where layers go.
+	// NoPlace loads every weight on the GPU even when it cannot hold them, and
+	// leaves the split across Peers to llama.cpp. Without it, given neither
+	// HostExperts nor MoeCache, a mixture of experts the GPU cannot hold leaves
+	// as many layers' experts in host memory as it must, with a GPU cache for
+	// the ones in use (Place); and with Peers but no Split, the peers take only
+	// the layers that do not fit here (PlaceDevices).
 	NoPlace bool
 }
 
@@ -326,27 +327,37 @@ func Open(path string, opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	if devs != nil {
-		mp.Devices = uintptr(unsafe.Pointer(&devs[0]))
-		if split != nil {
-			mp.TensorSplit = uintptr(unsafe.Pointer(&split[0]))
-		}
-	}
 	// Read the accelerator's free memory before anything is allocated, so the
 	// model's and the context's real costs can be measured rather than guessed.
 	bud := newBudget()
 	shape, _ := store.ReadShape(path)
 
 	// Where the weights go, when the operator did not say: a mixture of
-	// experts the GPU cannot hold leaves some layers' experts in host memory.
-	hostExperts, moeCache := opts.HostExperts, opts.MoeCache
+	// experts the GPU cannot hold leaves some layers' experts in host memory,
+	// and with peers, a model goes to them only as far as it does not fit here.
+	hostExperts, moeCache, firstHost := opts.HostExperts, opts.MoeCache, 0
 	var placed Placed
-	if hostExperts == 0 && moeCache == 0 && !opts.NoPlace && len(opts.Peers) == 0 && bud.known {
-		placed = placeFor(shape, bud.atStart, opts, filepath.Base(path))
+	if hostExperts == 0 && moeCache == 0 && !opts.NoPlace && bud.known {
+		switch {
+		case len(opts.Peers) == 0:
+			placed = placeFor(shape, bud.atStart, opts, filepath.Base(path))
+		case split == nil && opts.GPULayers > shape.Layers:
+			var across DevicePlacement
+			across, placed = placeAcross(shape, devs, bud.atStart, opts, filepath.Base(path))
+			if across.Layers != nil {
+				split, firstHost = across.Split(shape.Layers), across.FirstHost
+			}
+		}
 		hostExperts, moeCache = placed.HostExperts, placed.MoeCache
 	}
+	if devs != nil {
+		mp.Devices = uintptr(unsafe.Pointer(&devs[0]))
+		if split != nil {
+			mp.TensorSplit = uintptr(unsafe.Pointer(&split[0]))
+		}
+	}
 
-	overrides, patterns, err := hostExpertOverrides(hostExperts)
+	overrides, patterns, err := hostExpertOverrides(firstHost, hostExperts)
 	if err != nil {
 		return nil, err
 	}
@@ -359,8 +370,11 @@ func Open(path string, opts Options) (*Engine, error) {
 		// --no-repack, the same switch.
 		mp.UseExtraBufts = 0
 		which := fmt.Sprintf("the first %d layers'", hostExperts)
-		if hostExperts < 0 {
+		switch {
+		case hostExperts < 0:
 			which = "every layer's"
+		case firstHost > 0:
+			which = fmt.Sprintf("layers %d-%d's", firstHost, firstHost+hostExperts-1)
 		}
 		log.Printf("experts: %s routed experts stay in host memory, mapped from the file; a %d MiB GPU cache keeps the ones in use", which, moeCache)
 	}
@@ -395,7 +409,7 @@ func Open(path string, opts Options) (*Engine, error) {
 	// left, which would leave the pass to be the first thing the measurement
 	// below takes back.
 	ctx, slotsWant := opts.ContextSize, opts.Slots
-	if placed.HostExperts != 0 {
+	if placed.Reserve != 0 {
 		ctx = cmp.Or(ctx, placed.Tokens)
 		slotsWant = placed.Slots
 	}
@@ -448,6 +462,10 @@ func Open(path string, opts Options) (*Engine, error) {
 		// measured below takes it back down when it costs too much.
 		if hostExperts != 0 {
 			ub = max(ub, ubatchLarge)
+		}
+		// Placement kept room for a pass of its own size.
+		if placed.Reserve != 0 {
+			ub = max(ub, placed.Ubatch)
 		}
 	}
 	// What was left for us to choose. An explicit flag is never overridden, so
@@ -597,6 +615,8 @@ sizing:
 			"— a smaller -moe-cache makes room, or -batch %d takes it from that", ubatchLarge, ubatchLarge, gib(thinHeadroom), ubatchLarge)
 	case hostExperts != 0:
 		how = "sized for experts in host memory, which every pass reads again"
+	case placed.Reserve != 0:
+		how = "the pass placement kept room for"
 	}
 	log.Printf("batch: the GPU reads %d prompt tokens a pass, %s — the model and its cache are %s of %s",
 		ub, how, gib(sub(bud.atStart, bud.afterCtx)), gib(bud.atStart))
