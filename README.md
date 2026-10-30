@@ -23,7 +23,7 @@ kinfer serving on :11500 — 1 model(s) in ~/.kinfer/models
 
 ```
 $ ls -lh $(which kinfer)
--rwxr-xr-x  17M   # llama.cpp is inside — nothing else to install
+-rwxr-xr-x  23M   # llama.cpp is inside — nothing else to install
 ```
 
 > **Status: early but usable.** The inference core is done and the CLI works:
@@ -182,8 +182,11 @@ $ kinfer plan Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S          on the box, 77.8 GiB bud
   left for cache    26.7 GB
 ```
 
-Counted as weights, that file was 117.8 MB too large for the box. Loaded, it
-takes 50.7 GiB and decodes at 44.5 tok/s.
+Counted as weights, that file was 117.8 MB too large for the box — which is why
+it sat there unused from October 11, when it was downloaded to try, until
+October 29. Loaded, it takes 50.7 GiB, leaves 27 GiB for 8 slots + 4 prefix x
+32768, and decodes at 44.5 tok/s: a better quantisation of the same model than
+the UD-Q2_K_XL the box ran before (41.9 tok/s on b11175), on the one machine.
 
 ### `-slots` without `-ctx`: each model's context sized the way Ollama sizes one
 
@@ -945,21 +948,27 @@ timers run only when the variable is set.
 ## Sizing a model before loading it
 
 ```
-kinfer plan Qwen3.8-Flash-Next-UD-Q2_K_XL -ctx 16384
+kinfer plan -ctx 16384 Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S
 ```
 
 ```
-  weights           73.5 GB
+  weights           51.1 GB
+  read from disk    26.8 GB   (a table read a few rows a token: it stays on the SSD, not in memory)
   GPU budget        77.8 GB   (this process's share, not the machine's RAM)
-  left for cache     4.3 GB
+  left for cache    26.7 GB
 
   -slots   total tokens   largest -ctx that fits
-  1        32768          32768
-  2        32768          16384
-  4        32768          8192
+  1        262144         262144  (capped at what it was trained for)
+  2        524288         262144  (capped at what it was trained for)
+  4        1048576        262144
+  8        524288         65536
   …
-  For -ctx 16384: kinfer serve -ctx 16384 -slots 2
+  Unasked, serve picks: 8 slots + 4 prefix x 32768 tokens, cache about 10.3 GB
+  For -ctx 16384: kinfer serve -ctx 16384 -slots 8
 ```
+
+The same model's UD-Q2_K_XL, before the n-gram table was left on disk, had
+4.3 GB left for cache and room for two slots of 16384.
 
 `-ctx` is per conversation and gets multiplied by the slot count, which is the
 part that surprises people — raising `-slots` from 2 to 4 doubles the cache. The
@@ -973,6 +982,10 @@ counts.
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary
 - [x] **Inference core** — chat templates, sampling, stop detection, native bindings
 - [x] **Phase 1** — `fit` / `pull` / `list` / `rm` / `run` / `serve`
+- [x] **DeepSeek-V4.1** — its own prompt renderer and DSML tool calls, checked
+      against DeepSeek's encoder; sizing that leaves lazily read tables on disk
+- [ ] **Bigger than one machine** — llama.cpp RPC across the box and the
+      MacBook Pro, and llama.cpp's MoE expert cache on Metal
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,
       circuit breaking, per-agent model routing
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks

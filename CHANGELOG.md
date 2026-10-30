@@ -26,12 +26,14 @@ in ISTA's V4.1 layout that file is a link to a shared one) and reports
   ISTA's Engram file, which it used to offer as a model to pull.
 - `/api/ps` reports the loaded model's size without the table, as Ollama's does.
 
-On the box, with the ISTA Flash-Next IQ3_S already there (54.8 + 28.8 GB):
-`plan` used to say it did not fit, by 117.8 MB. It now counts 51.1 GiB of
+On the box, the ISTA Flash-Next IQ3_S (54.8 + 28.8 GB, the second file its
+n-gram table) had been on disk since October 11, downloaded to try, and never
+loaded: `plan` said it did not fit, by 117.8 MB. It now counts 51.1 GiB of
 weights and 26.8 read from disk, and loaded it takes 50.7 GiB of the 77.8 GiB
 budget, leaving 27 GiB for 8 slots + 4 prefix x 32768 and 5.8 free. It decodes
-at 44.5 tok/s (the UD-Q2_K_XL it replaces ran at 41.9 on b11175) and reads a 7,024-token
-prompt at 666 tok/s.
+at 44.5 tok/s and reads a 7,024-token prompt at 666 tok/s — a better
+quantisation than the UD-Q2_K_XL the box ran before, which decoded at 41.9 on
+b11175 and left 4.3 GB for cache. Nothing was downloaded to find this out.
 
 ### An exact prefix pool copies whole sequences, and says so
 
