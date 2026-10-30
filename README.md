@@ -84,7 +84,9 @@ brew install localkinai/tap/kinfer
 ```
 
 With other taps not trusted yet, Homebrew 7 can end the install with an error
-about one of them, after kinfer is in place: `kinfer version` says whether it is.
+about one of them, after kinfer is in place; `kinfer version` says whether it is,
+and `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1` before `brew install` skips the
+check that raised it.
 
 ## Commands
 
