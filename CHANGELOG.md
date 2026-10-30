@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-Everything below was built and measured on one 96 GB Mac Studio against a
-73.4 GiB model, which is why the numbers are specific.
+Built and measured on a 96 GB Mac Studio (M3 Ultra) and, for the entries on
+experts in host memory and on the SSD, a 48 GB MacBook Pro (M5 Max): the numbers
+are theirs, which is why they are specific.
 
 ### Across machines, the peers take only what does not fit here
 
@@ -86,7 +87,7 @@ GiB of weights against 88 GiB), ornith-1.5-35b and qwen3.8-27b all fit.
 
 The patched cache made generation fast and left prompts slow. On the MacBook Pro,
 Flash-Next with 24 of 48 layers' experts on the host read a 7,753-token prompt
-(the top of the README) at 73 tok/s in passes of 512 tokens, 117 in passes of
+(the top of the README as it was then) at 73 tok/s in passes of 512 tokens, 117 in passes of
 1024 and 162 in passes of 2048: every pass uses most experts of every layer, so
 the host experts are read again for each, and the reads ran at 1.1-1.5 GB/s from
 an SSD that does 13.2 given requests of a few MB from a few threads. The patch
@@ -389,7 +390,7 @@ Measured on the box, started with `-slots 4` and no other size given:
 
 Against Ollama on the same file this was, at the time, 18% slower one request at
 a time and 42% faster several at once; the entry above is what closed the first
-gap. The table is in the README.
+gap. The table is in docs/performance.md.
 
 ### A long prompt gets a longer slot
 

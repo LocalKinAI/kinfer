@@ -47,7 +47,7 @@ type Options struct {
 	//
 	// Pick from {8, 32, 64, 128}: step time roughly doubles between a batch of
 	// 8 and 12 and then stays flat to 32, so 12-16 costs more than 8 and
-	// returns less. See the table in README. 0 means 8, or fewer when the
+	// returns less. See the table in docs/performance.md. 0 means 8, or fewer when the
 	// memory left after the weights cannot give 8 a useful context.
 	Slots int
 

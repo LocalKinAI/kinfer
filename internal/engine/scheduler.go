@@ -54,7 +54,7 @@ const minPrefixMatch = 128
 //
 // Which sizes are worth using is not obvious. Step time nearly doubles between
 // a batch of 8 and 12 and then stays flat to 32, so twelve concurrent requests
-// produce less total throughput than eight. See the table in README; slot
+// produce less total throughput than eight. See the table in docs/performance.md; slot
 // counts come from {8, 32, 64, 128} and never from 12-16.
 //
 // That paragraph is about a dense model and does not carry over to a
