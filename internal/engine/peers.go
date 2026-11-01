@@ -57,8 +57,6 @@ func deviceList(peers []string, split []float32) ([]uintptr, []float32, error) {
 		return nil, nil, fmt.Errorf("no GPU here to keep the rest of the model on")
 	}
 	devs = append(devs, local[0])
-	// This GPU waits on every token while the peers compute their layers.
-	llama.KeepGPUWarm(llama.WarmWindowMs)
 
 	var shares []float32
 	if len(split) > 0 {

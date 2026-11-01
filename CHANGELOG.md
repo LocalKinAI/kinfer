@@ -1,6 +1,20 @@
 # Changelog
 
-## v0.1.1 — 2026-10-31
+## Unreleased
+
+### Fixed — no keep-warm beside experts in host memory
+
+v0.1.1 kept a split's GPUs warm whatever else was loaded. With experts in host
+memory that is a trap: the MoE cache waits on the GPU several times a layer, and
+on the MacBook Pro a GPU kept busy by anything else made each wait long.
+Flash-Next with 27 layers' experts on the host (the laptop alone, with
+`GGML_METAL_WARM_MS=1000`) decoded at 1.0-1.2 tok/s instead of 29.5-31.3; the
+same kernel from another process did the same, and the box lost nothing to it
+with 16 layers' experts on the host. v0.1.1 never turned the window on for one
+machine, so it showed only for a split that also kept experts in host memory —
+the way DeepSeek-V4.1 was to run across the two. Now a model with host experts
+keeps the window off for as long as it is loaded (`internal/engine/warm.go`), and
+says so at load.
 
 ### A split decodes as fast as one machine: the GPUs kept warm
 

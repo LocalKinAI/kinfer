@@ -300,6 +300,9 @@ type Engine struct {
 	nCtx  int // per conversation, in the layout it loaded with
 	slots int // likewise; the scheduler's layout can change, see Slots
 
+	// what this model counts toward keeping the GPU warm (warm.go), each 0 or 1
+	warmSplit, warmCache int
+
 	// sched owns the llama.cpp context: it rebuilds it when the layout
 	// changes, so the context it holds when it stops is the one to free.
 	sched *scheduler
@@ -592,6 +595,15 @@ sizing:
 		nCtx:  actualCtx / cells,
 		slots: slots,
 	}
+	if hostExperts != 0 {
+		e.warmCache = 1
+	} else if devs != nil {
+		e.warmSplit = 1
+	}
+	warmAdd(e.warmSplit, e.warmCache)
+	if devs != nil && hostExperts != 0 {
+		log.Printf("experts: with experts in host memory the GPU is not kept warm between tokens — the MoE cache waits on it too often")
+	}
 	queue := opts.MaxQueue
 	if queue <= 0 {
 		queue = DefaultMaxQueue
@@ -748,6 +760,10 @@ func (e *Engine) Close() {
 	if e.model != 0 {
 		llama.FreeModel(e.model)
 		e.model = 0
+	}
+	if e.warmSplit != 0 || e.warmCache != 0 {
+		warmAdd(-e.warmSplit, -e.warmCache)
+		e.warmSplit, e.warmCache = 0, 0
 	}
 }
 

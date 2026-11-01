@@ -73,6 +73,15 @@ overrides the window (0 is off). With the release libraries a split decodes as
 in the middle column. On the box alone it is worth 4% (45.5 against 43.8 tok/s),
 so a single machine leaves it off.
 
+A model with experts in host memory is never kept warm. The MoE cache waits on
+the GPU several times a layer, and on the MacBook Pro a GPU kept busy by anything
+else — the keep-warm kernel, or the same kernel from another process — made
+those waits long: Flash-Next with 27 layers' experts on the host decoded at 1
+tok/s instead of 30, and its reads from the SSD waited 34.5 s in all instead of
+4.2. On the box host experts lost nothing to it (25.2 against 25.1 tok/s), but
+the rule is the same on both. A worker keeps its GPU warm regardless, so a
+machine that runs a worker should not also serve a model with host experts.
+
 llama.cpp's RPC can also use RDMA over Thunderbolt, negotiated at connect, which
 would shorten the two waits. It is off on both machines here (`rdma_ctl status`);
 turning it on is done from macOS Recovery, and llama.cpp's RPC README says the
