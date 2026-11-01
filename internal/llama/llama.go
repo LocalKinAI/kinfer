@@ -327,6 +327,7 @@ func bind(dir string) error {
 	bindRPC(dir)
 	bindCPU(dir)
 	bindProfile(lib)
+	bindWarm(dir)
 	return nil
 }
 

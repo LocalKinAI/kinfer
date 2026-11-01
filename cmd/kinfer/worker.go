@@ -57,6 +57,11 @@ func cmdWorker(args []string) error {
 	if *cache != "" {
 		fmt.Printf("  weights kept in %s, so a model's second load sends hashes, not tensors\n", *cache)
 	}
+	// A worker waits between graphs on every token, while the other machine
+	// computes its layers; see internal/llama/warm.go.
+	if llama.KeepGPUWarm(llama.WarmWindowMs) {
+		fmt.Printf("  the GPU is kept at speed between tokens\n")
+	}
 	fmt.Printf("  on the other machine: kinfer serve -peers %s\n", *addr)
 	fmt.Printf("  no authentication — keep this address on a cable between two machines\n\n")
 	return llama.ServeRPC(*addr, *cache, *threads)

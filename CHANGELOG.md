@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### A split decodes as fast as one machine: the GPUs kept warm
+
+With a Thunderbolt 5 cable in place of the USB 2.0 one, Flash-Next split between
+the box and the MacBook Pro loaded in 15 s instead of minutes and read a 7,016-token
+prompt at 850-1,400 tok/s instead of 254-285, but decoded at 25-29 tok/s, about
+what it did over USB. A token waits on the cable only twice (about 0.3 ms each,
+the TCP stack's, on either cable). The rest was the GPUs: each waits while the
+other computes its layers, and macOS lowers an idle GPU's clock within
+milliseconds, so the laptop's 8 layers took 6 ms at the start of a reply and
+11-14 ms twenty tokens in.
+
+The patch (`patches/llama.cpp/b11998/0002-metal-keep-warm.patch`, libraries
+`darwin_arm64_b11998k3`) adds `ggml_backend_metal_set_warm`: for a window after
+each graph, a background thread runs a tiny kernel back to back on a queue of
+its own (one SIMD group, about 50 µs each, one at a time), and sleeps once the
+window passes without another graph. kinfer turns it on, for a second, in
+`kinfer worker` and in `serve -peers`; `GGML_METAL_WARM_MS` overrides it.
+
+Back to back on Thunderbolt 5, v0.1.0 against the patched build: the box with 8
+layers on the laptop, 25.1 → 42.3 tok/s; the laptop with 17 GB of layers on the
+box, 28.9 → 43.6 tok/s. The box alone decodes at 44.1. Prompts are unchanged
+(850; 1,403 and 1,274). On the box alone the window is worth 4% (43.8 → 45.5),
+and a single machine leaves it off.
+
 ### Where the way with experts on the SSD comes from
 
 The README now says it: Strata, whose own engine runs a mixture of experts from

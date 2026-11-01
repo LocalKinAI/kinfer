@@ -1,0 +1,266 @@
+diff --git a/ggml/include/ggml-metal.h b/ggml/include/ggml-metal.h
+index 433838f..a6ebb35 100644
+--- a/ggml/include/ggml-metal.h
++++ b/ggml/include/ggml-metal.h
+@@ -56,6 +56,12 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
+ 
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
+ 
++// keep the GPU's clock up for window_ms after each graph computation, with a tiny kernel on a
++// queue of its own, so a GPU that waits between graphs (a model split across machines, where each
++// waits while the other computes) does not drop its clock before the next one; 0 turns it off
++// (the default, unless GGML_METAL_WARM_MS gives a window)
++GGML_BACKEND_API void ggml_backend_metal_set_warm(int window_ms);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 597c126..4bf19c8 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -490,6 +490,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+     // keep the memory wired
+     ggml_metal_device_rsets_keep_alive(ctx->dev);
+ 
++    // and, if asked, the clock up until the next graph
++    ggml_metal_device_warm(ctx->dev);
++
+     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
+     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread
+     // while these nodes are processing, we start n_cb threads to enqueue the rest of the nodes
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index dd7cdb9..e9de572 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -332,6 +332,10 @@ void ggml_metal_device_rsets_rm (ggml_metal_device_t dev, ggml_metal_rset_t rset
+ 
+ void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev);
+ 
++// keep the GPU's clock up for a while after a graph computation (see ggml_backend_metal_set_warm)
++void ggml_metal_device_warm(ggml_metal_device_t dev);
++void ggml_metal_set_warm_ms(int window_ms);
++
+ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev);
+ void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev);
+ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 451f652..b013028 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -899,6 +899,9 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
+     [encoder->obj endEncoding];
+ }
+ 
++struct ggml_metal_warm;
++static void ggml_metal_warm_free(struct ggml_metal_warm * w);
++
+ struct ggml_metal_device {
+     id<MTLDevice> mtl_device;
+ 
+@@ -909,6 +912,10 @@ struct ggml_metal_device {
+ 
+     ggml_metal_rsets_t rsets;
+ 
++    // clock keep-warm thread, started by the first graph computation that asks for it
++    _Atomic(struct ggml_metal_warm *) warm;
++    bool warm_failed;
++
+     ggml_metal_library_t library;
+ 
+     struct ggml_metal_device_props props;
+@@ -1377,6 +1384,8 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
+     @autoreleasepool {
+         ggml_metal_fusion_info_free(dev->finfo);
+ 
++        ggml_metal_warm_free(atomic_load_explicit(&dev->warm, memory_order_acquire));
++
+         ggml_metal_rsets_free(dev->rsets);
+ 
+         ggml_metal_library_free(dev->library);
+@@ -1444,6 +1453,170 @@ void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev) {
+     atomic_store_explicit(&dev->rsets->d_loop, dev->rsets->loops_per_s*dev->rsets->keep_alive_s, memory_order_relaxed);
+ }
+ 
++//
++// clock keep-warm
++//
++// macOS lowers an idle GPU's clock within milliseconds. A GPU that waits between graphs pays for
++// it on the next one: with a model split across an M3 Ultra and an M5 Max, each waiting while the
++// other computes, the same 8 layers went from 6 ms to 11-14 ms a token over a reply's first 20
++// tokens, and keeping both GPUs busy took decode from 25 to 38 tok/s. For a window after each
++// graph computation a background thread runs a tiny kernel (one SIMD group, about 50 us) back to
++// back on a queue of its own; when the window passes without another graph, it sleeps.
++//
++
++#define GGML_METAL_WARM_KERNEL_US 50.0
++
++static atomic_int g_metal_warm_ms = -1; // -1: GGML_METAL_WARM_MS not read yet
++
++static int ggml_metal_warm_ms(void) {
++    int ms = atomic_load_explicit(&g_metal_warm_ms, memory_order_relaxed);
++    if (ms < 0) {
++        const char * val = getenv("GGML_METAL_WARM_MS");
++        int expected = -1;
++        atomic_compare_exchange_strong(&g_metal_warm_ms, &expected, val ? MAX(0, atoi(val)) : 0);
++        ms = atomic_load_explicit(&g_metal_warm_ms, memory_order_relaxed);
++    }
++    return ms;
++}
++
++void ggml_metal_set_warm_ms(int window_ms) {
++    atomic_store_explicit(&g_metal_warm_ms, MAX(0, window_ms), memory_order_relaxed);
++}
++
++struct ggml_metal_warm {
++    id<MTLCommandQueue>         queue;
++    id<MTLComputePipelineState> pipeline;
++    id<MTLBuffer>               out;
++
++    atomic_llong until_ns; // keep warm until this uptime
++    atomic_bool  sleeping;
++    atomic_bool  stop;
++
++    dispatch_semaphore_t wake;
++    dispatch_group_t     group;
++};
++
++static const char * ggml_metal_warm_src =
++    "#include <metal_stdlib>\n"
++    "using namespace metal;\n"
++    "kernel void kernel_warm(device uint * out [[buffer(0)]], constant uint & n [[buffer(1)]], uint tid [[thread_position_in_grid]]) {\n"
++    "    uint x = tid;\n"
++    "    for (uint i = 0; i < n; ++i) { x = x*1664525u + 1013904223u; }\n"
++    "    out[tid] = x;\n"
++    "}\n";
++
++static long long ggml_metal_uptime_ns(void) {
++    return (long long) clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++}
++
++static struct ggml_metal_warm * ggml_metal_warm_init(id<MTLDevice> device) {
++    NSError * error = nil;
++
++    id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:ggml_metal_warm_src] options:nil error:&error];
++    if (lib == nil) {
++        GGML_LOG_WARN("%s: cannot compile the keep-warm kernel: %s\n", __func__, [[error localizedDescription] UTF8String]);
++        return NULL;
++    }
++    id<MTLFunction> fn = [lib newFunctionWithName:@"kernel_warm"];
++    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:fn error:&error];
++    [fn release];
++    [lib release];
++    if (pipeline == nil) {
++        GGML_LOG_WARN("%s: cannot make the keep-warm pipeline: %s\n", __func__, [[error localizedDescription] UTF8String]);
++        return NULL;
++    }
++
++    struct ggml_metal_warm * w = calloc(1, sizeof(struct ggml_metal_warm));
++    w->queue    = [device newCommandQueue];
++    w->pipeline = pipeline;
++    w->out      = [device newBufferWithLength:32*sizeof(uint32_t) options:MTLResourceStorageModePrivate];
++    atomic_store_explicit(&w->until_ns, 0, memory_order_relaxed);
++    atomic_store_explicit(&w->sleeping, false, memory_order_relaxed);
++    atomic_store_explicit(&w->stop, false, memory_order_relaxed);
++    w->wake  = dispatch_semaphore_create(0);
++    w->group = dispatch_group_create();
++
++    dispatch_group_async(w->group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
++        uint32_t n = 256; // loop count, tuned as it runs to keep each kernel near GGML_METAL_WARM_KERNEL_US
++        while (!atomic_load_explicit(&w->stop, memory_order_relaxed)) {
++            if (ggml_metal_uptime_ns() >= atomic_load_explicit(&w->until_ns, memory_order_relaxed)) {
++                // announce the sleep before the last look at the window, so a graph that arrives in
++                // between either moves the window or finds the flag and wakes the thread
++                atomic_store_explicit(&w->sleeping, true, memory_order_seq_cst);
++                if (ggml_metal_uptime_ns() >= atomic_load_explicit(&w->until_ns, memory_order_seq_cst) &&
++                    !atomic_load_explicit(&w->stop, memory_order_relaxed)) {
++                    dispatch_semaphore_wait(w->wake, DISPATCH_TIME_FOREVER);
++                }
++                atomic_store_explicit(&w->sleeping, false, memory_order_relaxed);
++                continue;
++            }
++            @autoreleasepool {
++                id<MTLCommandBuffer> cmd_buf = [w->queue commandBuffer];
++                id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
++                [encoder setComputePipelineState:w->pipeline];
++                [encoder setBuffer:w->out offset:0 atIndex:0];
++                [encoder setBytes:&n length:sizeof(n) atIndex:1];
++                [encoder dispatchThreads:MTLSizeMake(32, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
++                [encoder endEncoding];
++                [cmd_buf commit];
++                [cmd_buf waitUntilCompleted];
++
++                const double us = ([cmd_buf GPUEndTime] - [cmd_buf GPUStartTime])*1e6;
++                if (us > 0) {
++                    n = (uint32_t) MAX(64.0, MIN(16777216.0, n*GGML_METAL_WARM_KERNEL_US/us));
++                }
++            }
++        }
++    });
++
++    return w;
++}
++
++static void ggml_metal_warm_free(struct ggml_metal_warm * w) {
++    if (w == NULL) {
++        return;
++    }
++
++    atomic_store_explicit(&w->stop, true, memory_order_seq_cst);
++    dispatch_semaphore_signal(w->wake);
++    dispatch_group_wait(w->group, DISPATCH_TIME_FOREVER);
++    dispatch_release(w->group);
++    dispatch_release(w->wake);
++
++    [w->out release];
++    [w->pipeline release];
++    [w->queue release];
++
++    free(w);
++}
++
++void ggml_metal_device_warm(ggml_metal_device_t dev) {
++    const int ms = ggml_metal_warm_ms();
++    if (ms <= 0) {
++        return;
++    }
++
++    struct ggml_metal_warm * w = atomic_load_explicit(&dev->warm, memory_order_acquire);
++    if (w == NULL) {
++        @synchronized (dev->mtl_device) {
++            w = atomic_load_explicit(&dev->warm, memory_order_acquire);
++            if (w == NULL && !dev->warm_failed) {
++                w = ggml_metal_warm_init(dev->mtl_device);
++                dev->warm_failed = w == NULL;
++                atomic_store_explicit(&dev->warm, w, memory_order_release);
++            }
++        }
++        if (w == NULL) {
++            return;
++        }
++    }
++
++    atomic_store_explicit(&w->until_ns, ggml_metal_uptime_ns() + (long long) ms*1000000, memory_order_seq_cst);
++    if (atomic_exchange_explicit(&w->sleeping, false, memory_order_seq_cst)) {
++        dispatch_semaphore_signal(w->wake);
++    }
++}
++
+ struct ggml_metal_event {
+     void * obj; // id<MTLSharedEvent>
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index d0771eb..289add8 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -666,6 +666,10 @@ void ggml_backend_metal_capture_next_compute(ggml_backend_t backend) {
+     ggml_metal_capture_next_compute(ctx);
+ }
+ 
++void ggml_backend_metal_set_warm(int window_ms) {
++    ggml_metal_set_warm_ms(window_ms);
++}
++
+ // backend device
+ 
+ static const char * ggml_backend_metal_device_get_name(ggml_backend_dev_t dev) {

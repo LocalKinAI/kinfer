@@ -12,8 +12,10 @@
 # fault at a time — the MoE cache's misses, the experts a prompt's large
 # batches upload, which are read ahead while the GPU computes, and the rows of
 # a per-layer embedding table — and a profile of the experts generation used
-# fills a fresh cache. The libraries land in
-# internal/nativelib/libs/darwin_arm64_${VERSION}k2, which replaces the release
+# fills a fresh cache. For a model split across machines, Metal can keep the
+# GPU's clock up between graphs, while it waits for the other machine's layers
+# (ggml_backend_metal_set_warm). The libraries land in
+# internal/nativelib/libs/darwin_arm64_${VERSION}k3, which replaces the release
 # set the way one release replaces another (see fetch-libs.sh).
 #
 # Needs cmake, ninja and Xcode's command line tools; about two minutes on an M4.
@@ -22,7 +24,7 @@
 set -euo pipefail
 
 VERSION=b11998 # the release the patches are made against
-LEVEL=k2       # bumped when the patches change, so a cached copy is not reused
+LEVEL=k3       # bumped when the patches change, so a cached copy is not reused
 SRC=""
 for arg in "$@"; do
   case "$arg" in

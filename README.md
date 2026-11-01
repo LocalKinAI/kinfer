@@ -204,11 +204,13 @@ release — after diffing its `llama.h`; see `internal/nativelib/libs/README.md`
 
 `scripts/build-libs.sh` instead builds b11998 from source with kinfer's patch
 (`patches/llama.cpp/b11998/`; about two minutes, cmake and Xcode's command line
-tools) into `darwin_arm64_b11998k2/`, replacing the release set. It matters only
+tools) into `darwin_arm64_b11998k3/`, replacing the release set. It matters
 for a model whose experts or tables come from the SSD — see
 [When the experts do not fit in memory either](docs/big-models.md#when-the-experts-do-not-fit-in-memory-either);
 with the release set `-host-experts` and `-moe-cache` work as before and there is
-no profile.
+no profile — and for a model split across machines, whose GPUs it keeps at speed
+between tokens; with the release set a split decodes at about 25 tok/s where the
+patched one reaches 42.
 
 `scripts/release.sh v0.1.0` builds what a release ships: those patched
 libraries, the version stamped in, packed with its sha256 into `dist/`.

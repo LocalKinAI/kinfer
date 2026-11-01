@@ -35,11 +35,48 @@ trip, 343 Mb/s:
 | decode | 44.5 tok/s | 26.3 tok/s | 23.7 tok/s |
 | a 7,016-token prompt | 666 tok/s | 284 tok/s | 283 tok/s |
 
-Two layers cost almost as much as eight: what slows a token is crossing the
-link — about 16 ms of round trips each — not the laptop's share of the work,
-which is about 0.6 ms per layer. Reading a prompt is the cable's bandwidth, the
-same however the layers are split. Both are costs of USB 2.0; a Thunderbolt link
-has a fraction of the latency and a hundred times the bandwidth.
+Two layers cost almost as much as eight, and reading a prompt is the cable's
+bandwidth, the same however the layers are split.
+
+### Over Thunderbolt 5, and the GPU that waits
+
+A Thunderbolt 5 cable between the same two machines (Thunderbolt Bridge, 80
+Gb/s) moves 57–68 Gb/s each way over TCP, two hundred times the USB link. A
+round trip still takes about 0.3 ms, as it does over USB: that is the TCP stack
+at both ends, not the wire. The same model, v0.1.0 in the first two columns, the
+patched libraries in the third:
+
+| | USB 2.0 | Thunderbolt 5 | Thunderbolt 5, GPUs kept warm |
+|---|---:|---:|---:|
+| box, 8 layers (8.3 GB) on the laptop: load | 25.6 s (from the worker's cache) | 15.5 s (no cache) | 34.7 s (no cache) |
+| decode | 22.7 tok/s | 25.1 tok/s | 42.3 tok/s |
+| a 7,016-token prompt | 285 tok/s | 850 tok/s | 850 tok/s |
+| laptop, placed by itself (17 GB on the box): load | 475 s\* | 54 s (no cache) | 56 s (no cache) |
+| decode | 25.6 tok/s\* | 28.9 tok/s | 43.6 tok/s |
+| a 7,016-token prompt | 254 tok/s\* | 1,403 tok/s | 1,274 tok/s |
+
+\* The day before, with an earlier build and `-split 0.32,0.68` (15.8 GB on the
+box); over Thunderbolt that split decoded as fast as placement's.
+
+The box alone decodes at 44.1 tok/s and reads the prompt at 777.
+
+The bandwidth fixed loading and prompts, and barely moved decode. Decode was
+never the cable's: a token crosses it in two waits (the asynchronous commands
+before them cost about 0.1 ms each), and the rest of the time went to the GPUs.
+Each waits while the other computes its layers, and macOS lowers an idle GPU's
+clock within milliseconds — the laptop's 8 layers took 6 ms a token at the
+start of a reply and 11–14 ms twenty tokens in. The patched libraries
+(`scripts/build-libs.sh`) keep a GPU busy with a tiny kernel, one SIMD group for
+about 50 µs at a time on a queue of its own, for a second after each graph it
+computes; a worker and a `serve -peers` turn it on, and `GGML_METAL_WARM_MS`
+overrides the window (0 is off). With the release libraries a split decodes as
+in the middle column. On the box alone it is worth 4% (45.5 against 43.8 tok/s),
+so a single machine leaves it off.
+
+llama.cpp's RPC can also use RDMA over Thunderbolt, negotiated at connect, which
+would shorten the two waits. It is off on both machines here (`rdma_ctl status`);
+turning it on is done from macOS Recovery, and llama.cpp's RPC README says the
+address must be on the Thunderbolt interface itself, not a bridge.
 
 A Mac with its firewall on can hold a new worker's incoming connections until the
 program is allowed — on the MacBook Pro they sat unanswered until `kinfer` showed
@@ -205,8 +242,9 @@ reads 8 GiB in about a second; a context rebuilt for a longer prompt does not
 refill it, since warming up by itself costs less than that.
 
 For comparison, the same model with that third on the box's GPU over USB 2.0
-instead (`-peers`) decodes at 25.6 tok/s and reads a prompt at 254: the SSD is
-now the faster of the two.
+instead (`-peers`) decodes at 25.6 tok/s and reads a prompt at 254, slower than
+the SSD; over Thunderbolt 5 with both GPUs kept warm it decodes at 43.6 and reads
+the prompt at 1,274 (see [Over Thunderbolt 5](#over-thunderbolt-5-and-the-gpu-that-waits)).
 
 ### Placed by itself
 
