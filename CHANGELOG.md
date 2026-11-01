@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.5 — 2026-11-01
 
 ### Faster — the MoE cache keeps the GPU waiting less
 
