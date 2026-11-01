@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.1 — 2026-10-31
 
 ### A split decodes as fast as one machine: the GPUs kept warm
 
