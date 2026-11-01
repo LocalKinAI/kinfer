@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.3 — 2026-10-31
 
 ### `kinfer run` borrows a GPU by itself
 
