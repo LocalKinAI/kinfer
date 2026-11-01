@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.2 — 2026-10-31
 
 ### Fixed — no keep-warm beside experts in host memory
 
