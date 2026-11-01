@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.4 — 2026-10-31
 
 ### Fixed — the REPL edits Chinese, and survives Ctrl-C
 
