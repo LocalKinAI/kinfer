@@ -27,6 +27,11 @@ $ kinfer stop                                # the daemon, and the model it hold
 stopped the kinfer daemon on 127.0.0.1:11500 (pid 46715)
 ```
 
+The prompt edits by character — Chinese included, two columns a character —
+with the cursor keys, Home/End, Ctrl-U/K/W and history; a paste is one message.
+Ctrl-C stops a reply and leaves the conversation as it was; at an empty prompt
+it leaves, as Ctrl-D does.
+
 After each reply `run` says how fast the prompt was read and the reply made, on
 stderr, so a reply piped from stdout is the reply alone; `-stats=false` drops
 it. A reasoning model's thinking is shown in grey as it comes, when stderr is a

@@ -12,7 +12,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -22,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -343,14 +343,19 @@ func streamChat(ctx context.Context, base, model string, msgs []clientMsg, maxTo
 
 const replHelp = `  /bye, /exit    leave (the daemon keeps the model warm)
   /clear         forget this conversation
-  /?, /help      this message`
+  /?, /help      this message
+  Ctrl-C stops a reply; at an empty prompt it leaves, as Ctrl-D does`
 
 // repl is an interactive conversation against a warm daemon.
 //
 // History is kept client-side and resent whole each turn, because the engine
 // clears its KV cache between turns. That is correct but not free — it is the
 // re-prefill cost a prefix cache will remove.
-func repl(ctx context.Context, base, model, system string, maxTok int, stats bool) error {
+//
+// Each reply has its own context, which Ctrl-C cancels: run's own, cancelled
+// once, stayed cancelled, and every turn after an interrupted reply failed.
+// While a line is typed the editor takes Ctrl-C itself (lineedit.go).
+func repl(base, model, system string, maxTok int, stats bool) error {
 	fmt.Printf("kinfer · %s\n", model)
 	fmt.Printf("%s\n", replHelp)
 
@@ -363,16 +368,21 @@ func repl(ctx context.Context, base, model, system string, maxTok int, stats boo
 	}
 	reset()
 
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 0, 64<<10), 4<<20) // a pasted soul is longer than the default 64K
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt)
+	defer signal.Stop(sigs)
 
+	in := newLineReader(os.Stdin, os.Stdout)
 	for {
-		fmt.Print("\n> ")
-		if !sc.Scan() {
-			fmt.Println()
-			return sc.Err() // nil on a clean EOF (^D)
+		fmt.Println()
+		raw, err := in.ReadLine("> ")
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, errInterrupted) {
+				return nil
+			}
+			return err
 		}
-		line := strings.TrimSpace(sc.Text())
+		line := strings.TrimSpace(raw)
 		switch {
 		case line == "":
 			continue
@@ -389,13 +399,31 @@ func repl(ctx context.Context, base, model, system string, maxTok int, stats boo
 
 		msgs = append(msgs, clientMsg{Role: "user", Content: line})
 		fmt.Println()
-		reply, st, err := streamChat(ctx, base, model, msgs, maxTok, os.Stdout)
+		select { // a Ctrl-C from before this reply is not for it
+		case <-sigs:
+		default:
+		}
+		turn, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-sigs:
+				cancel()
+			case <-turn.Done():
+			}
+		}()
+		reply, st, err := streamChat(turn, base, model, msgs, maxTok, os.Stdout)
+		interrupted := turn.Err() != nil
+		cancel()
 		fmt.Println()
 		if stats && err == nil {
 			printStats(st)
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "kinfer: %v\n", err)
+			if interrupted {
+				fmt.Fprintln(os.Stderr, "(stopped)")
+			} else {
+				fmt.Fprintf(os.Stderr, "kinfer: %v\n", err)
+			}
 			// Drop the turn that failed rather than carrying a question the
 			// model never answered into the next prompt.
 			msgs = msgs[:len(msgs)-1]

@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — the REPL edits Chinese, and survives Ctrl-C
+
+`kinfer run`'s interactive prompt left line editing to the terminal, which
+erases a byte per backspace: backspacing over Chinese, three bytes a
+character, left half a character on the screen and broken UTF-8 in the
+request. On a terminal the REPL now edits its lines itself, in raw mode
+(`cmd/kinfer/lineedit.go`): a backspace erases a character, two columns for a
+wide one; the cursor keys, Home/End, Ctrl-U/K/W and history (up/down) work; a
+long line wraps and redraws; a bracketed paste is one message, its newlines
+kept. Piped, it reads lines as before. Driven through a real terminal with
+expect: 你好世界, two backspaces, 吗 sent "你好吗".
+
+Ctrl-C during a reply stopped it for good: the REPL shared run's one context,
+cancelled once, and every turn after failed. Each reply now has its own, and
+Ctrl-C stops just that one ("(stopped)"); at the prompt it clears the line, or
+leaves on an empty one, as Ctrl-D does.
+
 ## v0.1.3 — 2026-10-31
 
 ### `kinfer run` borrows a GPU by itself

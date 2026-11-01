@@ -276,7 +276,8 @@ func cmdRun(args []string) error {
 	}
 
 	if prompt == "" {
-		return repl(ctx, base, model, *system, *maxTok, *stats)
+		stop() // the REPL takes Ctrl-C a reply at a time
+		return repl(base, model, *system, *maxTok, *stats)
 	}
 
 	var msgs []clientMsg
