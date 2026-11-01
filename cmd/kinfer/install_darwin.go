@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -86,6 +87,22 @@ func uninstallService() (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// servicePID is the pid of the serve kinfer install keeps running, 0 when it
+// is not installed or not running.
+func servicePID() int {
+	out, err := exec.Command("launchctl", "print", launchdDomain()+"/"+serviceLabel).Output()
+	if err != nil {
+		return 0
+	}
+	for _, l := range strings.Split(string(out), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(l), "pid = "); ok {
+			pid, _ := strconv.Atoi(v)
+			return pid
+		}
+	}
+	return 0
 }
 
 func launchctl(args ...string) error {

@@ -5,23 +5,66 @@ A mixture of experts the GPU cannot hold, from host memory, from the SSD, and ac
 ## One model on two machines
 
 A model can take a second machine's GPU for some of its layers, through
-llama.cpp's RPC backend. The other machine runs a worker; this one names it:
+llama.cpp's RPC backend. With two Macs on a Thunderbolt cable, neither needs an
+address:
 
 ```bash
-# on the MacBook Pro: its end of the cable between the two
-kinfer worker -addr 169.254.85.249:50052
+# on the Mac lending its GPU
+kinfer worker
 
-# on the box: the layers that do not fit here go there, the rest and the output stay
-kinfer serve -peers 169.254.85.249:50052
+# on the other: a model that does not fit here borrows the worker; one that fits stays here
+kinfer run Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S
 ```
+
+`kinfer worker` listens on its end of the Thunderbolt Bridge, and answers a
+question broadcast on the bridge — never Wi-Fi or the LAN. `kinfer run` starts
+its daemon with `-peers auto`: when a model does not fit this GPU (with the room
+placement keeps for its context), the daemon asks over the cable, borrows the
+workers that answer, and gives them only the layers that do not fit here
+(see [Split by itself](#split-by-itself)). A model that fits never connects — a
+layer behind the cable costs every token a round trip, and a worker serves one
+machine at a time. With no worker answering, or one lent to another machine (it
+must answer a hello within 2 s), the model stays here, its experts in host
+memory as placement decides. On the MacBook Pro, Flash-Next found the box's
+worker in 0.3 s and decoded at 44.4 tok/s; with the worker busy it stayed on the
+laptop at 26.5.
+
+The worker can be started from the Mac that borrows it, over ssh, with the
+user name on the other Mac alone — kinfer finds that Mac at the other end of
+the cable by the IPv6 all-nodes address every Mac answers, takes its host key
+the first time, and starts the worker there in the background, where it lasts
+until that Mac restarts:
+
+```bash
+kinfer worker -on jackysub          # the Mac at the other end of the cable, as user jackysub
+kinfer worker -on jackysub -stop    # and stop it
+kinfer worker -on jackysub@studio.local   # or any Mac ssh reaches
+```
+
+It needs Remote Login on that Mac, and kinfer there of the same release; ssh
+asks for that Mac's password unless this one's key is in its authorized_keys
+(`ssh-copy-id` once). `kinfer stop` stops the daemon `kinfer run` started, and
+leaves the serve `kinfer install` keeps running to `kinfer uninstall`.
+
+`-peers none` (or `KINFER_PEERS=none` in the shell's profile) keeps `run` on
+this machine; `-peers host:port` names workers by hand, as for a USB link or
+another network. `serve` borrows nothing unless told: `serve -peers auto` finds
+workers the same way, `serve -peers 169.254.85.249:50052` names them. A daemon
+already running is used as it is, unless the run asked for peers it does not
+borrow; then the run says how to stop it, since using it would load the model
+somewhere other than asked.
 
 The worker is kinfer itself, not llama.cpp's `rpc-server`, because both ends
 must be the same llama.cpp build — the protocol went from 7 to 8 between b11175
-and b11998 — and one binary on both machines cannot disagree with itself. The
-protocol has no authentication, so a worker belongs on the cable between the two
-machines (a Thunderbolt bridge, a USB link), never on a LAN address; it defaults
-to loopback. The worker keeps every tensor it is sent in `~/.kinfer/rpc-cache`,
-by hash, so a model's second load sends hashes instead of weights.
+and b11998 — and one binary on both machines cannot disagree with itself; a
+worker of another version is refused at the hello rather than aborting the
+process. The protocol has no authentication, so a worker belongs on the cable
+between the two machines, never on a LAN address: by default the Thunderbolt
+Bridge's, otherwise `-addr` given by hand (127.0.0.1 for this machine alone).
+The worker keeps every tensor it is sent in `~/.kinfer/rpc-cache`, by hash, so a
+model's second load sends hashes instead of weights. Both ends probe a silent
+connection after 10 s: a borrower killed with its connection open freed the
+worker in 15 s, where TCP alone takes two hours.
 
 Measured with Qwen3.8-Flash-Next IQ3_S between the box (M3 Ultra) and a MacBook
 Pro (M5 Max), joined by a USB-C cable that negotiated USB 2.0 — 1.2 ms round

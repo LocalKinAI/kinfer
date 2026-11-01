@@ -1,8 +1,12 @@
 package llama
 
 import (
+	"encoding/binary"
 	"fmt"
+	"io"
+	"net"
 	"path/filepath"
+	"time"
 
 	"github.com/ebitengine/purego"
 )
@@ -108,6 +112,45 @@ func ServeRPC(endpoint, cacheDir string, threads int) error {
 	rpcStartServer(&ep[0], cache, uint64(threads), uint64(len(devs)), &devs[0])
 	// It returns only when it could not listen.
 	return fmt.Errorf("the RPC server at %s stopped (could it bind that address?)", endpoint)
+}
+
+// The protocol of the llama.cpp kinfer embeds (ggml-rpc.h, b11998), as much of
+// it as a hello takes: a command byte and a length-prefixed request of the
+// connection capabilities, all zero for plain TCP; a length-prefixed response
+// of the server's version and its capabilities.
+const (
+	rpcCmdHello     = 14
+	rpcCapsSize     = 24
+	RPCProtoVersion = 8
+)
+
+// RPCHello says whether a worker at endpoint answers a hello within wait, in
+// this build's protocol, and hangs up. llama.cpp's own connection does not ask
+// first: a worker serving another machine takes one connection at a time, and
+// llama.cpp waits on it forever; one of another version, and it aborts the
+// whole process.
+func RPCHello(endpoint string, wait time.Duration) error {
+	c, err := net.DialTimeout("tcp", endpoint, min(wait, 3*time.Second))
+	if err != nil {
+		return fmt.Errorf("worker %s is not reachable: %w", endpoint, err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(wait))
+	req := make([]byte, 1+8+rpcCapsSize)
+	req[0] = rpcCmdHello
+	binary.LittleEndian.PutUint64(req[1:9], rpcCapsSize)
+	if _, err := c.Write(req); err != nil {
+		return fmt.Errorf("worker %s is not reachable: %w", endpoint, err)
+	}
+	rsp := make([]byte, 8+4+rpcCapsSize)
+	if _, err := io.ReadFull(c, rsp); err != nil {
+		return fmt.Errorf("worker %s did not answer within %s — is it serving another machine?", endpoint, wait)
+	}
+	if n := binary.LittleEndian.Uint64(rsp[:8]); n != 4+rpcCapsSize || rsp[8] != RPCProtoVersion {
+		return fmt.Errorf("worker %s speaks RPC protocol %d.%d, this kinfer %d: run the same kinfer on both machines",
+			endpoint, rsp[8], rsp[9], RPCProtoVersion)
+	}
+	return nil
 }
 
 // RPCDevices connects to a worker and returns its devices, for a model's

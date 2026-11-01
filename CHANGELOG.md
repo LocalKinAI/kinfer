@@ -1,5 +1,64 @@
 # Changelog
 
+## Unreleased
+
+### `kinfer run` borrows a GPU by itself
+
+Lending a GPU took looking up the Thunderbolt Bridge's link-local address on
+one Mac and typing it into `-peers` on the other, and again whenever the cable
+was plugged in again. Now:
+
+- `kinfer worker` listens on its end of the Thunderbolt Bridge by default (it
+  listened on loopback, of no use to a worker), and answers a question broadcast
+  on the bridge alone (`internal/link`). A Thunderbolt Bridge passes neither the
+  limited broadcast nor multicast from a bound socket — those datagrams never
+  left it — but the link-local network's own broadcast address has a route
+  scoped to it.
+- `kinfer run` starts its daemon with `-peers auto`. For a model that does not
+  fit this GPU, the daemon asks over the cable (0.3 s), borrows the workers that
+  answer, and gives them only the layers that do not fit here. A model that fits
+  never connects. With no answer, or a worker lent to another machine, the model
+  stays here with its experts in host memory. On the MacBook Pro, Flash-Next
+  found the box's worker and decoded at 44.4 tok/s; with the worker busy it
+  stayed on the laptop at 26.5.
+- `-peers none`, `-peers host:port[,...]` and `KINFER_PEERS` say otherwise;
+  `serve -peers auto` does what run does, and `serve` alone still borrows
+  nothing. `/health` lists a daemon's peers, and a run that asks for peers
+  refuses a daemon running with others and says how to stop it.
+- A worker is asked for a hello, within 2 s, before llama.cpp connects
+  (`llama.RPCHello`): llama.cpp waited forever on a worker serving another
+  machine, and aborted the process on another protocol version.
+- The patch adds TCP keepalive to RPC connections
+  (`patches/llama.cpp/b11998/0003-rpc-keepalive.patch`, libraries
+  `darwin_arm64_b11998k4`). A borrower that died with its connection open left
+  the worker serving it, the only connection it takes, until TCP's two-hour
+  keepalive; probed after 10 s of silence it freed in 15 s.
+
+### `kinfer worker -on`, and `kinfer stop`
+
+`kinfer worker -on user` starts a worker on the Mac at the other end of the
+Thunderbolt cable, over ssh, from the Mac that will borrow it: that Mac is found
+by the IPv6 all-nodes address on the bridge, which every Mac answers with
+nothing of kinfer's running, its host key taken the first time
+(`StrictHostKeyChecking=accept-new`), and the worker left running there in the
+background. `-on user@host` names any Mac ssh reaches, `-stop` stops it, and a
+release that differs from this one is said at once. It needs Remote Login there
+and, for no password, this Mac's key in that one's authorized_keys.
+
+`kinfer stop` stops the daemon `kinfer run` started — it took `pkill -f 'serve
+-addr 127.0.0.1:11500'`. `/health` now says the daemon's pid; one from an older
+release is found by the port it listens on, if that process is kinfer. The serve
+`kinfer install` keeps running is refused, since launchd would start it again.
+
+### `kinfer run` shows the thinking and the speed
+
+After each reply `run` prints, on stderr, how fast the prompt was read and the
+reply made — `[prompt 18 tokens in 0.25 s (71 tok/s) · reply 112 tokens at 44.1
+tok/s]`, as `ollama run --verbose` and play.sh do; `-stats=false` drops it. A
+reasoning model's thinking, which `run` never showed — a long think looked like
+a hang, and a reply cut short by `-n` was blank — is shown in grey on stderr as
+it comes, when stderr is a terminal. Piped, stdout carries the reply alone.
+
 ## v0.1.2 — 2026-10-31
 
 ### Fixed — no keep-warm beside experts in host memory

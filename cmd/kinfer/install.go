@@ -88,13 +88,16 @@ func cmdUninstall(args []string) error {
 // checkServeFlags parses args with serve's flag set so a typo is refused now,
 // at the keyboard, rather than by a job that fails to start after every login.
 func checkServeFlags(args []string) error {
-	fs, _ := serveFlags(flag.ContinueOnError)
+	fs, o := serveFlags(flag.ContinueOnError)
 	fs.SetOutput(nopWriter{})
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("serve would refuse these flags: %w", err)
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("serve takes no arguments, and %q would be one", fs.Arg(0))
+	}
+	if err := o.check(); err != nil {
+		return fmt.Errorf("serve would refuse these flags: %w", err)
 	}
 	return nil
 }

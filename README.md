@@ -97,10 +97,12 @@ kinfer list                  # what is installed
 kinfer rm <model>            # delete one
 kinfer run <model> [prompt]  # chat — no prompt means interactive
 kinfer ps                    # what the daemon is holding right now
+kinfer stop                  # stop that daemon
 kinfer serve [-addr :11500]  # serve over HTTP; context and slots sized to the model
 kinfer install [serve flags] # keep serve running: at login and after a crash (macOS)
 kinfer uninstall             # stop it and remove the service
-kinfer worker -addr <ip:port> # lend this machine's GPU to a serve -peers on another
+kinfer worker                # lend this machine's GPU over a Thunderbolt cable
+kinfer worker -on <user>     # start one on the Mac at the other end of the cable
 kinfer version               # this build, and the llama.cpp inside it
 ```
 
@@ -112,8 +114,10 @@ A model the GPU cannot hold needs no flags. A mixture of experts uses a few of
 its experts for each token — 10 of Flash-Next's 512 — so kinfer reads the
 model's header, keeps on the GPU what every token uses and a cache of the
 experts in use, and leaves the other experts in host memory, read from the SSD
-as the cache misses them. Given another machine's GPU (`-peers`), it gives that
-machine only the layers that do not fit here.
+as the cache misses them. With another Mac on a Thunderbolt cable running
+`kinfer worker`, `kinfer run` finds it by itself and borrows its GPU for the
+layers that do not fit here — 44 tok/s on the MacBook Pro where its SSD gives 30
+— and a model that fits never touches it.
 
 Qwen3.8-Flash-Next IQ3_S — 51 GiB of weights, and a 27 GiB table read a few
 rows a token — with no flags; a 7,753-token prompt and three 200-token replies:
@@ -204,13 +208,14 @@ release — after diffing its `llama.h`; see `internal/nativelib/libs/README.md`
 
 `scripts/build-libs.sh` instead builds b11998 from source with kinfer's patch
 (`patches/llama.cpp/b11998/`; about two minutes, cmake and Xcode's command line
-tools) into `darwin_arm64_b11998k3/`, replacing the release set. It matters
+tools) into `darwin_arm64_b11998k4/`, replacing the release set. It matters
 for a model whose experts or tables come from the SSD — see
 [When the experts do not fit in memory either](docs/big-models.md#when-the-experts-do-not-fit-in-memory-either);
 with the release set `-host-experts` and `-moe-cache` work as before and there is
 no profile — and for a model split across machines, whose GPUs it keeps at speed
-between tokens; with the release set a split decodes at about 25 tok/s where the
-patched one reaches 42.
+between tokens (with the release set a split decodes at about 25 tok/s where the
+patched one reaches 42), and whose connections notice a machine that went away
+within about 25 s instead of two hours.
 
 `scripts/release.sh v0.1.0` builds what a release ships: those patched
 libraries, the version stamped in, packed with its sha256 into `dist/`.
@@ -239,8 +244,9 @@ formula for that release into the tap,
       them: no flags on the MacBook Pro, as fast as the hand-tuned ones
 - [x] **Split by itself** — with `-peers`, the peers take only the layers that do
       not fit here, and what does not fit anywhere stays in this machine's host memory
-- [ ] **Bigger than one machine, at speed** — a Thunderbolt 5 link, and choosing
-      between a peer's GPU and this machine's SSD by what each costs a token
+- [x] **Bigger than one machine, at speed** — over Thunderbolt 5 with the GPUs
+      kept warm a split decodes as fast as the box alone, and `kinfer run` borrows a
+      worker it finds on the cable only for a model that does not fit here
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,
       circuit breaking, per-agent model routing
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks

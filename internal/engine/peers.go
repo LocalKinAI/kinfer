@@ -3,10 +3,10 @@ package engine
 import (
 	"fmt"
 	"log"
-	"net"
 	"strings"
 	"time"
 
+	"github.com/LocalKinAI/kinfer/internal/link"
 	"github.com/LocalKinAI/kinfer/internal/llama"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
@@ -14,6 +14,42 @@ import (
 // peerSettle is how long deviceList waits after its own check before llama.cpp
 // connects to a worker; see there.
 const peerSettle = 500 * time.Millisecond
+
+// helloWait is how long a worker has to answer that check.
+const helloWait = 2 * time.Second
+
+// findWait is how long kinfer listens for workers answering over the
+// Thunderbolt cable; they answered in 1-20 ms there.
+const findWait = 300 * time.Millisecond
+
+// findPeers is the workers a model borrows when kinfer was asked to find them
+// (-peers auto): none for a model that fits this GPU — a layer behind the
+// cable costs every token a round trip, and a worker takes one machine at a
+// time, so it is not held for a model that does not need it — and otherwise
+// whichever answer over the Thunderbolt cable. With none, the model stays
+// here, its experts in host memory as placement decides.
+func findPeers(sh store.Shape, bud *budget, opts Options, name string) []string {
+	if !bud.known || sh.WeightBytes == 0 {
+		return nil
+	}
+	room := placeRoom(sh, opts.Slots, opts.ContextSize, opts.Batch)
+	if uint64(sh.WeightBytes)+room.Reserve <= bud.atStart {
+		return nil
+	}
+	b, err := link.FindBridge()
+	if err != nil {
+		log.Printf("peers: %s does not fit this GPU, and there is %v; it stays here", name, err)
+		return nil
+	}
+	found, err := link.Find(b, findWait)
+	if err != nil || len(found) == 0 {
+		log.Printf("peers: %s does not fit this GPU, and no kinfer worker answered over the Thunderbolt cable (%s); it stays here",
+			name, b.Name)
+		return nil
+	}
+	log.Printf("peers: %s does not fit this GPU; over the Thunderbolt cable %s answered", name, strings.Join(found, ", "))
+	return found
+}
 
 // deviceList is the device list a model loads onto when it is split across
 // machines: every peer's devices, then this machine's GPU, then the zero
@@ -34,13 +70,12 @@ func deviceList(peers []string, split []float32) ([]uintptr, []float32, error) {
 	var devs []uintptr
 	for _, p := range peers {
 		// ggml aborts the whole process when it cannot connect, rather than
-		// returning an error, so the connection is tried here first: a worker
-		// on a laptop that went to sleep is a failed load, not a dead server.
-		c, err := net.DialTimeout("tcp", p, 3*time.Second)
-		if err != nil {
-			return nil, nil, fmt.Errorf("worker %s is not reachable: %w", p, err)
+		// returning an error, and waits forever on a worker busy with another
+		// machine, so the worker is asked first: a worker on a laptop that went
+		// to sleep, or lent to someone else, is a failed load, not a dead server.
+		if err := llama.RPCHello(p, helloWait); err != nil {
+			return nil, nil, err
 		}
-		c.Close()
 		// The worker serves one connection at a time and keeps a queue of
 		// one, and connecting again at once was refused or reset over the
 		// cable from the MacBook Pro to the box, most loads in a row; half a

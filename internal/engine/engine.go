@@ -112,6 +112,11 @@ type Options struct {
 	// last.
 	Peers []string
 
+	// FindPeers, in place of Peers, looks for workers over the Thunderbolt
+	// cable for a model this GPU cannot hold, and borrows those that answer;
+	// a model that fits borrows none (findPeers).
+	FindPeers bool
+
 	// Split is each device's share of the layers, in that order: the peers',
 	// then this machine's. Empty lets llama.cpp share by free memory.
 	Split []float32
@@ -326,14 +331,26 @@ func Open(path string, opts Options) (*Engine, error) {
 	mp := llama.DefaultModelParams()
 	mp.NGpuLayers = int32(opts.GPULayers)
 
-	devs, split, err := deviceList(opts.Peers, opts.Split)
-	if err != nil {
-		return nil, err
-	}
 	// Read the accelerator's free memory before anything is allocated, so the
 	// model's and the context's real costs can be measured rather than guessed.
 	bud := newBudget()
 	shape, _ := store.ReadShape(path)
+
+	peers := opts.Peers
+	if opts.FindPeers && opts.HostExperts == 0 && opts.MoeCache == 0 && !opts.NoPlace && len(opts.Split) == 0 {
+		peers = findPeers(shape, bud, opts, filepath.Base(path))
+	}
+	devs, split, err := deviceList(peers, opts.Split)
+	if err != nil && opts.FindPeers && len(peers) > 0 {
+		// Found is not promised: a worker that answered may be lent to
+		// another machine by now. The model stays here instead.
+		log.Printf("peers: %v; %s stays here", err, filepath.Base(path))
+		peers = nil
+		devs, split, err = deviceList(nil, opts.Split)
+	}
+	if err != nil {
+		return nil, err
+	}
 
 	// Where the weights go, when the operator did not say: a mixture of
 	// experts the GPU cannot hold leaves some layers' experts in host memory,
@@ -342,7 +359,7 @@ func Open(path string, opts Options) (*Engine, error) {
 	var placed Placed
 	if hostExperts == 0 && moeCache == 0 && !opts.NoPlace && bud.known {
 		switch {
-		case len(opts.Peers) == 0:
+		case len(peers) == 0:
 			placed = placeFor(shape, bud.atStart, opts, filepath.Base(path))
 		case split == nil && opts.GPULayers > shape.Layers:
 			var across DevicePlacement

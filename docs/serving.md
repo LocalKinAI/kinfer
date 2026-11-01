@@ -11,6 +11,7 @@ the same reason `ollama run` feels instant.
 ```
 $ kinfer run qwen "say hi in three words"    # 0.50s — daemon starts, model loads
 Hi there!
+[prompt 13 tokens in 0.01 s (1120 tok/s) · reply 3 tokens at 248.5 tok/s]
 $ kinfer run qwen "name three colors"        # 0.41s — warm
 $ kinfer run qwen                            # no prompt: interactive
 kinfer · qwen
@@ -21,7 +22,16 @@ kinfer · qwen
 $ kinfer ps
 NAME                                               SIZE  UNTIL
 qwen2.5-0.5b-instruct-q4_k_m                   468.6 MB  5m0s
+
+$ kinfer stop                                # the daemon, and the model it holds
+stopped the kinfer daemon on 127.0.0.1:11500 (pid 46715)
 ```
+
+After each reply `run` says how fast the prompt was read and the reply made, on
+stderr, so a reply piped from stdout is the reply alone; `-stats=false` drops
+it. A reasoning model's thinking is shown in grey as it comes, when stderr is a
+terminal. A model that does not fit this GPU borrows a kinfer worker on a
+Thunderbolt cable, if one answers ([One model on two machines](big-models.md#one-model-on-two-machines)).
 
 An idle model is unloaded after `-keepalive` (default 5 minutes), because a 7B
 left resident forever owns most of a 16 GB machine. A request can say otherwise,

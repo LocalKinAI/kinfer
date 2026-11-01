@@ -1,0 +1,47 @@
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index d5670f3..985ebe6 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -707,6 +707,26 @@ static bool set_no_delay(sockfd_t sockfd) {
+     return ret == 0;
+ }
+ 
++// A peer that died without closing the connection — its FIN lost, its machine asleep or unplugged — would
++// hold the server's one connection, or leave the client waiting, until TCP's own keepalive two hours later.
++// Probing after 10 s of silence, every 5 s, 3 times, finds it within about 25 s; the peer's kernel answers
++// the probes, so a long computation on a live peer is not mistaken for a dead one.
++static void set_keep_alive(sockfd_t sockfd) {
++    int on = 1;
++    setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (char *)&on, sizeof(on));
++#if defined(__APPLE__)
++    int idle = 10, intvl = 5, cnt = 3;
++    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
++    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
++    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
++#elif defined(__linux__)
++    int idle = 10, intvl = 5, cnt = 3;
++    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
++    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
++    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
++#endif
++}
++
+ static bool set_reuse_addr(sockfd_t sockfd) {
+     int flag = 1;
+     int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(int));
+@@ -722,6 +742,7 @@ socket_ptr socket_t::accept() {
+         LOG_ERROR("Failed to set TCP_NODELAY\n");
+         return nullptr;
+     }
++    set_keep_alive(client_socket_fd);
+     LOG_DBG("[%s] accepted client connection\n", __func__);
+     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+ }
+@@ -763,6 +784,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
+         LOG_ERROR("Failed to set TCP_NODELAY\n");
+         return nullptr;
+     }
++    set_keep_alive(sockfd);
+     struct sockaddr_in addr;
+     addr.sin_family = AF_INET;
+     addr.sin_port = htons(port);

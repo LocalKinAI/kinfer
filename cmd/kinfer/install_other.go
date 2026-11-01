@@ -19,3 +19,6 @@ func installService(service) (string, error) {
 func uninstallService() (string, error) {
 	return "", fmt.Errorf("kinfer uninstall is macOS-only for now (this is %s)", runtime.GOOS)
 }
+
+// servicePID has no service to look up off macOS.
+func servicePID() int { return 0 }

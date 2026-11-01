@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 
+	"github.com/LocalKinAI/kinfer/internal/link"
 	"github.com/LocalKinAI/kinfer/internal/llama"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
 	"github.com/LocalKinAI/kinfer/internal/store"
@@ -15,22 +20,46 @@ import (
 // cmdWorker lends this machine's GPU to a kinfer serve on another, which puts
 // some of a model's layers on it (serve -peers). See internal/llama/rpc.go.
 //
-// The default address is loopback because the protocol has no authentication:
-// anyone who reaches the port can run computations and read what is loaded. A
-// worker meant for another machine is given the address of the cable between
-// them — a Thunderbolt bridge, a USB link — never a LAN or Wi-Fi address.
+// The protocol has no authentication: anyone who reaches the port can run
+// computations and read what is loaded. So a worker listens on the cable
+// between two machines and nowhere else — by default this Mac's end of a
+// Thunderbolt cable (internal/link), where it also answers the machine at the
+// other end when it asks for workers; otherwise a cable's address given by
+// hand, or loopback. Never a LAN or Wi-Fi address.
 func cmdWorker(args []string) error {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
-	addr := fs.String("addr", "127.0.0.1:50052", "address to serve on: this machine's end of the cable to the other one")
+	addr := fs.String("addr", "auto", "address to serve on: this machine's end of the cable to the other one (auto = the Thunderbolt Bridge's)")
 	home, _ := os.UserHomeDir()
 	cache := fs.String("cache", filepath.Join(home, ".kinfer", "rpc-cache"),
 		"where to keep the weights a serve sends, so its next load sends hashes instead (\"\" to keep none)")
 	threads := fs.Int("threads", runtime.NumCPU(), "CPU threads for work the GPU does not take")
+	on := fs.String("on", "", "start the worker on another Mac instead, over ssh, in the background there: user@host, or a user alone for the Mac at the other end of the Thunderbolt cable")
+	stop := fs.Bool("stop", false, "with -on, stop the worker running there")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("worker takes no arguments; %q was one", fs.Arg(0))
+	}
+	if *on != "" {
+		return remoteWorker(*on, *stop)
+	}
+	if *stop {
+		return fmt.Errorf("-stop stops a worker started with -on; a worker here stops with Ctrl-C")
+	}
+	bridge, berr := link.FindBridge()
+	if *addr == "auto" {
+		if berr != nil {
+			return fmt.Errorf("%w\n       connect one, or give -addr: another cable's address, or 127.0.0.1:%d for this machine alone",
+				berr, link.Port)
+		}
+		*addr = bridge.Addr()
+	}
+	// Found by the other machine only on the bridge: a worker given another
+	// address is named by hand there too.
+	onBridge := false
+	if host, _, err := net.SplitHostPort(*addr); err == nil && berr == nil {
+		onBridge = net.ParseIP(host).Equal(bridge.IP)
 	}
 	if *cache != "" {
 		if err := os.MkdirAll(*cache, 0o755); err != nil {
@@ -62,7 +91,17 @@ func cmdWorker(args []string) error {
 	if llama.KeepGPUWarm(llama.WarmWindowMs) {
 		fmt.Printf("  the GPU is kept at speed between tokens\n")
 	}
-	fmt.Printf("  on the other machine: kinfer serve -peers %s\n", *addr)
+	if onBridge {
+		go func() {
+			if err := link.Answer(context.Background(), bridge, *addr); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("worker: the other machine cannot find this worker by itself (%v); name it there with -peers %s", err, *addr)
+			}
+		}()
+		fmt.Printf("  on the other machine, over the Thunderbolt cable: kinfer run <model> finds this worker by itself "+
+			"when the model does not fit there; kinfer serve -peers auto does the same, -peers %s names it\n", *addr)
+	} else {
+		fmt.Printf("  on the other machine: kinfer run -peers %s <model>, or kinfer serve -peers %s\n", *addr, *addr)
+	}
 	fmt.Printf("  no authentication — keep this address on a cable between two machines\n\n")
 	return llama.ServeRPC(*addr, *cache, *threads)
 }

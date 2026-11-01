@@ -31,9 +31,10 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer rm <model>            delete a model
   kinfer run <model> [prompt]  chat with a model (no prompt = interactive)
   kinfer ps                    show which model is loaded right now
+  kinfer stop                  stop the background daemon run started
   kinfer plan <model>          what -slots and -ctx to serve it with
   kinfer serve                 serve models over HTTP
-  kinfer worker                lend this machine's GPU to a serve on another (-peers)
+  kinfer worker                lend this machine's GPU to the Mac at the other end of a Thunderbolt cable
   kinfer install [serve flags] keep serve running: at login, and after a crash (macOS)
   kinfer uninstall             stop it and remove the service
   kinfer fit                   what this machine can actually run
@@ -44,11 +45,14 @@ Examples:
   kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
   kinfer run qwen                        # interactive, model stays warm
   kinfer run qwen "explain merkle trees" # one shot, same warm model
+  kinfer worker -on jackysub             # lend the GPU of the Mac at the other end of the cable
   kinfer serve -addr :11500
 
 run starts a background daemon on first use and reuses it afterwards, so the
 model is loaded once rather than once per command. kinfer ps shows what it is
-holding; -local skips the daemon and loads in-process instead.
+holding; -local skips the daemon and loads in-process instead. A model that
+does not fit this GPU borrows a kinfer worker that answers over a Thunderbolt
+cable, if there is one; -peers none (or KINFER_PEERS=none) keeps it here.
 `
 
 func main() {
@@ -69,6 +73,8 @@ func main() {
 		err = cmdRemove(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "stop":
+		err = cmdStop(os.Args[2:])
 	case "ps":
 		err = cmdPS(os.Args[2:])
 	case "serve":
@@ -213,6 +219,23 @@ func cmdRun(args []string) error {
 	addr := fs.String("addr", defaultAddr, "daemon address")
 	keepAlive := fs.Duration("keepalive", 5*time.Minute, "how long the daemon keeps an idle model loaded")
 	local := fs.Bool("local", false, "load the model in this process instead of using a daemon")
+	stats := fs.Bool("stats", true, "after each reply, how fast the prompt was read and the reply made (on stderr)")
+	// By default the daemon borrows a worker over the Thunderbolt cable for a
+	// model that does not fit here, and keeps the rest here (-peers auto).
+	// KINFER_PEERS says otherwise once for the machine, -peers for one run.
+	peers, asked, peersFlag := []string{"auto"}, false, false
+	if v := os.Getenv("KINFER_PEERS"); v != "" {
+		p, err := parsePeers(v)
+		if err != nil {
+			return fmt.Errorf("KINFER_PEERS: %w", err)
+		}
+		peers, asked = p, true
+	}
+	fs.Func("peers", "where the daemon borrows GPUs for a model that does not fit here: auto = the kinfer workers that answer over the Thunderbolt cable, none = this machine alone, or workers' host:port, comma-separated (default auto, or $KINFER_PEERS)", func(v string) (err error) {
+		peers, err = parsePeers(v)
+		asked, peersFlag = true, true
+		return err
+	})
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -241,16 +264,19 @@ func cmdRun(args []string) error {
 	defer stop()
 
 	if *local {
+		if peersFlag && len(peers) > 0 {
+			return fmt.Errorf("-peers needs the daemon: the model loads in it, not in this process; drop -local")
+		}
 		return runLocal(ctx, model, prompt, *system, *ngl, *nCtx, *maxTok)
 	}
 
-	base, err := ensureDaemon(*addr, *ngl, *nCtx, *keepAlive)
+	base, err := ensureDaemon(*addr, *ngl, *nCtx, *keepAlive, peers, asked)
 	if err != nil {
 		return err
 	}
 
 	if prompt == "" {
-		return repl(ctx, base, model, *system, *maxTok)
+		return repl(ctx, base, model, *system, *maxTok, *stats)
 	}
 
 	var msgs []clientMsg
@@ -259,8 +285,11 @@ func cmdRun(args []string) error {
 	}
 	msgs = append(msgs, clientMsg{Role: "user", Content: prompt})
 
-	_, err = streamChat(ctx, base, model, msgs, *maxTok, os.Stdout)
+	_, st, err := streamChat(ctx, base, model, msgs, *maxTok, os.Stdout)
 	fmt.Println()
+	if *stats && err == nil {
+		printStats(st)
+	}
 	return err
 }
 
@@ -436,6 +465,41 @@ func (p *prefixFlag) Set(v string) error {
 	return nil
 }
 
+// parsePeers reads a -peers list, host:port comma-separated; "" and "none" are
+// none, and "auto" — alone — is the workers that answer over the Thunderbolt
+// cable when a model needs them (engine.Options.FindPeers), kept as ["auto"].
+func parsePeers(v string) ([]string, error) {
+	switch strings.TrimSpace(v) {
+	case "", "none":
+		return nil, nil
+	case "auto":
+		return []string{"auto"}, nil
+	}
+	var peers []string
+	for _, p := range strings.Split(v, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(p); err != nil {
+			return nil, fmt.Errorf("%q is not host:port, auto or none", p)
+		}
+		peers = append(peers, p)
+	}
+	return peers, nil
+}
+
+// isAuto is a peers list that says to find them.
+func isAuto(peers []string) bool { return len(peers) == 1 && peers[0] == "auto" }
+
+// check is what serve refuses among flags that parse one by one.
+func (o *serveOpts) check() error {
+	if isAuto(o.peers) && len(o.split) > 0 {
+		return fmt.Errorf("-split shares the layers among peers named by hand, not -peers auto")
+	}
+	return nil
+}
+
 func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	o := &serveOpts{}
 	fs := flag.NewFlagSet("serve", h)
@@ -453,16 +517,9 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.IntVar(&o.hostExperts, "host-experts", 0, "a mixture of experts' routed experts stay in host memory, mapped from the file, for this many of the first layers (-1 = every layer; 0 = as many as -place decides, none for a model that fits)")
 	fs.IntVar(&o.moeCache, "moe-cache", 0, "MiB of GPU memory caching the host experts in use, so only a miss is copied (0 = what -place decides, none for a model that fits)")
 	fs.BoolVar(&o.place, "place", true, "when a mixture of experts does not fit the GPU, keep as many layers' experts in host memory as it must, with a GPU cache for the ones in use, unless -host-experts or -moe-cache say otherwise; with -peers and no -split, give the peers only the layers that do not fit here (false = load it whole, and let llama.cpp split by free memory)")
-	fs.Func("peers", "kinfer workers on other machines (host:port, comma-separated) whose GPUs take the first layers of each model", func(v string) error {
-		o.peers = nil
-		for _, p := range strings.Split(v, ",") {
-			p = strings.TrimSpace(p)
-			if _, _, err := net.SplitHostPort(p); err != nil {
-				return fmt.Errorf("%q is not host:port", p)
-			}
-			o.peers = append(o.peers, p)
-		}
-		return nil
+	fs.Func("peers", "kinfer workers on other machines (host:port, comma-separated) whose GPUs take the first layers of each model; auto = those that answer over the Thunderbolt cable, for a model that does not fit here (default none)", func(v string) (err error) {
+		o.peers, err = parsePeers(v)
+		return err
 	})
 	fs.Func("split", "each device's share of the layers, comma-separated: every peer's, then this machine's (default: the peers take only what does not fit here; with -place=false, by free memory)", func(v string) error {
 		o.split = nil
@@ -487,6 +544,13 @@ func cmdServe(args []string) error {
 		return fmt.Errorf("serve takes no arguments; %q was one", fs.Arg(0))
 	}
 
+	if err := o.check(); err != nil {
+		return err
+	}
+	findPeers := isAuto(o.peers)
+	if findPeers {
+		o.peers = nil
+	}
 	st, err := store.Open()
 	if err != nil {
 		return err
@@ -494,7 +558,7 @@ func cmdServe(args []string) error {
 	srv := server.New(st, engine.Options{
 		GPULayers: o.ngl, ContextSize: o.nCtx, Slots: o.slots, PrefixSlots: int(o.prefix),
 		MaxQueue: o.queue, MaxGenerate: noLimit(o.maxGen), MaxWait: noLimit(o.maxWait),
-		FixedLayout: !o.flex, Batch: o.batch, Peers: o.peers, Split: o.split,
+		FixedLayout: !o.flex, Batch: o.batch, Peers: o.peers, FindPeers: findPeers, Split: o.split,
 		HostExperts: o.hostExperts, MoeCache: o.moeCache, NoPlace: !o.place,
 	})
 	srv.SetKeepAlive(o.keepAlive)

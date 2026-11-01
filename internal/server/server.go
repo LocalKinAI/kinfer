@@ -147,7 +147,17 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		// The peers are how `kinfer run -peers` tells a daemon that borrows
+		// them from one that would load on this machine alone.
+		// The pid is how `kinfer stop` finds the daemon to stop.
+		h := map[string]any{"status": "ok", "pid": os.Getpid()}
+		switch {
+		case s.opts.FindPeers:
+			h["peers"] = []string{"auto"}
+		case len(s.opts.Peers) > 0:
+			h["peers"] = s.opts.Peers
+		}
+		writeJSON(w, http.StatusOK, h)
 	})
 
 	// Counting wraps everything, so an endpoint added later cannot forget to

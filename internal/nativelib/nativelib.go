@@ -151,7 +151,7 @@ func sameContent(a, b []byte) bool {
 // "darwin_arm64_b6862" — the llama.cpp build number is part of the name, and it
 // is not known at compile time, so match on the prefix.
 // LibrarySet names the llama.cpp libraries this binary carries for this
-// platform: darwin_arm64_b11998 for the release set, darwin_arm64_b11998k3
+// platform: darwin_arm64_b11998 for the release set, darwin_arm64_b11998k4
 // for the one scripts/build-libs.sh patches.
 func LibrarySet() (string, error) { return platformDir() }
 
