@@ -1,0 +1,96 @@
+diff --git a/ggml/src/ggml-metal/CMakeLists.txt b/ggml/src/ggml-metal/CMakeLists.txt
+index 91691b2..06689fc 100644
+--- a/ggml/src/ggml-metal/CMakeLists.txt
++++ b/ggml/src/ggml-metal/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
+ find_library(METAL_FRAMEWORK    Metal      REQUIRED)
+ find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
++find_library(IOKIT_FRAMEWORK    IOKit)
+ 
+ message(STATUS "Metal framework found")
+ 
+@@ -21,6 +22,11 @@ target_link_libraries(ggml-metal PRIVATE
+                       ${METALKIT_FRAMEWORK}
+                       )
+ 
++# GGML_METAL_FREE_DEVICE reads the GPU's memory statistics from IOKit (macOS only).
++if (IOKIT_FRAMEWORK)
++    target_link_libraries(ggml-metal PRIVATE ${IOKIT_FRAMEWORK})
++endif()
++
+ if (GGML_METAL_NDEBUG)
+     add_compile_definitions(GGML_METAL_NDEBUG)
+ endif()
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -9,6 +9,10 @@
+ #include <Foundation/Foundation.h>
+ 
+ #include <Metal/Metal.h>
++
++#if TARGET_OS_OSX
++#include <IOKit/IOKitLib.h>
++#endif
+ 
+ #include <stdatomic.h>
+ 
+@@ -1669,14 +1673,58 @@
+     }
+ 
+     GGML_UNUSED(dev);
++}
++
++// The GPU memory every process on the machine holds, from the accelerator's own statistics
++// (IOAccelerator's PerformanceStatistics, "Alloc system memory"), or 0 when they cannot be read.
++static size_t ggml_metal_device_alloc_all(void) {
++    size_t all = 0;
++#if TARGET_OS_OSX
++    io_service_t accel = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOAccelerator"));
++    if (accel == IO_OBJECT_NULL) {
++        return 0;
++    }
++    CFTypeRef stats = IORegistryEntryCreateCFProperty(accel, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0);
++    if (stats != NULL && CFGetTypeID(stats) == CFDictionaryGetTypeID()) {
++        CFTypeRef v = CFDictionaryGetValue((CFDictionaryRef) stats, CFSTR("Alloc system memory"));
++        int64_t n = 0;
++        if (v != NULL && CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef) v, kCFNumberSInt64Type, &n) && n > 0) {
++            all = (size_t) n;
++        }
++    }
++    if (stats != NULL) {
++        CFRelease(stats);
++    }
++    IOObjectRelease(accel);
++#endif
++    return all;
+ }
+ 
++// GGML_METAL_FREE_DEVICE: report free memory as what the whole GPU has left, not this process's
++// share of it. Metal counts a process's own allocations only, so a process that lends its GPU to
++// another machine (kinfer worker) would offer memory the machine's other apps already hold, and the
++// layers it is given would be paged in and out of the GPU every token.
++static bool ggml_metal_free_device(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * val = getenv("GGML_METAL_FREE_DEVICE");
++        on = val != NULL && val[0] != '\0' && strcmp(val, "0") != 0;
++    }
++    return on;
++}
++
+ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
+     if (@available(macOS 10.12, iOS 16.0, *)) {
+         *total     = dev->mtl_device.recommendedMaxWorkingSetSize;
+         size_t cur = dev->mtl_device.currentAllocatedSize;
+         // it's possible to allocate more than `recommendedMaxWorkingSetSize`
+         *free      = *total > cur ? *total - cur : 0;
++        if (ggml_metal_free_device()) {
++            const size_t all = ggml_metal_device_alloc_all();
++            if (all > 0) {
++                *free = MIN(*free, *total > all ? *total - all : 0);
++            }
++        }
+     } else {
+         *free = 0;
+         *total = 0;

@@ -2,10 +2,13 @@ package llama
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/ebitengine/purego"
@@ -130,8 +133,12 @@ const (
 // llama.cpp waits on it forever; one of another version, and it aborts the
 // whole process.
 func RPCHello(endpoint string, wait time.Duration) error {
-	c, err := net.DialTimeout("tcp", endpoint, min(wait, 3*time.Second))
+	c, err := dialWorker(endpoint, min(wait, 3*time.Second))
 	if err != nil {
+		if errors.Is(err, syscall.EHOSTUNREACH) && runtime.GOOS == "darwin" {
+			return fmt.Errorf("worker %s is not reachable: %w (if other programs here reach it, macOS's Local Network "+
+				"privacy is refusing this one: start kinfer from Terminal or from an ssh session that stays open)", endpoint, err)
+		}
 		return fmt.Errorf("worker %s is not reachable: %w", endpoint, err)
 	}
 	defer c.Close()
@@ -151,6 +158,29 @@ func RPCHello(endpoint string, wait time.Duration) error {
 			endpoint, rsp[8], rsp[9], RPCProtoVersion)
 	}
 	return nil
+}
+
+// dialWorker connects to a worker, and tries again for about two seconds when
+// the connection is refused or reset: a worker turning from its last
+// connection refuses the next for a moment (6 of 300 connections opened over
+// the cable right after the last one closed). A worker that is gone still
+// fails, two seconds later. The patched llama.cpp's own connections do the
+// same.
+//
+// "No route to host" is not tried again: on a Mac that is what its Local
+// Network privacy answers, for good, a process it will not let reach the
+// network the cable is on — one started over ssh by a session that has
+// since ended, for one.
+func dialWorker(endpoint string, timeout time.Duration) (net.Conn, error) {
+	pause := 50 * time.Millisecond
+	for attempt := 0; ; attempt++ {
+		c, err := net.DialTimeout("tcp", endpoint, timeout)
+		if err == nil || attempt == 7 || !(errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET)) {
+			return c, err
+		}
+		time.Sleep(pause)
+		pause = min(2*pause, 400*time.Millisecond)
+	}
 }
 
 // RPCDevices connects to a worker and returns its devices, for a model's

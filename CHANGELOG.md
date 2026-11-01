@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased
+
+### Faster — the MoE cache keeps the GPU waiting less
+
+The MoE cache stops the GPU before every layer whose experts it holds, to read
+which experts the layer selected and upload the ones it lacks. DeepSeek V4.1
+IQ2_XXS alone on the box holds 26 such layers, and Metal's own timestamps put
+a 68 ms token at about 32 ms of computing, 19 of waiting for the SSD and 11 of
+idling around the stops. Patch 0005 shortens the stops:
+
+- Metal marks the end of each graph with an event, and the host watches for
+  it rather than waiting to be woken once Metal has handled the completion:
+  the host now carries on about 40 µs after the GPU's last instruction.
+- The cache reads a layer's selection and writes its slot map in the memory
+  the GPU shares, where each was a copy queued on the GPU, two more command
+  buffers a layer to start and wait for.
+- A miss nobody read ahead comes from the SSD straight into the stage, past
+  the page cache.
+
+V4.1 alone on the box, the same five requests, replies identical: decode from
+14.7 to 16.1 tokens a second as placed by default, a 3,614-token prompt from
+176 to 184 a second. With shorter stops more layers behind the cache pay:
+`-host-experts 32 -moe-cache 47542` decodes at 17.7 and reads the prompt at
+197, and 36 or all 40 layers do as well, with short prompts faster still.
+
+Elsewhere, back to back: Flash-Next alone on the MacBook Pro, 28 layers'
+experts on its SSD, from 27.1 to 30.9 a second, prompts much the same; V4.1
+from the box with the MacBook Pro's GPU taking ten layers, from 18.0 to 21.5,
+most of it the event (without it 18.4, with the old copies 20.2). A model
+split with every expert on a GPU is unchanged: Flash-Next from the MacBook Pro
+borrowing the box, 43.4 and 44.3. Placement still sizes the cache at a third
+of the experts in host memory: on the MacBook Pro 32 layers instead of 28
+gain 5% and 36 lose 8%, while V4.1 on the box gains 10% from 32 to 40.
+
+Tried and left out: queueing the next layer's graph before the stop, held on
+the GPU at an event until the slot map is written (the GPU took about as long
+to resume from the event as to start a new command buffer: 1.5%, within the
+noise), and keeping the GPU warm through the stops (2%, and the MacBook Pro
+once lost most of its speed to it).
+
+### Fixed — a worker offered GPU memory its machine's apps held
+
+Metal reports a process's own allocations only, so a worker offered the whole
+GPU budget and placement filled it: DeepSeek V4.1 IQ2_XXS served from the box,
+12 layers on the MacBook Pro's 40 GiB, while its own apps held 6.5 GB more. Its
+GPU paged those layers in and out every token: 2.3 tokens a second. A worker
+now reports what the whole GPU has left (patch 0004, `GGML_METAL_FREE_DEVICE`,
+read from IOKit): 33.9 of 40 GiB there, 10 layers, and 17.4-18.4 tokens a
+second, against 13.3-16.2 for the box alone; a 3,614-token prompt at 229 a
+second, against 176. The same reading keeps a laptop borrowing the box from
+being given the memory a model loaded by the box's own service holds.
+
+### Fixed — a worker turning around no longer aborts a load
+
+ggml-rpc connects afresh whenever nothing holds its last connection, several
+times a load, and aborted the process on any refusal. A worker serves one
+connection at a time and resets one opened right after the last closed (6 of
+300 over the cable). Refused and reset connections are tried again for two
+seconds (patch 0003, and kinfer's own hello), and a connection that fails for
+good says why in the log. A "no route to host" on a Mac now says it may be
+Local Network privacy: on the box, a managed Mac, a kinfer started over ssh
+lost the network the cable is on once that ssh session ended, while programs
+in a live session still reached the worker.
+
+The patched libraries are `darwin_arm64_b11998k5`.
+
 ## v0.1.4 — 2026-10-31
 
 ### Fixed — the REPL edits Chinese, and survives Ctrl-C

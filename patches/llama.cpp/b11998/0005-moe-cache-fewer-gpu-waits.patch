@@ -1,0 +1,313 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 4bf19c8..1ceab38 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -22,6 +22,7 @@
+ 
+ struct ggml_metal_command_buffer {
+     id<MTLCommandBuffer> obj;
++    uint64_t done; // the value it signals ev_done with as it finishes, 0 for none
+ };
+ 
+ struct ggml_metal {
+@@ -75,6 +76,15 @@ struct ggml_metal {
+     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
+     id<MTLCommandBuffer> cmd_buf_last;
+ 
++    // a graph's command buffers signal ev_done as they finish, each with a value one higher than the last, and
++    // synchronize watches for done_last, what cmd_buf_last signals, 0 if it signals nothing: the GPU writes the value as
++    // it gets there and the thread sees it within about 40 us, where waiting for the command buffer wakes it only once
++    // Metal has handled the completion. An MoE cache synchronizes before every layer whose experts it holds, and the
++    // GPU idles meanwhile
++    id<MTLSharedEvent> ev_done;
++    uint64_t           done_next;
++    uint64_t           done_last;
++
+     // abort ggml_metal_graph_compute if callback returns true
+     ggml_abort_callback abort_callback;
+     void *              abort_callback_data;
+@@ -186,6 +196,10 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+ 
+         res->cmd_buf_last = nil;
+ 
++        res->ev_done   = [device newSharedEvent];
++        res->done_next = 1;
++        res->done_last = 0;
++
+         res->pipelines_ext = ggml_metal_pipelines_init();
+ 
+         return res;
+@@ -244,6 +258,8 @@ void ggml_metal_free(ggml_metal_t ctx) {
+     ggml_metal_device_event_free(ctx->dev, ctx->ev_cpy);
+     ggml_metal_device_event_free(ctx->dev, ctx->ev_sync);
+ 
++    [ctx->ev_done release];
++
+     free(ctx);
+ }
+ 
+@@ -253,9 +269,22 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
+ 
+ void ggml_metal_synchronize(ggml_metal_t ctx) {
+     // wait for any backend operations to finish
++    bool signaled = false;
+     if (ctx->cmd_buf_last) {
+-        [ctx->cmd_buf_last waitUntilCompleted];
++        if (ctx->done_last > 0 && ctx->cmd_bufs_ext.count == 0) {
++            // watch for the value for up to 10 ms, the most a layer of generation takes, then wait to be woken
++            const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++            while (!(signaled = ctx->ev_done.signaledValue >= ctx->done_last)) {
++                if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0 > 10000000) {
++                    break;
++                }
++            }
++        }
++        if (!signaled) {
++            [ctx->cmd_buf_last waitUntilCompleted];
++        }
+         ctx->cmd_buf_last = nil;
++        ctx->done_last    = 0;
+     }
+ 
+     // check status of all command buffers
+@@ -269,7 +298,9 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
+             }
+ 
+             MTLCommandBufferStatus status = [cmd_buf status];
+-            if (status != MTLCommandBufferStatusCompleted) {
++            // a command buffer whose value has been signaled ran to the end, though Metal may not have marked it yet
++            const bool ran = ctx->cmd_bufs[cb_idx].done > 0 && ctx->ev_done.signaledValue >= ctx->cmd_bufs[cb_idx].done;
++            if (status != MTLCommandBufferStatusCompleted && !(ran && status != MTLCommandBufferStatusError)) {
+                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
+                 if (status == MTLCommandBufferStatusError) {
+                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+@@ -364,6 +395,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
+         // instead, remember a reference to the command buffer and wait for it later if needed
+         [ctx->cmd_bufs_ext addObject:cmd_buf];
+         ctx->cmd_buf_last = cmd_buf;
++        ctx->done_last    = 0;
+ 
+         [cmd_buf retain];
+     }
+@@ -410,6 +442,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+         // instead, remember a reference to the command buffer and wait for it later if needed
+         [ctx->cmd_bufs_ext addObject:cmd_buf];
+         ctx->cmd_buf_last = cmd_buf;
++        ctx->done_last    = 0;
+ 
+         [cmd_buf retain];
+     }
+@@ -433,6 +466,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
+ 
+         [ctx_dst->cmd_bufs_ext addObject:sync_cmd_buf];
+         ctx_dst->cmd_buf_last = sync_cmd_buf;
++        ctx_dst->done_last    = 0;
+ 
+         [sync_cmd_buf retain];
+ 
+@@ -462,6 +496,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
+         // instead, remember a reference to the command buffer and wait for it later if needed
+         [ctx_src->cmd_bufs_ext addObject:cmd_buf];
+         ctx_src->cmd_buf_last = cmd_buf;
++        ctx_src->done_last    = 0;
+ 
+         [cmd_buf retain];
+ 
+@@ -525,6 +560,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+             if (ctx->cmd_buf_last) {
+                 [ctx->cmd_buf_last waitUntilCompleted];
+                 ctx->cmd_buf_last = nil;
++                ctx->done_last    = 0;
+             }
+ 
+             if (!ctx->capture_started) {
+@@ -569,7 +605,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+             if (ctx->cmd_bufs[n_cb].obj) {
+                 [ctx->cmd_bufs[n_cb].obj release];
+             }
+-            ctx->cmd_bufs[n_cb].obj = cmd_buf;
++            ctx->cmd_bufs[n_cb].obj  = cmd_buf;
++            ctx->cmd_bufs[n_cb].done = ctx->done_next++;
+ 
+             [cmd_buf enqueue];
+ 
+@@ -578,6 +615,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+ 
+         // remember the command buffer for the next iteration
+         ctx->cmd_buf_last = ctx->cmd_bufs[n_cb].obj;
++        ctx->done_last    = ctx->cmd_bufs[n_cb].done;
+ 
+         // prepare the rest of the command buffers asynchronously (optional)
+         // cmd_buf[0.. n_cb)
+@@ -588,7 +626,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+             if (ctx->cmd_bufs[cb_idx].obj) {
+                 [ctx->cmd_bufs[cb_idx].obj release];
+             }
+-            ctx->cmd_bufs[cb_idx].obj = cmd_buf;
++            ctx->cmd_bufs[cb_idx].obj  = cmd_buf;
++            ctx->cmd_bufs[cb_idx].done = 0;
+ 
+             // always enqueue the first two command buffers
+             // enqueue all of the command buffers if we don't need to abort
+@@ -597,7 +636,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+ 
+                 // update the pointer to the last queued command buffer
+                 // this is needed to implement synchronize()
++                ctx->cmd_bufs[cb_idx].done = ctx->done_next++;
+                 ctx->cmd_buf_last = cmd_buf;
++                ctx->done_last    = ctx->cmd_bufs[cb_idx].done;
+             }
+         }
+ 
+@@ -699,6 +740,7 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
+ 
+         [ctx->cmd_bufs_ext addObject:cmd_buf];
+         ctx->cmd_buf_last = cmd_buf;
++        ctx->done_last    = 0;
+ 
+         [cmd_buf retain];
+     }
+@@ -715,6 +757,7 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+ 
+         [ctx->cmd_bufs_ext addObject:cmd_buf];
+         ctx->cmd_buf_last = cmd_buf;
++        ctx->done_last    = 0;
+ 
+         [cmd_buf retain];
+     }
+@@ -785,6 +828,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+         ggml_metal_op_free(ctx_op);
+ 
+         if (cb_idx < 2 || ctx->abort_callback == NULL) {
++            if (ctx->cmd_bufs[cb_idx].done > 0) {
++                [cmd_buf encodeSignalEvent:ctx->ev_done value:ctx->cmd_bufs[cb_idx].done];
++            }
+             [cmd_buf commit];
+         }
+     });
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6ea5f1d..56c0b2d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2841,9 +2841,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     const bool stream = lctx->moe_stream && !llama_backend_is_rpc(backend);
+ 
+     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
++        // as in the MoE cache: wait for the split that computes them, then read them, a copy from memory where the GPU
++        // shares it with the host
+         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+-        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+         ggml_backend_synchronize(backend);
++        ggml_backend_tensor_get(ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+ 
+         st.used.assign(n_expert, false);
+         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 733ea69..e7a3a51 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -298,8 +298,14 @@ struct moe_cache_reader {
+ 
+     // read with every thread, past the page cache if nocache, and wait for the reads
+     void read_now(const std::vector<read> & reads, bool nocache) {
++        read_now(nocache ? std::vector<read>() : reads, nocache ? reads : std::vector<read>());
++    }
++
++    // read cached through the page cache and direct past it, with every thread, and wait for both
++    void read_now(const std::vector<read> & cached, const std::vector<read> & direct) {
+         std::vector<job> js;
+-        split(reads, true, nocache, js);
++        split(cached, true, false, js);
++        split(direct, true, true,  js);
+         if (js.empty()) {
+             return;
+         }
+@@ -722,9 +728,12 @@ struct llama_moe_cache::impl {
+         int32_t slot;
+         size_t  n;
+         size_t  at;     // in stage
++        bool    ahead;  // read ahead into the page cache, so read from there
+     };
+     std::vector<upload> uploads;
+     std::vector<moe_cache_reader::read> reads;
++    std::vector<moe_cache_reader::read> reads_direct;
++    std::vector<uint8_t> fill_ahead; // [fills] whether the expert was read ahead
+     std::vector<uint8_t> stage;
+ 
+     moe_cache_reader reader; // last, so its threads stop before what they use goes away
+@@ -1120,9 +1129,11 @@ struct llama_moe_cache::impl {
+         }
+         GGML_ASSERT(ggml_is_contiguous(sel));
+ 
+-        ids.resize(ggml_nelements(sel));
+-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        // wait for the split that selects them, then read them: from a buffer the GPU shares with the host this is a
++        // copy from memory, where an asynchronous read would queue a copy on the GPU behind the split and wait for it too
+         ggml_backend_synchronize(backend);
++        ids.resize(ggml_nelements(sel));
++        ggml_backend_tensor_get(sel, ids.data(), 0, ggml_nbytes(sel));
+ 
+         size_t n_hit = 0;
+         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+@@ -1132,12 +1143,14 @@ struct llama_moe_cache::impl {
+         for (int32_t id : ids) {
+             counts[(size_t) il*n_expert_model + id] += 1.0f;
+         }
++        fill_ahead.assign(fills.size(), 0);
+         {
+             std::lock_guard<std::mutex> lock(ahead_mutex);
+             std::vector<uint8_t> & ahead = ahead_set[il];
+             if (!ahead.empty()) {
+-                for (const auto & f : fills) {
+-                    st_read.misses_ahead += ahead[f.expert];
++                for (size_t i = 0; i < fills.size(); ++i) {
++                    fill_ahead[i] = ahead[fills[i].expert];
++                    st_read.misses_ahead += fill_ahead[i];
+                 }
+                 std::fill(ahead.begin(), ahead.end(), 0);
+             }
+@@ -1149,10 +1162,11 @@ struct llama_moe_cache::impl {
+         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+             for (size_t i = 0; i < fills.size();) {
+                 size_t n = 1;
+-                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
++                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n &&
++                        fill_ahead[i + n] == fill_ahead[i]) {
+                     n++;
+                 }
+-                uploads.push_back({ ip, fills[i].expert, fills[i].slot, n, 0 });
++                uploads.push_back({ ip, fills[i].expert, fills[i].slot, n, 0, fill_ahead[i] != 0 });
+                 i += n;
+             }
+         }
+@@ -1168,13 +1182,16 @@ struct llama_moe_cache::impl {
+             }
+             uint8_t * base = moe_cache_stage(stage, used);
+             reads.clear();
++            reads_direct.clear();
+             for (size_t k = u0; k < u1; ++k) {
+                 const upload & u = uploads[k];
+                 const ggml_tensor * w = l.experts[u.ip];
+-                reads.push_back({ (const uint8_t *) w->data + u.expert*w->nb[2], u.n*w->nb[2], base + u.at });
++                // an expert read ahead is in the page cache, or on its way there; the others come straight from the SSD
++                // into the stage, which is laid out for that, without a copy through the page cache or room taken in it
++                (u.ahead ? reads : reads_direct).push_back({ (const uint8_t *) w->data + u.expert*w->nb[2], u.n*w->nb[2], base + u.at });
+             }
+             const auto t_read = std::chrono::steady_clock::now();
+-            reader.read_now(reads, false);
++            reader.read_now(reads, reads_direct);
+             st_read.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_read).count();
+             for (size_t k = u0; k < u1; ++k) {
+                 const upload & u = uploads[k];
+@@ -1191,8 +1208,9 @@ struct llama_moe_cache::impl {
+         st.misses += fills.size();
+         st.bytes  += bytes;
+ 
+-        // the next copy synchronizes the backend before it changes the slot map again
+-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++        // the backend is idle until the split this map is an input of: write it now, again a copy from memory where the
++        // GPU shares it, instead of a copy queued on the GPU ahead of the split
++        ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+ 
+         read_ahead(il, sel);
+ 

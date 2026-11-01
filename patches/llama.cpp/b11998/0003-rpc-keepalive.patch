@@ -1,8 +1,23 @@
 diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
-index d5670f3..985ebe6 100644
+index d5670f3..a15d797 100644
 --- a/ggml/src/ggml-rpc/transport.cpp
 +++ b/ggml/src/ggml-rpc/transport.cpp
-@@ -707,6 +707,26 @@ static bool set_no_delay(sockfd_t sockfd) {
+@@ -17,10 +17,14 @@
+ #  include <netdb.h>
+ #  include <unistd.h>
+ #endif
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+ #include <optional>
++#include <thread>
+ 
+ #ifdef GGML_RPC_RDMA
+ #  include <infiniband/verbs.h>
+@@ -707,6 +711,26 @@ static bool set_no_delay(sockfd_t sockfd) {
      return ret == 0;
  }
  
@@ -29,7 +44,7 @@ index d5670f3..985ebe6 100644
  static bool set_reuse_addr(sockfd_t sockfd) {
      int flag = 1;
      int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(int));
-@@ -722,6 +742,7 @@ socket_ptr socket_t::accept() {
+@@ -722,6 +746,7 @@ socket_ptr socket_t::accept() {
          LOG_ERROR("Failed to set TCP_NODELAY\n");
          return nullptr;
      }
@@ -37,11 +52,79 @@ index d5670f3..985ebe6 100644
      LOG_DBG("[%s] accepted client connection\n", __func__);
      return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
  }
-@@ -763,6 +784,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
-         LOG_ERROR("Failed to set TCP_NODELAY\n");
-         return nullptr;
-     }
-+    set_keep_alive(sockfd);
+@@ -754,15 +779,29 @@ socket_ptr socket_t::create_server(const char * host, int port) {
+     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+ }
+ 
++static void close_fd(sockfd_t sockfd) {
++#ifdef _WIN32
++    closesocket(sockfd);
++#else
++    close(sockfd);
++#endif
++}
++
++// A server serves one client at a time, and the client connects afresh whenever nothing holds its last
++// connection, several times while a model loads. Between two of them the server can refuse or reset the next
++// for a moment while it turns from the last: over a Thunderbolt cable, 6 of 300 connections opened right after
++// the last one closed were reset. A refused or reset connection is tried again for about two seconds; a server
++// that is gone still fails, and one turning around does not abort the load.
++static bool connect_failed_for_now() {
++#ifdef _WIN32
++    const int err = WSAGetLastError();
++    return err == WSAECONNREFUSED || err == WSAECONNRESET;
++#else
++    return errno == ECONNREFUSED || errno == ECONNRESET;
++#endif
++}
++
+ socket_ptr socket_t::connect(const char * host, int port) {
+-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
+-    if (!is_valid_fd(sockfd)) {
+-        return nullptr;
+-    }
+-    if (!set_no_delay(sockfd)) {
+-        LOG_ERROR("Failed to set TCP_NODELAY\n");
+-        return nullptr;
+-    }
      struct sockaddr_in addr;
      addr.sin_family = AF_INET;
      addr.sin_port = htons(port);
+@@ -772,11 +811,33 @@ socket_ptr socket_t::connect(const char * host, int port) {
+         return nullptr;
+     }
+     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
+-    if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+-        return nullptr;
++    for (int attempt = 0;; attempt++) {
++        auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
++        if (!is_valid_fd(sockfd)) {
++            LOG_ERROR("Cannot open a socket to %s:%d: %s\n", host, port, strerror(errno));
++            return nullptr;
++        }
++        if (!set_no_delay(sockfd)) {
++            LOG_ERROR("Failed to set TCP_NODELAY\n");
++            close_fd(sockfd);
++            return nullptr;
++        }
++        set_keep_alive(sockfd);
++        if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
++            LOG_DBG("[%s] connected to %s:%d\n", __func__, host, port);
++            return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
++        }
++        const bool again = attempt < 7 && connect_failed_for_now();
++        if (!again) {
++            LOG_ERROR("Cannot connect to %s:%d after %d tries: %s\n", host, port, attempt + 1, strerror(errno));
++        }
++        close_fd(sockfd);
++        if (!again) {
++            return nullptr;
++        }
++        // 50, 100, 200, then 400 ms: 1.95 s in all
++        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(50 << attempt, 400)));
+     }
+-    LOG_DBG("[%s] connected to %s:%d\n", __func__, host, port);
+-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+ }
+ 
+ #ifdef _WIN32

@@ -208,7 +208,7 @@ release — after diffing its `llama.h`; see `internal/nativelib/libs/README.md`
 
 `scripts/build-libs.sh` instead builds b11998 from source with kinfer's patch
 (`patches/llama.cpp/b11998/`; about two minutes, cmake and Xcode's command line
-tools) into `darwin_arm64_b11998k4/`, replacing the release set. It matters
+tools) into `darwin_arm64_b11998k5/`, replacing the release set. It matters
 for a model whose experts or tables come from the SSD — see
 [When the experts do not fit in memory either](docs/big-models.md#when-the-experts-do-not-fit-in-memory-either);
 with the release set `-host-experts` and `-moe-cache` work as before and there is

@@ -67,6 +67,13 @@ func cmdWorker(args []string) error {
 		}
 	}
 
+	// The other machine places layers here by the free memory this worker
+	// reports, and Metal counts only this process's allocations: the GPU
+	// memory this machine's own apps hold would be offered too, and the
+	// layers paged in and out of the GPU every token (V4.1 from the box,
+	// 12 layers on the MacBook Pro: 2.3 tokens a second). The patched
+	// llama.cpp reports what the whole GPU has left instead.
+	os.Setenv("GGML_METAL_FREE_DEVICE", "1")
 	dir, err := nativelib.Prepare()
 	if err != nil {
 		return err

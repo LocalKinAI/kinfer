@@ -12,11 +12,20 @@
 # fault at a time — the MoE cache's misses, the experts a prompt's large
 # batches upload, which are read ahead while the GPU computes, and the rows of
 # a per-layer embedding table — and a profile of the experts generation used
-# fills a fresh cache. For a model split across machines, Metal can keep the
-# GPU's clock up between graphs, while it waits for the other machine's layers
+# fills a fresh cache. The cache waits on the GPU before every layer it holds,
+# and waits less: Metal marks the end of each graph with an event the host
+# watches for instead of waiting to be woken, the experts a layer selects and
+# its slot map are copied in memory the GPU shares rather than by the GPU, and
+# a miss nobody read ahead comes from the SSD past the page cache. For a model
+# split across machines, Metal can keep the GPU's clock up between graphs,
+# while it waits for the other machine's layers
 # (ggml_backend_metal_set_warm), and RPC connections probe a silent peer, so a
-# worker is not held for two hours by a machine that went away. The libraries
-# land in internal/nativelib/libs/darwin_arm64_${VERSION}k4, which replaces the release
+# worker is not held for two hours by a machine that went away, and try again
+# for two seconds when a worker turning from its last connection refuses the
+# next, rather than abort the load; and a worker can report the free memory of
+# the whole GPU, not just its own share (GGML_METAL_FREE_DEVICE), so it is not
+# given the memory its machine's other apps hold. The libraries land in
+# internal/nativelib/libs/darwin_arm64_${VERSION}k5, which replaces the release
 # set the way one release replaces another (see fetch-libs.sh).
 #
 # Needs cmake, ninja and Xcode's command line tools; about two minutes on an M4.
@@ -25,12 +34,12 @@
 set -euo pipefail
 
 VERSION=b11998 # the release the patches are made against
-LEVEL=k4       # bumped when the patches change, so a cached copy is not reused
+LEVEL=k5       # bumped when the patches change, so a cached copy is not reused
 SRC=""
 for arg in "$@"; do
   case "$arg" in
   -h | --help)
-    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *) SRC=$arg ;;
