@@ -86,7 +86,7 @@ conversation still carries an agent's turns forward:
 
 ```
 sizing: 1 slots + 1 prefix x 32768 tokens measured 2.6 GiB, leaving 1.7 GiB — the prefix pool shares the slots' cells instead, keeping 32768 tokens each
-memory: MTL0   model 73.4 GiB + context 1.7 GiB -> 2.6 GiB free of 77.8 GiB (this process only)
+memory: MTL0   model 73.4 GiB + context 1.7 GiB -> 2.6 GiB free of 77.8 GiB (the whole GPU)
         context is 32768 tokens: -ctx 32768 per conversation x 1 slots, with 1 prefix entries in whatever the slots leave free
 ```
 
@@ -189,9 +189,9 @@ is rebuilt as the most slots that still hold it:
 
 ```
 slots: 65536 tokens of context as 4 x 16384; a prompt that needs a longer slot gets 3 x 21760, 2 x 32768, 1 x 65536 while it runs — the rest wait, and 4 x 16384 comes back when nothing needs the longer slots. -flex=false keeps 4 x 16384.
-slots: 4 x 16384 -> 1 x 65536 for a 44555-token prompt (it queued 10.9s; the cache was rebuilt in 224ms, leaving 10.1 GiB free (this process only))
-slots: 1 x 65536 -> 4 x 16384 — nothing running needs the longer slots (it queued 1m56.3s; the cache was rebuilt in 223ms, leaving 9.8 GiB free (this process only))
-slots: 4 x 16384 -> 2 x 32768 for a 27174-token prompt (it queued 2m4s; the cache was rebuilt in 246ms, leaving 10.0 GiB free (this process only))
+slots: 4 x 16384 -> 1 x 65536 for a 44555-token prompt (it queued 10.9s; the cache was rebuilt in 224ms, leaving 10.1 GiB free (the whole GPU))
+slots: 1 x 65536 -> 4 x 16384 — nothing running needs the longer slots (it queued 1m56.3s; the cache was rebuilt in 223ms, leaving 9.8 GiB free (the whole GPU))
+slots: 4 x 16384 -> 2 x 32768 for a 27174-token prompt (it queued 2m4s; the cache was rebuilt in 246ms, leaving 10.0 GiB free (the whole GPU))
 ```
 
 The weights stay where they are; only the cache is reallocated, in about a quarter
@@ -345,11 +345,28 @@ a slot for over 400 seconds — eight of those is the whole server. A reply cut 
 `done_reason: "timeout"`, because `"stop"` would claim the model finished and
 `"length"` would claim it hit the budget it was given.
 
-**A queued request survives a backend failure.** llama.cpp reports a fatal
-decode for the whole context, so kinfer retires the model — and used to fail
-every request it held. Measured: 32 concurrent requests against a dying backend,
-0 answered before, 28 after. The four that had already streamed text are still
-failed, because re-running them would repeat it.
+**A request survives a backend failure.** llama.cpp reports a fatal decode for
+the whole context, so kinfer retires the model — and used to fail every request
+it held. Measured: 32 concurrent requests against a dying backend, 0 answered
+before, 28 after. Those 28 were still queued and simply run on the replacement.
+The four that had already streamed text now go on too: the replacement prefills
+the reply so far after the prompt and continues from its end, so nothing is sent
+twice and the client sees a pause. Flash-Next on the MacBook Pro, with a failure
+injected 40 tokens into its thinking: the same thinking and answer, word for
+word, 15 seconds later. A request reloads at most twice.
+
+On a Mac the usual failure is the GPU running out of memory under the model,
+because an app took some after the load. Free GPU memory is what the whole GPU
+has left — other processes' allocations taken off, read by kinfer's build of
+llama.cpp (patch 0004, `GGML_METAL_FREE_DEVICE`, which `=0` turns off) — so a
+replacement is placed to fit what is free when it loads, and so is a model in
+the first place. Metal alone reports only what this process has left of its
+budget: on the MacBook Pro, with 8 GiB held by a browser, Teams and the rest,
+Flash-Next was placed into 37.7 of the GPU's 40 GiB and its first reply failed
+with `Insufficient Memory` every time. Placed against the 32 GiB actually free —
+40 layers' experts on the SSD and a 12.9 GiB cache — it decoded a 384-token
+reply at 29.9 tokens a second; placed into all 40 GiB, on a day that happened
+to work, it did 30.9.
 
 ## Seeing what it is doing
 

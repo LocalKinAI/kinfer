@@ -164,6 +164,12 @@ type GenParams struct {
 	// "low", "high", "max", or a number from 1 to 100. Empty is the model's
 	// default. Templates without such a budget ignore it.
 	Effort string
+
+	// Resume is the start of the reply, which the caller already has: the
+	// model goes on from its end, and only what follows is sent. The server
+	// sets it to carry a reply over to a reloaded model when the backend went
+	// down in the middle of it (ErrInterrupted).
+	Resume string
 }
 
 // thinking is the reasoning a job asked for, in the form templates take.

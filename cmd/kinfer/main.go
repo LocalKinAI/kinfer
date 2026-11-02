@@ -61,6 +61,19 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Free GPU memory means what the whole GPU has left. Metal counts a
+	// process's own allocations only, so a worker offered memory its
+	// machine's apps held (V4.1 from the box, 12 layers on the MacBook Pro
+	// paged every token: 2.3 tokens a second), and serve placed a model as if
+	// they held none: Flash-Next on the MacBook Pro took 37.7 of the GPU's
+	// 40 GiB beside 8 GiB of a browser, Teams and the rest, and its first
+	// reply failed with Insufficient Memory. The patched llama.cpp reads the
+	// GPU's own count instead (patch 0004); GGML_METAL_FREE_DEVICE=0 turns it
+	// off.
+	if os.Getenv("GGML_METAL_FREE_DEVICE") == "" {
+		os.Setenv("GGML_METAL_FREE_DEVICE", "1")
+	}
+
 	var err error
 	switch os.Args[1] {
 	case "version", "-version", "--version":

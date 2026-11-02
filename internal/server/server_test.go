@@ -790,7 +790,8 @@ func TestQueuedRequestSurvivesAFatalBackendFailure(t *testing.T) {
 	}
 }
 
-// A request that had already started must NOT be retried: its client has seen
+// A request that failed in flight for any reason but its engine going down —
+// here the engine closing under it — must NOT be retried: its client has seen
 // part of the answer, and running it again would repeat that text.
 func TestInFlightRequestIsNotRetried(t *testing.T) {
 	srv, reg := newTestServer(t, "alpha")
@@ -817,7 +818,7 @@ func TestInFlightRequestIsNotRetried(t *testing.T) {
 
 // The retry must not loop: a replacement that is itself down has to surface,
 // not spin.
-func TestRetryHappensOnceOnly(t *testing.T) {
+func TestRetryIsBounded(t *testing.T) {
 	srv, reg := newTestServer(t, "alpha")
 
 	var opened int
@@ -832,11 +833,68 @@ func TestRetryHappensOnceOnly(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(body)))
 
-	if opened > 2 {
+	if opened > 1+maxReloads {
 		t.Errorf("opened %d engines — the retry is looping", opened)
 	}
 	if w.Code == http.StatusOK {
 		t.Error("a request that never ran twice reported success")
+	}
+}
+
+// A reply the backend died in the middle of goes on, on a replacement, from
+// where it stopped: the client gets one reply, with nothing repeated.
+//
+// This is what a GPU out of memory under the model does on a Mac when another
+// app takes some after the load. Before, the reply failed with "llama.cpp
+// backend failed (code -3)", and with the replacement placed the same way the
+// next one could fail again.
+func TestInterruptedReplyGoesOn(t *testing.T) {
+	srv, reg := newTestServer(t, "alpha")
+
+	var engines []*fakeEngine
+	srv.open = func(path string, _ engine.Options) (generator, error) {
+		cut := fmt.Errorf("%w: %w", engine.ErrInterrupted, errors.New("llama.cpp backend failed (code -3)"))
+		f := &fakeEngine{path: path, frags: []string{"half", " of it"}, err: cut, broken: true}
+		switch len(engines) {
+		case 1:
+			f.frags = []string{", then"} // dies again: the memory was taken again in between
+		case 2:
+			f.frags, f.err, f.broken = []string{" the rest"}, nil, false
+		}
+		engines = append(engines, f)
+		reg.put(f)
+		return f, nil
+	}
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false,"options":{"num_predict":10}}`
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(body)))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 — a reply cut short by the backend was failed instead of carried on:\n%s",
+			w.Code, w.Body.String())
+	}
+	var got ollamaChatResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if got.Message.Content != "half of it, then the rest" {
+		t.Errorf("content = %q, want each part once, in order", got.Message.Content)
+	}
+	if len(engines) != 3 {
+		t.Fatalf("opened %d engines, want 3 — the first, and a replacement for each failure", len(engines))
+	}
+	for i, want := range []string{"", "half of it", "half of it, then"} {
+		if p := engines[i].params; p.Resume != want {
+			t.Errorf("engine %d was asked to resume from %q, want %q", i+1, p.Resume, want)
+		}
+	}
+	// Each fragment is a token to the fake: two, then one, were spent already.
+	if p := engines[2].params; p.MaxTokens != 7 {
+		t.Errorf("the last replacement may write %d tokens, want the 7 of 10 left", p.MaxTokens)
+	}
+	if got.EvalCount != 4 {
+		t.Errorf("eval_count = %d, want the 4 tokens all three wrote", got.EvalCount)
 	}
 }
 

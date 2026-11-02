@@ -12,13 +12,16 @@ import (
 // One thing to know before reading any number here: ggml-metal computes free as
 // recommendedMaxWorkingSetSize minus currentAllocatedSize, and
 // currentAllocatedSize is a property of this process's MTLDevice. So the
-// headroom below is what THIS process has left of its budget, not what the
-// machine has left. Verified: with a 73.4 GiB model resident in another kinfer,
+// headroom below was what THIS process had left of its budget, not what the
+// machine had left. Verified: with a 73.4 GiB model resident in another kinfer,
 // a second one loading a 0.5B still reported 76.9 GiB of 77.8 GiB free.
 //
-// That is the uncomfortable part. Every out-of-memory failure observed on this
-// machine happened while another process held GPU memory, and this reading is
-// blind to exactly that.
+// That was the uncomfortable part. Every out-of-memory failure observed on this
+// machine happened while another process held GPU memory, and that reading is
+// blind to exactly that. kinfer's build of llama.cpp can also read the GPU's
+// own count of what every process holds (patch 0004), and kinfer turns it on
+// (GGML_METAL_FREE_DEVICE, see cmd/kinfer): free is then what the whole GPU
+// has left. What follows is why it had to be.
 //
 // The failure this exists to prevent: kinfer accepts `-ctx 16384 -slots 4`,
 // spends 34 seconds loading 73.5 GiB, answers a few requests, and then dies
@@ -64,12 +67,20 @@ import (
 // second big model reproduces it instantly; and why the original outage looked
 // intermittent — it sat within a gigabyte of the line.
 //
-// Two consequences for this file. The figure it prints is exact for this
-// process and says nothing about the machine, which is why it is labelled that
-// way. And the line below is not a prediction that this configuration will
-// fail: it is the point at which there is no longer room for company, which on
-// a shared machine is the thing that decides it.
+// Two consequences for this file. The figure it prints says which of the two
+// readings it is (freeScope). And the line below is not a prediction that this
+// configuration will fail: it is the point at which there is no longer room for
+// company — even with the whole GPU's reading, whatever starts after it — which
+// on a shared machine is the thing that decides it.
 const thinHeadroom = 2 << 30 // 2 GiB
+
+// freeScope is what a free figure counts, for the lines that print one.
+func freeScope() string {
+	if llama.FreeSeesOthers() {
+		return "the whole GPU"
+	}
+	return "this process only"
+}
 
 // ThinHeadroom is the same number, for tools that plan a configuration the
 // server will then judge. They must use one number or fit will recommend
@@ -130,25 +141,30 @@ func (b *budget) report(slots, prefix, perSeq int, shared bool) {
 	if shared {
 		layout = fmt.Sprintf("x %d slots, with %d prefix entries in whatever the slots leave free", slots, prefix)
 	}
-	log.Printf("memory: %s   model %s + context %s -> %s free of %s (this process only)\n"+
+	log.Printf("memory: %s   model %s + context %s -> %s free of %s (%s)\n"+
 		"          context is %d tokens: -ctx %d per conversation %s",
-		b.dev.Name, gib(model), gib(ctx), gib(free), gib(total),
+		b.dev.Name, gib(model), gib(ctx), gib(free), gib(total), freeScope(),
 		perSeq*cells, perSeq, layout)
 
 	if total == 0 || free >= thinHeadroom {
 		return
 	}
 
+	unseen := "This figure is this process's own budget and cannot see other\n" +
+		"          processes — anything else using the GPU eats into it unseen."
+	if llama.FreeSeesOthers() {
+		unseen = "Whatever starts using the GPU from now on takes from it."
+	}
 	log.Printf("memory: only %s of %s is left after loading.\n"+
-		"          This figure is this process's own budget and cannot see other\n"+
-		"          processes — anything else using the GPU eats into it unseen.\n"+
+		"          %s\n"+
 		"          A batch that then cannot allocate is not recoverable in place: the\n"+
 		"          Metal backend latches the error, llama.cpp reports it fatally, and\n"+
-		"          kinfer retires the model, ending every in-flight and queued request\n"+
-		"          at once. Configurations this tight have run for hours and have also\n"+
-		"          died, so leave room for whatever else runs here.\n"+
+		"          kinfer reloads the model to fit what is free by then; the replies\n"+
+		"          it was writing wait for that and go on where they stopped.\n"+
+		"          Configurations this tight have run for hours and have also died,\n"+
+		"          so leave room for whatever else runs here.\n"+
 		"          -ctx %d -slots %d, or -ctx %d -slots %d, would leave more.",
-		gib(free), gib(total),
+		gib(free), gib(total), unseen,
 		suggestCtx(b, cells, 0, perSeq), slots,
 		perSeq, max(1, slots/2))
 }

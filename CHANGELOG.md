@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — a model was placed as if the GPU were its own
+
+Metal reports only what this process has left of the GPU's budget, so kinfer
+placed and sized a model as if the apps around it held nothing. On the MacBook
+Pro (40 GiB for the GPU), with 8 GiB held by a browser, Teams and the rest,
+Flash-Next was placed into 37.7 GiB and its first reply failed with
+`Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory)` — on every
+try, since the reload was placed the same way.
+
+Free GPU memory is now what the whole GPU has left, for every command: the
+reading v0.1.5 gave `kinfer worker` (patch 0004), which counts every process's
+allocations. The same laptop with the same apps places Flash-Next into the
+32 GiB actually free, 40 of its 48 layers' experts on the SSD and a 12.9 GiB
+cache, and decodes a 384-token reply at 29.9 tokens a second (30.9 placed into
+all 40 GiB, the day that worked). `GGML_METAL_FREE_DEVICE=0` goes back to the
+old reading. The memory line says which it is: `(the whole GPU)`.
+
+### Fixed — a reply the backend failed under goes on
+
+When an app takes GPU memory after the load anyway, the GPU fails under the
+model and llama.cpp gives up the whole context. Queued requests were already run
+again on a reloaded model; the ones mid-reply were failed, because running them
+again would repeat what the client had. Now the reload is placed to fit what is
+free by then, and each reply goes on from where it stopped: the replacement
+prefills the reply so far after the prompt and sends only what follows. A
+request reloads at most twice.
+
+Flash-Next on the MacBook Pro with a failure injected 40 tokens into its
+thinking: the same thinking and answer, word for word, after a 15-second pause.
+
 ## v0.1.5 — 2026-11-01
 
 ### Faster — the MoE cache keeps the GPU waiting less

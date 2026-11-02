@@ -192,6 +192,10 @@ type job struct {
 	full []llama.Token
 	want int
 
+	// resume is the reply the job carries over (GenParams.Resume), tokenized
+	// to follow the prompt.
+	resume []llama.Token
+
 	// frags carries generated text; it is closed when the reply ends. err holds
 	// the failure, if any, and is only read after frags is closed.
 	frags chan string
@@ -367,16 +371,24 @@ func (s *scheduler) run() {
 		}
 
 		if err := s.step(); err != nil {
+			var de *llama.DecodeError
+			fatal := errors.As(err, &de) && de.Fatal()
+
 			// A decode failure is not attributable to one slot, so every slot
-			// in the batch hears about it rather than hanging.
+			// in the batch hears about it rather than hanging. When it ends
+			// the context, each hears that its reply was cut short where it
+			// stood, which a reloaded model can go on from.
+			failed := err
+			if fatal {
+				failed = fmt.Errorf("%w: %w", ErrInterrupted, err)
+			}
 			for _, sl := range s.slots {
 				if sl.job != nil {
-					s.release(sl, err)
+					s.release(sl, failed)
 				}
 			}
 
-			var de *llama.DecodeError
-			if errors.As(err, &de) && de.Fatal() {
+			if fatal {
 				// The context is finished. Serving from it would return this
 				// same error to every request from now on, which for a fallback
 				// runtime means it is down without saying so.
@@ -469,6 +481,9 @@ func (s *scheduler) prepare(j *job) bool {
 		return false
 	}
 	full, err := s.tokenizer(j)(j.msgs)
+	if err == nil {
+		j.resume, err = s.resumeTokens(j)
+	}
 	if err != nil {
 		j.finish(fmt.Errorf("tokenize: %w", err))
 		return false
@@ -476,9 +491,20 @@ func (s *scheduler) prepare(j *job) bool {
 	j.full = full
 	j.want = len(s.slots)
 	if s.flex != nil {
-		j.want = s.flex.want(len(full), j.params.MaxTokens)
+		j.want = s.flex.want(len(full)+len(j.resume), j.params.MaxTokens)
 	}
 	return true
+}
+
+// resumeTokens is the reply j carries over (GenParams.Resume), tokenized to
+// follow its prompt: without the think opening startIn writes into the reply
+// when the prompt itself opened the block.
+func (s *scheduler) resumeTokens(j *job) ([]llama.Token, error) {
+	text := j.params.Resume
+	if s.tpl.OpensThink(j.params.thinking()) {
+		text = strings.TrimPrefix(text, "<think>")
+	}
+	return llama.Tokenize(s.vocab, text, false, true)
 }
 
 // tokenizer renders and tokenizes a conversation the way j asked for it.
@@ -517,9 +543,10 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	}
 	// A conversation longer than the slot loses its oldest turns rather than
 	// being refused, and one that nearly fills it loses enough to leave room
-	// for the reply; see fit.go.
-	budget := s.ctxPerSeq - replyRoom(s.ctxPerSeq, j.params.MaxTokens)
-	msgs, tokens, dropped, err := fitMessages(j.msgs, budget, s.ctxPerSeq, fitTokenize, s.messageSize)
+	// for the reply; see fit.go. A reply carried over takes its room first.
+	limit := s.ctxPerSeq - len(j.resume)
+	budget := limit - replyRoom(s.ctxPerSeq, j.params.MaxTokens)
+	msgs, tokens, dropped, err := fitMessages(j.msgs, budget, limit, fitTokenize, s.messageSize)
 	j.full = nil // the slot keeps what it runs; the rest is garbage
 	if err != nil {
 		var big *PromptTooLongError
@@ -604,6 +631,11 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 		}
 	}
 
+	// The reply carried over is prefilled after the prompt, and the model
+	// goes on from its end. It comes after the pool's checkpoints, which are
+	// in the prompt.
+	tokens = append(tokens, j.resume...)
+
 	// A caller that named no budget gets the rest of its slot's context. That
 	// is a real bound, so kinfer does not also impose a ceiling on num_predict:
 	// what a runaway request costs is time, and the wall clock in deadlines
@@ -632,7 +664,14 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	sl.maxGen = maxGen
 	sl.emitted = 0
 	sl.out.Reset()
-	if s.tpl.OpensThink(j.params.thinking()) {
+	switch {
+	case j.params.Resume != "":
+		// The caller has the reply so far. It stays in front of what follows,
+		// so a stop marker that straddles the two is still found, and it is
+		// not sent again.
+		sl.out.WriteString(j.params.Resume)
+		sl.emitted = len(j.params.Resume)
+	case s.tpl.OpensThink(j.params.thinking()):
 		// The prompt opened the think block, so the model writes only its
 		// close. Reported from here, the reply reads as every other reasoning
 		// model's does, and the splitters downstream need no exception.
@@ -1004,15 +1043,25 @@ func (s *scheduler) release(sl *slot, err error) {
 //
 // It exists to separate the two halves of a shutdown. A slot that was mid-batch
 // has already streamed part of an answer, and re-running it would repeat that
-// text; there is nothing to do but fail it. A job still in the queue holds only
-// its messages and parameters — no KV state, no emitted tokens, no tie to the
-// context that died — and can simply be run again on the replacement.
+// text; it can only go on from where it stopped (ErrInterrupted). A job still
+// in the queue holds only its messages and parameters — no KV state, no emitted
+// tokens, no tie to the context that died — and can simply be run again on the
+// replacement.
 //
 // That distinction is most of the blast radius. When a backend failure retired
 // a model mid-load-test, 26 requests failed at once and the majority of them
 // had never started. Callers that can reload a model should retry this; callers
 // that cannot should report it. Engine cannot reload itself, so it reports.
 var ErrNotStarted = errors.New("the engine went down before this request started")
+
+// ErrInterrupted means the backend failed while a request was running, ending
+// the context. What the reply had come to reached the caller with the error, so
+// a caller able to reload the model can have the replacement go on from there
+// (GenParams.Resume) instead of failing it: nothing is sent twice.
+//
+// On a Mac the usual cause is the GPU running out of memory under the model,
+// because something else on the machine started using it after the load.
+var ErrInterrupted = errors.New("the engine went down in the middle of this reply")
 
 // drain ends every in-flight and queued request on shutdown.
 //

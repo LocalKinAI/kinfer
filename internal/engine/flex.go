@@ -235,7 +235,7 @@ func (s *scheduler) reshape(j *job) bool {
 	}
 	left := ""
 	if free > 0 {
-		left = ", leaving " + gib(free) + " free (this process only)"
+		left = ", leaving " + gib(free) + " free (" + freeScope() + ")"
 	}
 	log.Printf("slots: %s -> %s %s (it queued %s; the cache was rebuilt in %s%s)",
 		from, target, why, time.Since(j.queued).Round(100*time.Millisecond), time.Since(began).Round(time.Millisecond), left)

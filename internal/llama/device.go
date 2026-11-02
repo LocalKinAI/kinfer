@@ -2,6 +2,7 @@ package llama
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/ebitengine/purego"
@@ -24,6 +25,15 @@ type Device struct {
 	Type  DeviceType
 	Free  uint64 // bytes the backend says are still available
 	Total uint64 // the budget, not the machine's RAM
+}
+
+// FreeSeesOthers reports whether the free memory Metal reports is what the
+// whole GPU has left, other processes' allocations taken off (patch 0004,
+// GGML_METAL_FREE_DEVICE, which kinfer turns on), or only what this process
+// has left of the budget.
+func FreeSeesOthers() bool {
+	v := os.Getenv("GGML_METAL_FREE_DEVICE")
+	return v != "" && v != "0"
 }
 
 // DeviceType mirrors enum ggml_backend_dev_type.
