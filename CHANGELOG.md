@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.6 — 2026-11-02
 
 ### Fixed — a model was placed as if the GPU were its own
 
