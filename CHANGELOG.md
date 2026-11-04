@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.7 — 2026-11-03
 
 ### Fixed — Claude Code's every turn was read from the start
 
