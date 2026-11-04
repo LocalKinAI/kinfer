@@ -106,6 +106,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"counter", cur.eng.PromptTokens(), "")
 		metric("eval_tokens_total", "Tokens generated since this model loaded.",
 			"counter", cur.eng.EvalTokens(), "")
+		drafted, accepted := cur.eng.Drafts()
+		metric("draft_tokens_total", "Tokens the model's MTP head drafted since this model loaded.",
+			"counter", drafted, "")
+		metric("draft_accepted_total", "Drafted tokens the model accepted: written as drafted, a pass sooner.",
+			"counter", accepted, "")
 		metric("model_loaded", "1 for the model currently resident.", "gauge", 1,
 			fmt.Sprintf("{model=%q}", cur.path))
 	} else {

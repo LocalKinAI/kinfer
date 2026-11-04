@@ -182,15 +182,16 @@ func TestAutoSizeFitsAnAutomaticPoolAroundFixedConversations(t *testing.T) {
 
 	for _, c := range []struct {
 		name       string
-		spendable  int64
+		free       uint64
 		wantPrefix int
 		wantShared bool
 	}{
-		{"room for cells of its own", dedicated, 2, false},
-		{"room only to share the slots' cells", shared, 2, true},
-		{"no room at all", base - 1, 0, false},
+		{"room for cells of its own", freeFor(dedicated), 2, false},
+		{"room only to share the slots' cells", freeFor(shared), 2, true},
+		// The slots were sized against free less fitReserve, and took all of it.
+		{"no room at all", uint64(base) + fitReserve, 0, false},
 	} {
-		p, err := AutoSize(moe, freeFor(c.spendable), slots, 0, ctx)
+		p, err := AutoSize(moe, c.free, slots, 0, ctx)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -201,8 +202,9 @@ func TestAutoSizeFitsAnAutomaticPoolAroundFixedConversations(t *testing.T) {
 			t.Errorf("%s: pool %d (shared %v), want %d (shared %v)", c.name, p.Prefix, p.SharedPool, c.wantPrefix, c.wantShared)
 		}
 		// The operator's own conversations cost what they cost; the pool must
-		// not push the plan past that or past the budget, whichever is more.
-		if limit := max(c.spendable, base); p.Estimated > limit {
+		// not push the plan past that, or past what the slots were sized
+		// against, whichever is more.
+		if limit := max(spendableOf(c.free), int64(sub(c.free, fitReserve)), base); p.Estimated > limit {
 			t.Errorf("%s: plan costs %d, over the %d that the slots or the budget allow", c.name, p.Estimated, limit)
 		}
 	}
@@ -316,5 +318,24 @@ func TestBatchHoldsTheMicroBatch(t *testing.T) {
 		if got := batchFor(c[0]); got != c[1] {
 			t.Errorf("batchFor(%d) = %d, want %d", c[0], got, c[1])
 		}
+	}
+}
+
+// Slots sized against nearly all the memory left — as SizeTotal sizes them —
+// still leave a pool sharing their cells, which costs a hybrid model only each
+// entry's recurrent state: without one, no turn reuses the one before it, and
+// on the box qwen3.8 read a 7,851-token conversation again on every turn.
+func TestPoolSharesTheSlotsCellsWhenTheyTookMostOfTheMemory(t *testing.T) {
+	// Four slots of 32768 cost 2.75 GiB here: more than half of 5 GiB.
+	p, err := AutoSize(moe, 5*GiB, 4, 0, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Prefix == 0 || !p.SharedPool {
+		t.Errorf("got %d prefix entries (shared %v) beside slots that left 1.25 GiB; want a shared pool", p.Prefix, p.SharedPool)
+	}
+	// With nothing past the slots, there is still none.
+	if p, _ := AutoSize(moe, 3*GiB, 4, 0, 32768); p.Prefix != 0 {
+		t.Errorf("got %d prefix entries with no memory past the slots", p.Prefix)
 	}
 }

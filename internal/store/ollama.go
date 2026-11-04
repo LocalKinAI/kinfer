@@ -79,13 +79,18 @@ func readOllamaManifest(root, manifests, path string) (Model, bool) {
 
 	// The weights are the layer Ollama calls the model. A cloud entry has none,
 	// which is exactly how it is told apart.
-	var blob string
+	var blob, projector string
 	var size int64
 	for _, l := range mf.Layers {
-		if strings.HasSuffix(l.MediaType, ".image.model") {
-			blob = filepath.Join(root, "blobs", strings.ReplaceAll(l.Digest, ":", "-"))
-			size = l.Size
-			break
+		path := filepath.Join(root, "blobs", strings.ReplaceAll(l.Digest, ":", "-"))
+		switch {
+		case strings.HasSuffix(l.MediaType, ".image.model") && blob == "":
+			blob, size = path, l.Size
+		case strings.HasSuffix(l.MediaType, ".image.projector"):
+			// A vision model's projector, the mmproj another runtime reads.
+			if _, err := os.Stat(path); err == nil {
+				projector = path
+			}
 		}
 	}
 	// No weights layer is a cloud entry; a zero-byte one is a broken manifest.
@@ -114,11 +119,12 @@ func readOllamaManifest(root, manifests, path string) (Model, bool) {
 	}
 
 	return Model{
-		Name:     name,
-		Path:     blob,
-		Size:     info.Size(),
-		Modified: info.ModTime(),
-		Source:   FromOllama,
+		Name:      name,
+		Path:      blob,
+		Size:      info.Size(),
+		Modified:  info.ModTime(),
+		Source:    FromOllama,
+		Projector: projector,
 	}, true
 }
 

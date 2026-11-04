@@ -1,5 +1,103 @@
 # Changelog
 
+## Unreleased
+
+### Added — drafting with the model's MTP head
+
+A model trained with multi-token prediction now drafts its next tokens with its
+own MTP head — up to four a step — and reads them in the pass that reads its
+next token: each it would have written itself is kept. Every token is one the
+model chose — Qwen3.8-27B's replies at temperature 0 came out identical with
+drafts and without, fifteen of fifteen — and they come sooner. On
+the box, Qwen3.8-27B wrote one conversation's reply at 37 to 69 tok/s instead of
+31.5, least on prose and most on code; on llama-server's own three prompts it
+accepted exactly the drafts llama-server's MTP drafting accepts (180 of 297, 189
+of 264, 178 of 303) at the same speed, 51, 58 and 50 tok/s. On the decode prompts
+of the comparison with Ollama, which drafts with the same head, it wrote 43 tok/s
+where Ollama wrote 42 and kinfer had written 31.5.
+
+The pass that checks drafts costs more the more tokens it carries, and every
+conversation in it pays, so drafts are shared out: four each for one or two
+conversations writing, two for three, one for four to eight, none past eight.
+Conversations writing at once wrote more together at every count measured up to
+eight: two 51 tok/s instead of 38, four 89 instead of 61, eight 111 instead of
+103. Ten wrote 86 instead of 92: the snapshots below are written every pass.
+
+A mixture of experts drafts one token a step: ornith-1.5-35b wrote 118–131 tok/s
+at one instead of 108, accepting two drafts in three or more, and 78–85 at four,
+accepting one in five; two at once 166 together instead of 149, four 229 instead
+of 201. At one draft its replies were identical too; at two or more, three of
+five took another word somewhere the model was torn, because a pass of three
+tokens multiplies some weights with a Metal kernel that sums in another order.
+`-draft -1` turns drafting off. It costs memory, which sizing counts: the head's own cache, and four
+snapshots of every sequence's recurrent state for a hybrid model like Qwen3.8 —
+with the box service's four slots of 65536, 24.7 GiB of context instead of 19.9;
+with twelve slots of 4096, 19.0 instead of 8.6.
+`/metrics` counts drafts and the ones accepted.
+
+### Fixed — a conversation's every turn was read again when memory was tight
+
+A turn reuses the one before it through the prefix pool, and nothing else. Slots
+sized the way Ollama sizes one request's context can take more than half of the
+memory left, and the pool was held to half: it got nothing, even sharing the
+slots' cells, where it costs only a hybrid model's recurrent state per entry. On
+the box, beside Ollama's ornith, qwen3.8's four slots of 32768 left the pool no
+entries, and a conversation's second turn read all 7,851 tokens again: 26.2 s,
+where Ollama took 0.3. The pool is now held to what the slots leave of the memory
+they were sized against; the same conditions give it two entries sharing the
+slots' cells, 0.3 GiB more, and the second turn takes 0.49 s.
+
+A bare model name — `qwen3.8` — is Ollama's `qwen3.8:latest` before any model the
+name begins, as Ollama's clients mean it; on the box it was refused as ambiguous
+beside Qwen3.8-Flash-Next and qwen3.8-27b.
+
+### Added — pictures, for a model with a projector
+
+A vision model now reads pictures: Ollama's `images`, OpenAI's `image_url`
+content parts, Anthropic's `image` blocks and the Responses API's `input_image`,
+sent as base64 or a `data:` URL — a link is refused, not fetched. The projector
+it reads them through loads with it: Ollama's own layer for a model borrowed from
+its store (ornith-1.5:35b and qwen3.8 on the box), or `NAME.mmproj.gguf` beside
+one of kinfer's, which `kinfer pull` now fetches with a vision model (F16
+first) and `kinfer rm` removes with it. Its memory is counted with the model's
+when the context is sized.
+
+A prompt with pictures is read whole when its turn comes, alone — the other
+conversations wait the second or so it takes — and the prefix pool, which knows
+a prompt by its tokens, neither lends to it nor keeps it. A picture for a model
+without a projector is refused (400), as Ollama refuses it: it used to be said
+in words, and told that a picture was there, Qwen's 4B described one it had not
+seen. OpenAI content
+sent as an array of parts was refused before, text parts too; it reads now.
+
+On the box, ornith-1.5:35b from Ollama's store said a picture split red and blue
+was "red on the left half and blue on the right half", as Ollama's own copy of
+it did, in both dialects; two pictures in one message were named in order; and
+a 97-token prompt with its picture was read in 0.22 s.
+
+### Added — embeddings, beside the chat model
+
+An embedding model — nomic-embed-text, bge-m3, EmbeddingGemma, Qwen3-Embedding:
+a GGUF whose header names a pooling, or an encoder like BERT's — now makes
+vectors over Ollama's `/api/embed` (unit length; `truncate`, `dimensions`),
+Ollama's older `/api/embeddings` (the model's own vector) and OpenAI's
+`/v1/embeddings` (texts or tokens; float or base64). LocalKin's RAG and
+kinhome's text lookups ask Ollama for these today.
+
+It loads in a place of its own beside the chat model, with its own idle clock:
+an agent looking up what to put in its next prompt does not unload the model it
+is about to send it to — Flash-Next takes half a minute to load again. Asked to
+chat, an embedding model is refused (400) before the chat model is let go;
+`/api/show` says it embeds, `/api/ps` lists it, and `ollama stop` unloads it. A
+text is read up to 8192 tokens, or as far as the model was trained, and a longer
+one is cut there unless `truncate` is false. Pictures and sound in `input` — what
+Ollama 0.40 embeds with EmbeddingGemma 2 — are refused for now.
+
+On the box, nomic-embed-text read from Ollama's own store: kinfer's vectors and
+Ollama's agree to a cosine of 1.000000 on each of four texts, Chinese among
+them, from the same 69 tokens; batched or one at a time, the same; it loaded in
+0.45 s, and a chat model loaded before it answered next in 6 ms, still loaded.
+
 ## v0.1.7 — 2026-11-03
 
 ### Fixed — Claude Code's every turn was read from the start

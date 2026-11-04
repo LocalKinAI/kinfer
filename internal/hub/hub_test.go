@@ -150,3 +150,49 @@ func TestShards(t *testing.T) {
 		t.Errorf("Shards(a file that stands alone) = %s", got)
 	}
 }
+
+// A vision repo's projector: F16 first, then BF16 — which "f16" must not be
+// mistaken for — then F32, then whatever there is.
+func TestProjector(t *testing.T) {
+	cases := []struct {
+		files []string
+		want  string
+	}{
+		{[]string{"m-Q4_K_M.gguf", "mmproj-BF16.gguf", "mmproj-F16.gguf", "mmproj-F32.gguf"}, "mmproj-F16.gguf"},
+		{[]string{"m-Q4_K_M.gguf", "mmproj-model-f32.gguf", "mmproj-model-bf16.gguf"}, "mmproj-model-bf16.gguf"},
+		{[]string{"m-Q4_K_M.gguf", "mmproj-Q8_0.gguf"}, "mmproj-Q8_0.gguf"},
+		{[]string{"m-Q4_K_M.gguf"}, ""},
+	}
+	for _, c := range cases {
+		var files []File
+		for _, n := range c.files {
+			files = append(files, File{Name: n})
+		}
+		got, ok := Projector(files)
+		if got.Name != c.want || ok != (c.want != "") {
+			t.Errorf("Projector(%v) = %q, %v; want %q", c.files, got.Name, ok, c.want)
+		}
+	}
+}
+
+func TestProjectorName(t *testing.T) {
+	if got := ProjectorName([]File{{Name: "Qwen3-VL-8B-Q4_K_M.gguf"}}); got != "Qwen3-VL-8B-Q4_K_M.mmproj.gguf" {
+		t.Errorf("one file: %q", got)
+	}
+	set := []File{{Name: "Q2/Big-Q2-00001-of-00002.gguf"}, {Name: "Q2/Big-Q2-00002-of-00002.gguf"}}
+	if got := ProjectorName(set); got != "Big-Q2.mmproj.gguf" {
+		t.Errorf("a split model: %q, want the name the store gives the set", got)
+	}
+}
+
+// A projector is never the model a quantization picks.
+func TestPickLeavesProjectorsOut(t *testing.T) {
+	files := []File{{Name: "mmproj-F16.gguf"}, {Name: "model-F16.gguf"}, {Name: "model-Q8_0.gguf"}}
+	got, err := Pick(files, Ref{Repo: "o/r", Quant: "F16"})
+	if err != nil || got.Name != "model-F16.gguf" {
+		t.Errorf("Pick F16 = %q, %v", got.Name, err)
+	}
+	if got, _ := Pick([]File{{Name: "mmproj-F16.gguf"}, {Name: "model-Q8_0.gguf"}}, Ref{Repo: "o/r"}); got.Name != "model-Q8_0.gguf" {
+		t.Errorf("Pick with no quantization = %q", got.Name)
+	}
+}

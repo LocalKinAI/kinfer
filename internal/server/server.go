@@ -14,6 +14,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -61,6 +62,14 @@ type Server struct {
 
 	// open loads a model. Tests replace it; nothing else should.
 	open func(path string, opts engine.Options) (generator, error)
+
+	// The embedding model, loaded beside the chat model (embed.go): the same
+	// rules, its own place and idle clock. openEmbed loads one; tests replace it.
+	emb        *embedLease
+	embLoading bool
+	embIdle    *time.Timer
+	embExpiry  time.Time
+	openEmbed  func(path string, opts engine.Options) (embedder, error)
 }
 
 // Version is reported by /api/version.
@@ -104,6 +113,7 @@ type generator interface {
 	Load() (waiting, busy, slots int)
 	PromptTokens() int64
 	EvalTokens() int64
+	Drafts() (drafted, accepted int64)
 	Close()
 }
 
@@ -113,7 +123,7 @@ func openEngine(path string, opts engine.Options) (generator, error) {
 
 // New creates a server over the given store.
 func New(s *store.Store, opts engine.Options) *Server {
-	srv := &Server{store: s, opts: opts, open: openEngine}
+	srv := &Server{store: s, opts: opts, open: openEngine, openEmbed: openEmbedder}
 	srv.cond = sync.NewCond(&srv.mu)
 	return srv
 }
@@ -136,6 +146,9 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	// OpenAI dialect.
+	mux.HandleFunc("/api/embed", s.handleOllamaEmbed)
+	mux.HandleFunc("/api/embeddings", s.handleOllamaEmbeddings)
+	mux.HandleFunc("/v1/embeddings", s.handleOpenAIEmbeddings)
 	mux.HandleFunc("/v1/chat/completions", s.handleOpenAIChat)
 	mux.HandleFunc("/v1/models", s.handleOpenAIModels)
 
@@ -165,11 +178,12 @@ func (s *Server) Handler() http.Handler {
 	return s.count(mux)
 }
 
-// Close releases the resident model.
+// Close releases the resident models.
 func (s *Server) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.retireLocked()
+	s.retireEmbedderLocked()
 }
 
 // retireLocked stops treating the resident model as resident and waits for
@@ -239,11 +253,17 @@ func (s *Server) armIdleLocked() {
 // wire format, where zero is "unload now" — the idiom `ollama stop` and every
 // script that frees memory for another model send — so there it means that.
 func (s *Server) idleForLocked(l *lease) (d time.Duration, forever bool) {
-	if l.keepAlive != nil {
-		if *l.keepAlive < 0 {
+	return s.idleFor(l.keepAlive)
+}
+
+// idleFor is how long a model whose last request asked for keepAlive may sit
+// idle, or forever; nil is the server's own -keepalive.
+func (s *Server) idleFor(keepAlive *time.Duration) (d time.Duration, forever bool) {
+	if keepAlive != nil {
+		if *keepAlive < 0 {
 			return 0, true
 		}
-		return *l.keepAlive, false
+		return *keepAlive, false
 	}
 	if s.keepAlive <= 0 {
 		return 0, true
@@ -275,6 +295,17 @@ func (s *Server) acquireOnce(name string) (generator, func(), error) {
 	path, err := s.store.Resolve(name)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// An embedding model writes no text. Said before anything is swapped out:
+	// loading it would unload the chat model only to fail.
+	s.mu.Lock()
+	loaded := s.cur != nil && s.cur.path == path
+	s.mu.Unlock()
+	if !loaded {
+		if sh, err := store.ReadShape(path); err == nil && sh.Embeds() {
+			return nil, nil, fmt.Errorf("%s %w", name, errEmbeddingModel)
+		}
 	}
 
 	s.mu.Lock()
@@ -317,7 +348,9 @@ func (s *Server) acquireOnce(name string) (generator, func(), error) {
 	// the model being loaded can queue on cond instead of on the mutex.
 	s.mu.Unlock()
 	log.Printf("loading %s", path)
-	e, err := s.open(path, s.opts)
+	opts := s.opts
+	opts.Projector = s.store.ProjectorFor(path)
+	e, err := s.open(path, opts)
 	s.mu.Lock()
 
 	if err != nil {
@@ -362,6 +395,11 @@ type ollamaMsg struct {
 	// API send an earlier turn's thinking back. Read only; replies carry it in
 	// their own field.
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+
+	// pictures are the message's pictures, read by UnmarshalJSON (media.go)
+	// from Ollama's "images" and OpenAI's content parts, with a marker in
+	// Content where each goes. Never written.
+	pictures [][]byte
 }
 
 // ollamaCall is a tool call on the wire. Both dialects nest the call under a
@@ -439,7 +477,7 @@ func wireCalls(calls []tools.Call) []ollamaCall {
 func toChatMessages(in []ollamaMsg) []chat.Message {
 	out := make([]chat.Message, len(in))
 	for i, m := range in {
-		out[i] = chat.Message{Role: m.Role, Content: m.Content, Thinking: m.Thinking}
+		out[i] = chat.Message{Role: m.Role, Content: m.Content, Thinking: m.Thinking, Images: m.pictures}
 		if out[i].Thinking == "" {
 			out[i].Thinking = m.ReasoningContent
 		}
@@ -547,7 +585,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	loadStart := time.Now()
 	eng, release, err := s.acquire(req.Model)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		writeJSON(w, acquireStatus(err), map[string]string{"error": err.Error()})
 		return
 	}
 	defer release()
@@ -758,17 +796,24 @@ func (s *Server) handlePS(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	}
 
+	type resident struct {
+		path   string
+		expiry time.Time
+		lazy   int64
+	}
+	var held []resident
 	s.mu.Lock()
-	var path string
-	var expiry time.Time
-	var lazy int64
 	if s.cur != nil {
-		path, expiry, lazy = s.cur.path, s.expiry, s.cur.lazy
+		held = append(held, resident{s.cur.path, s.expiry, s.cur.lazy})
+	}
+	if s.emb != nil {
+		held = append(held, resident{s.emb.path, s.embExpiry, 0})
 	}
 	s.mu.Unlock()
 
 	loaded := []entry{}
-	if path != "" {
+	for _, h := range held {
+		path, expiry, lazy := h.path, h.expiry, h.lazy
 		e := entry{Name: modelName(path), Model: modelName(path)}
 		if fi, err := os.Stat(path); err == nil {
 			e.Size = fi.Size()
@@ -819,6 +864,10 @@ func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	capabilities := []string{"completion"}
+	if sh, err := store.ReadShape(path); err == nil && sh.Embeds() {
+		capabilities = []string{"embedding"}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"details": map[string]any{
 			"family":             chat.Detect(path).Name,
@@ -827,8 +876,20 @@ func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
 			"quantization_level": "",
 		},
 		"model_info":   map[string]any{},
-		"capabilities": []string{"completion"},
+		"capabilities": capabilities,
 	})
+}
+
+// errEmbeddingModel is an embedding model asked to write text.
+var errEmbeddingModel = errors.New("is an embedding model: it makes vectors (/api/embed, /v1/embeddings), not text")
+
+// acquireStatus is the HTTP status a request failed with when its model could
+// not be had: a name nothing answers to, or a model that writes no text.
+func acquireStatus(err error) int {
+	if errors.Is(err, errEmbeddingModel) {
+		return http.StatusBadRequest
+	}
+	return http.StatusNotFound
 }
 
 func modelName(path string) string {
@@ -886,7 +947,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	eng, release, err := s.acquire(req.Model)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{"message": err.Error()}})
+		writeJSON(w, acquireStatus(err), map[string]any{"error": map[string]string{"message": err.Error()}})
 		return
 	}
 	defer release()

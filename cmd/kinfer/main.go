@@ -306,7 +306,7 @@ func runLocal(ctx context.Context, model, prompt, system string, ngl, nCtx, maxT
 		return err
 	}
 
-	eng, err := engine.Open(path, engine.Options{GPULayers: ngl, ContextSize: nCtx})
+	eng, err := engine.Open(path, engine.Options{GPULayers: ngl, ContextSize: nCtx, Projector: st.ProjectorFor(path)})
 	if err != nil {
 		return err
 	}
@@ -396,6 +396,7 @@ type serveOpts struct {
 	moeCache        int
 	place           bool
 	kvCache         string
+	draft           int
 }
 
 // prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
@@ -500,6 +501,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.BoolVar(&o.flex, "flex", true, "give a prompt too long for a slot a longer one: fewer slots, the same tokens, while it runs (false = keep the layout)")
 	fs.IntVar(&o.hostExperts, "host-experts", 0, "a mixture of experts' routed experts stay in host memory, mapped from the file, for this many of the first layers (-1 = every layer; 0 = as many as -place decides, none for a model that fits)")
 	fs.IntVar(&o.moeCache, "moe-cache", 0, "MiB of GPU memory caching the host experts in use, so only a miss is copied (0 = what -place decides, none for a model that fits)")
+	fs.IntVar(&o.draft, "draft", 0, "tokens drafted a step with a model's MTP head, for one pass to check — the model's own reply, sooner (0 = 4 for a dense model with a head, 1 for a mixture of experts, none when its experts are in host memory; -1 = none)")
 	fs.StringVar(&o.kvCache, "kv-cache", "f16", "what the attention cache is kept in: f16, or q8_0 — about half the memory, so twice the context per conversation, and decode up to a seventh slower at long contexts (a model q8_0 does not suit stays f16: the DeepSeek family, and heads it does not divide)")
 	fs.BoolVar(&o.place, "place", true, "when a mixture of experts does not fit the GPU, keep as many layers' experts in host memory as it must, with a GPU cache for the ones in use, unless -host-experts or -moe-cache say otherwise; with -peers and no -split, give the peers only the layers that do not fit here (false = load it whole, and let llama.cpp split by free memory)")
 	fs.Func("peers", "kinfer workers on other machines (host:port, comma-separated) whose GPUs take the first layers of each model; auto = those that answer over the Thunderbolt cable, for a model that does not fit here (default none)", func(v string) (err error) {
@@ -545,6 +547,7 @@ func cmdServe(args []string) error {
 		MaxQueue: o.queue, MaxGenerate: noLimit(o.maxGen), MaxWait: noLimit(o.maxWait),
 		FixedLayout: !o.flex, Batch: o.batch, Peers: o.peers, FindPeers: findPeers, Split: o.split,
 		HostExperts: o.hostExperts, MoeCache: o.moeCache, NoPlace: !o.place, CacheType: o.kvCache,
+		Draft: o.draft,
 	})
 	srv.SetKeepAlive(o.keepAlive)
 	defer srv.Close()

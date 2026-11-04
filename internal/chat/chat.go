@@ -38,6 +38,10 @@ type Message struct {
 	// it back. Most templates drop it; DeepSeek V4.1 renders it again inside a
 	// tool loop, where the model reads its own reasoning before the next call.
 	Thinking string
+
+	// Images are the pictures the message shows, as image files (jpg, png…),
+	// one for each engine.ImageMarker in Content, in order.
+	Images [][]byte
 }
 
 // Thinking is how a reply should reason: not at all, or with an effort level

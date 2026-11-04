@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -172,6 +173,17 @@ func List(ctx context.Context, repo string) ([]File, error) {
 // quantisation with the best size-to-quality ratio for most models — and if
 // that is absent, the first file, so `pull` still does something sensible.
 func Pick(files []File, ref Ref) (File, error) {
+	// A projector, an importance matrix, an MTP head: files beside a model,
+	// not models. "F16" would otherwise pick mmproj-F16.gguf.
+	var models []File
+	for _, f := range files {
+		if IsModel(f.Name) {
+			models = append(models, f)
+		}
+	}
+	if len(models) > 0 {
+		files = models
+	}
 	if ref.File != "" {
 		for _, f := range files {
 			if strings.EqualFold(f.Name, ref.File) {
@@ -212,6 +224,42 @@ func Pick(files []File, ref Ref) (File, error) {
 	}
 	return files[0], nil
 }
+
+// Projector is the projector a vision model's repo ships, the file it reads
+// pictures with: F16 where there is one — Metal reads it as is — then BF16,
+// F32, and failing those the first.
+func Projector(files []File) (File, bool) {
+	var found []File
+	for _, f := range files {
+		if strings.Contains(strings.ToLower(filepath.Base(f.Name)), "mmproj") {
+			found = append(found, f)
+		}
+	}
+	for _, kind := range []string{"f16", "bf16", "f32"} {
+		for _, f := range found {
+			if strings.Contains(strings.ToLower(f.Name), kind) && !(kind == "f16" && strings.Contains(strings.ToLower(f.Name), "bf16")) {
+				return f, true
+			}
+		}
+	}
+	if len(found) > 0 {
+		return found[0], true
+	}
+	return File{}, false
+}
+
+// ProjectorName is what a projector is kept as beside the model set names —
+// the files of one split model, or one file — so the store finds it.
+func ProjectorName(set []File) string {
+	name := strings.TrimSuffix(filepath.Base(set[0].Name), ".gguf")
+	if len(set) > 1 {
+		name = pieceSuffix.ReplaceAllString(name, "")
+	}
+	return name + ".mmproj.gguf"
+}
+
+// pieceSuffix is a split model's piece number at the end of a name.
+var pieceSuffix = regexp.MustCompile(`-\d{5}-of-\d{5}$`)
 
 // pieceNumber is where a split model's piece numbers itself, as in
 // "-00002-of-00005.gguf". Taking the number out leaves a name every piece of

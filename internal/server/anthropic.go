@@ -68,6 +68,14 @@ type anthropicBlock struct {
 	Input   json.RawMessage `json:"input"`
 	Content json.RawMessage `json:"content"`
 	IsError bool            `json:"is_error"`
+
+	// Source is an image block's picture: {"type": "base64", "data": …}, or
+	// a "url", which kinfer does not fetch.
+	Source *struct {
+		Type string `json:"type"`
+		Data string `json:"data"`
+		URL  string `json:"url"`
+	} `json:"source"`
 }
 
 type anthropicTool struct {
@@ -182,17 +190,32 @@ func anthropicToChat(req *anthropicRequest) ([]chat.Message, error) {
 			role = "system"
 		}
 		var text []string
+		var pics [][]byte
 		flush := func() {
 			if len(text) > 0 {
-				out = append(out, chat.Message{Role: role, Content: strings.Join(text, "\n")})
-				text = nil
+				out = append(out, chat.Message{Role: role, Content: strings.Join(text, "\n"), Images: pics})
+				text, pics = nil, nil
 			}
 		}
 		for _, b := range blocks {
 			switch b.Type {
 			case "text":
 				text = append(text, b.Text)
-			case "image", "document":
+			case "image":
+				if b.Source == nil {
+					return nil, fmt.Errorf("messages[%d]: an image block without a source", i)
+				}
+				src := b.Source.Data
+				if b.Source.Type == "url" {
+					src = b.Source.URL
+				}
+				pic, err := picture(src)
+				if err != nil {
+					return nil, fmt.Errorf("messages[%d]: %w", i, err)
+				}
+				text = append(text, engine.ImageMarker)
+				pics = append(pics, pic)
+			case "document":
 				text = append(text, omittedAttachment(b.Type))
 			case "tool_result":
 				flush()
@@ -264,7 +287,11 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	eng, release, err := s.acquire(req.Model)
 	if err != nil {
-		writeAnthropicError(w, http.StatusNotFound, "not_found_error", err.Error())
+		kind := "not_found_error"
+		if acquireStatus(err) == http.StatusBadRequest {
+			kind = "invalid_request_error"
+		}
+		writeAnthropicError(w, acquireStatus(err), kind, err.Error())
 		return
 	}
 	defer release()
@@ -434,6 +461,10 @@ func writeAnthropicGenError(w http.ResponseWriter, err error) {
 	var big *engine.PromptTooLongError
 	if errors.As(err, &big) {
 		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", big.Error())
+		return
+	}
+	if pictureFault(err) {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	var stale *engine.TimeoutError

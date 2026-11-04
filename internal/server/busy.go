@@ -28,6 +28,10 @@ func writeGenError(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": big.Error()})
 		return
 	}
+	if pictureFault(err) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	// A request that aged out of the queue is the same answer as a full one —
 	// the server has more work than it can take — reached by time rather than
@@ -62,6 +66,12 @@ func writeOpenAIGenError(w http.ResponseWriter, err error) {
 	if errors.As(err, &big) {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
 			"error": map[string]string{"message": big.Error(), "type": "invalid_request_error"},
+		})
+		return
+	}
+	if pictureFault(err) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "invalid_request_error"},
 		})
 		return
 	}

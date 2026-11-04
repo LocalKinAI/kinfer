@@ -61,6 +61,11 @@ type Model struct {
 	// Source is where the file lives. A borrowed model is read in place and
 	// never written to.
 	Source Source
+
+	// Projector is a vision model's projector, the file it reads pictures
+	// with: a layer of its own in Ollama's store, and NAME.mmproj.gguf beside
+	// one of kinfer's. Empty for a model that reads only text.
+	Projector string
 }
 
 // Store is a directory of models.
@@ -118,7 +123,7 @@ func (s *Store) List() ([]Model, error) {
 
 	var out []Model
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") || isProjector(e.Name()) {
 			continue
 		}
 		path := filepath.Join(s.root, e.Name())
@@ -153,11 +158,12 @@ func (s *Store) List() ([]Model, error) {
 		}
 
 		out = append(out, Model{
-			Name:     nameOf(e.Name()),
-			Path:     path,
-			Size:     info.Size(),
-			Modified: info.ModTime(),
-			Source:   FromKinfer,
+			Name:      nameOf(e.Name()),
+			Path:      path,
+			Size:      info.Size(),
+			Modified:  info.ModTime(),
+			Source:    FromKinfer,
+			Projector: projectorBeside(path),
 		})
 	}
 
@@ -251,6 +257,14 @@ func (s *Store) Resolve(name string) (string, error) {
 			return m.Path, nil
 		}
 	}
+	// Ollama's clients send a bare name for its :latest tag. It means that
+	// model, before any other the name begins: "qwen3.8" on the box is
+	// qwen3.8:latest, not Qwen3.8-Flash-Next or qwen3.8-27b.
+	for _, m := range models {
+		if strings.EqualFold(m.Name, name+":latest") {
+			return m.Path, nil
+		}
+	}
 
 	// The exact name of a model a pull has not finished means that model, not
 	// another the name is the start of.
@@ -314,6 +328,13 @@ func (s *Store) Remove(name string) error {
 	model, idx, _ := shardOf(filepath.Base(path))
 	if idx == 0 {
 		model = nameOf(filepath.Base(path))
+	}
+	// Its projector goes with it — the one kinfer keeps beside it, never a
+	// file of Ollama's.
+	if p := projectorBeside(filepath.Join(filepath.Dir(path), model+".gguf")); p != "" {
+		if err := os.Remove(p); err != nil {
+			return err
+		}
 	}
 	if u, ok := s.unfinished(model); ok {
 		return removeAll(u.Files)
@@ -492,6 +513,48 @@ func names(models []Model) []string {
 		out[i] = m.Name
 	}
 	return out
+}
+
+// isProjector is a vision model's projector file, which is not a model:
+// mmproj-F16.gguf as Hugging Face repos name it, NAME.mmproj.gguf as kinfer
+// keeps it.
+func isProjector(filename string) bool {
+	return strings.Contains(strings.ToLower(filename), "mmproj")
+}
+
+// projectorBeside is NAME.mmproj.gguf next to NAME.gguf, if it is there.
+func projectorBeside(model string) string {
+	p := strings.TrimSuffix(model, filepath.Ext(model)) + ".mmproj.gguf"
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
+
+// ProjectorFor is the projector of the model at path, or "" for one that
+// reads only text: what Ollama's manifest names for its blob, or the file
+// beside one of kinfer's own (and the first piece's, for a split model).
+func (s *Store) ProjectorFor(path string) string {
+	// A model linked into the store from Ollama's has its projector there:
+	// the same file, by another name.
+	info, statErr := os.Stat(path)
+	if all, err := s.All(); err == nil {
+		for _, m := range all {
+			if m.Projector == "" {
+				continue
+			}
+			if m.Path == path {
+				return m.Projector
+			}
+			if mi, err := os.Stat(m.Path); err == nil && statErr == nil && os.SameFile(info, mi) {
+				return m.Projector
+			}
+		}
+	}
+	if base, idx, _ := shardOf(filepath.Base(path)); idx > 0 {
+		return projectorBeside(filepath.Join(filepath.Dir(path), base+".gguf"))
+	}
+	return projectorBeside(path)
 }
 
 // HumanSize formats a byte count for display.

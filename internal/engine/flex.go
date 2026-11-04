@@ -71,7 +71,8 @@ type flex struct {
 	// back a context whose first batch fails for want of it, and reports what
 	// the one it built left free (0 when there is no accelerator to ask). The
 	// engine supplies it, because the engine holds the model and the budget.
-	build func(layout) (llama.Context, uint64, error)
+	// With drafting on, the MTP head's context comes with it.
+	build func(layout) (llama.Context, *drafter, uint64, error)
 
 	// refused are the slot counts build turned down. They are not tried again:
 	// each attempt frees the cache and builds it twice while every request
@@ -81,7 +82,7 @@ type flex struct {
 
 // newFlex returns nil when no layout would give a conversation more context
 // than home does: home has one slot, or the model was trained for no more.
-func newFlex(home layout, trained int, build func(layout) (llama.Context, uint64, error)) *flex {
+func newFlex(home layout, trained int, build func(layout) (llama.Context, *drafter, uint64, error)) *flex {
 	f := &flex{home: home, total: home.slots * home.perSeq, build: build, refused: map[int]bool{}}
 	f.most = f.total
 	if trained > 0 {
@@ -209,22 +210,24 @@ func (s *scheduler) reshape(j *job) bool {
 	// more than the cache costs filling itself as it generates, and a long
 	// prompt reshapes twice, on arrival and when it is done.
 	s.profile.save(s.lctx)
+	s.draft.free()
+	s.draft = nil
 	llama.FreeContext(s.lctx)
 	s.lctx = 0
-	lctx, free, err := s.flex.build(target)
+	lctx, draft, free, err := s.flex.build(target)
 	if err != nil && target != s.flex.home {
 		log.Printf("slots: %s could not be built for a %d-token prompt (%v) — rebuilding %s, and %d slots are not tried again",
 			target, len(j.full), err, s.flex.home, target.slots)
 		s.flex.refused[target.slots] = true
 		j.want = s.flex.want(len(j.full), j.params.MaxTokens)
 		target = s.flex.home
-		lctx, free, err = s.flex.build(target)
+		lctx, draft, free, err = s.flex.build(target)
 	}
 	if err != nil {
 		log.Printf("slots: no context could be built (%v) — retiring this model; the next request reloads it", err)
 		return false
 	}
-	s.install(lctx, target)
+	s.install(lctx, draft, target)
 	if target == from {
 		return true // back where it was, after a refusal already reported
 	}
@@ -242,16 +245,18 @@ func (s *scheduler) reshape(j *job) bool {
 	return true
 }
 
-// install makes lctx the scheduler's context, divided as l.
-func (s *scheduler) install(lctx llama.Context, l layout) {
+// install makes lctx the scheduler's context, divided as l, with draft
+// drafting for it (nil for none).
+func (s *scheduler) install(lctx llama.Context, draft *drafter, l layout) {
 	s.lctx = lctx
+	s.draft = draft
 	s.ctxPerSeq = l.perSeq
 	s.slots = make([]*slot, l.slots)
 	for i := range s.slots {
 		s.slots[i] = &slot{seq: int32(i), logitIdx: -1}
 	}
 	// Pooled prefixes live in sequence ids above the slots.
-	s.pool = newPrefixPool(lctx, int32(l.slots), l.prefix, minPrefixMatch, s.wholePrefixes)
+	s.pool = newPrefixPool(lctx, draft, int32(l.slots), l.prefix, minPrefixMatch, s.wholePrefixes)
 	s.nSlots.Store(int32(l.slots))
 }
 

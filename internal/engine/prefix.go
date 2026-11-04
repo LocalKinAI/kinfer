@@ -85,8 +85,9 @@ type prefixEntry struct {
 	shared bool
 }
 
-// newPrefixPool claims n sequence ids starting at firstSeq.
-func newPrefixPool(lctx llama.Context, firstSeq int32, n, minMatch int, exact bool) *prefixPool {
+// newPrefixPool claims n sequence ids starting at firstSeq, in lctx and in the
+// MTP head's cache beside it when draft is drafting for it.
+func newPrefixPool(lctx llama.Context, draft *drafter, firstSeq int32, n, minMatch int, exact bool) *prefixPool {
 	if n <= 0 {
 		return nil
 	}
@@ -96,9 +97,11 @@ func newPrefixPool(lctx llama.Context, firstSeq int32, n, minMatch int, exact bo
 		share: func(src, dst int32, n int32) {
 			p0, p1 := copyBounds(exact, n)
 			llama.CopySequence(lctx, src, dst, p0, p1)
+			draft.share(src, dst, n, p0, p1)
 		},
 		forget: func(seq int32) {
 			llama.ForgetSequence(lctx, seq, -1, -1)
+			draft.forget(seq)
 		},
 	}
 	for i := 0; i < n; i++ {

@@ -233,6 +233,160 @@ family, whose latent and compressed caches are not the per-head K and V this
 counts, and a model whose heads 32 does not divide, stay at f16 when asked;
 the log says which. `kinfer plan -kv-cache q8_0` shows the sizing first.
 
+## Drafting with the model's MTP head
+
+A model trained with multi-token prediction carries a small head beside it — one
+more layer, on Qwen3.8-27B — that reads the hidden state the model left at a
+token and guesses the tokens after it. kinfer has that head draft the next few
+tokens of every conversation that is writing, and the model reads them in the
+pass that reads its next token: it keeps each draft it would have written
+itself, and where it would not, what it did write there. Every token is one the
+model chose — at temperature 0, Qwen3.8-27B's replies came out identical with
+drafts and without, fifteen of fifteen — and it comes sooner, because a dense
+model reads every weight once whether a pass carries one token or five.
+
+Qwen3.8-27B Q4_K_M on the box, one conversation, temperature 0, 256 tokens:
+
+| reply | without drafts | with four a step |
+|---|---:|---:|
+| a Python function | 31.4 tok/s | 69.4 tok/s |
+| a French translation | 31.3 | 58.8 |
+| the planets, one fact each | 31.4 | 53.3 |
+| how a hash map works, in 150 words | 31.5 | 37.3 |
+| TCP's handshake, in Chinese | 31.3 | 36.8 |
+
+How much it buys is how many drafts the model accepts: most of them in code,
+which says what comes next, about a third in prose. On llama-server's own three
+prompts kinfer accepted exactly the drafts llama-server's MTP drafting accepts
+from the same file — 180 of 297, 189 of 264, 178 of 303 — at the same speed, 51,
+58 and 50 tok/s. Ollama drafts with the same head: on the decode prompts of the
+comparison with it, kinfer wrote 43 tok/s and Ollama 42, where kinfer had
+written 31.5.
+
+A pass costs more the more tokens it reads — about 7 ms a token past the first
+few, draft or not — and every conversation in it pays. So drafts are shared out
+over the conversations writing: four each for one or two, two for three, one
+for four to eight, none past eight, where the head also stops reading what they
+write. The same model, conversations writing at once, tok/s together:
+
+| at once | without drafts | with |
+|---:|---:|---:|
+| 1 | 30.4 | 38.0 |
+| 2 | 38.0 | 51.3 |
+| 3 | 48.0 | 62.2 |
+| 4 | 60.8 | 89.3 |
+| 6 | 83.3 | 90.3 |
+| 8 | 102.7 | 110.7 |
+
+(Four drafts each for four conversations had made it 42.6.) Past eight it costs
+a little: no drafts are made, but each pass still writes the snapshots below —
+ten at once wrote 85.6 tok/s together, against 92.1 without. A fleet that keeps
+more than eight conversations writing is better off with `-draft -1`.
+
+It costs memory, which sizing counts: the head's own cache, as long as the
+model's, and for a hybrid model like this one a snapshot of every sequence's
+recurrent state for each draft, to go back to when one is rejected — 150 MiB a
+snapshot here. With the box service's four slots of 65536 and a pool of two,
+the context took 24.7 GiB instead of 19.9; with twelve slots of 4096 and a pool
+of four, 19.0 instead of 8.6 — the snapshots are per sequence. Reading a prompt
+went from 315 tok/s to 300: the head reads every token the model does, and the
+larger cache left room for passes of 1024 tokens rather than 2048.
+
+A mixture of experts drafts one token a step. Every token of a pass fetches its
+own experts, so each draft costs nearly a token's reading, and the head's
+guesses past the first are seldom right. ornith-1.5-35b (35B, 3B active) on the
+box, llama-server's three prompts, 256 tokens:
+
+| drafts a step | tok/s | drafts accepted |
+|---:|---|---|
+| none | 107.4, 108.7, 109.4 | |
+| 1 | 130.7, 130.9, 118.3 | 77%, 85%, 66% |
+| 2 | 107.0, 119.8, 101.3 | 43%, 53%, 40% |
+| 4 | 80.2, 84.6, 77.6 | 22%, 27%, 20% |
+
+With one a step two at once wrote 166 tok/s together instead of 149, four 229
+instead of 201; the head's layer added 0.7 GiB to the model and the snapshots
+3.5 GiB to the context. One is also the most at which a pass reads exactly what
+reading the tokens one at a time would: past two tokens a pass, Metal multiplies
+some weights with a kernel that sums in another order, and the expert router
+can turn that last-bit difference into another word where the model was torn.
+At one draft ornith's five replies were identical to its replies without; at
+two or more, three of five parted somewhere — "insert a key" became "insert a
+key-value pair", "swinging from" "swinging dramatically from", 三次完成后
+完成三次握手后 — at the same three places at two, three and four. That is the same kind of difference the prefix pool makes, and like it
+not a mistake: each word is one the model chose. A mixture of experts whose
+experts are kept in host memory does not draft unless asked, since the reads a
+draft adds come from there.
+
+`-draft N` sets how many tokens a step one conversation drafts (up to 8), and
+`-draft -1` turns it off and gives the memory back. A conversation with pictures
+is not drafted for, nor is a model split across machines. `kinfer plan -draft 4`
+shows the sizing with it; `/metrics` counts the drafts and the ones accepted,
+and the log says how many were when the model unloads.
+
+## Embeddings, beside the chat model
+
+An embedding model makes vectors instead of text: Ollama's `/api/embed`
+(`input` a text or texts; `truncate`, `dimensions`, `keep_alive`), its older
+`/api/embeddings` (`prompt`, one vector), and OpenAI's `/v1/embeddings` (`input`
+a text, texts, or tokens; `encoding_format` float or base64). `/api/embed` and
+`/v1/embeddings` answer with vectors of unit length, so a dot product is the
+cosine; `/api/embeddings` gives the model's own, as Ollama's does. `dimensions`
+keeps that many of the first values and normalizes them again — the sizes a
+Matryoshka-trained model such as EmbeddingGemma is still good at (512, 256, 128).
+
+A model embeds if its header names a pooling (`<arch>.pooling_type`: mean, the
+first token, the last), or if it is an encoder — BERT, nomic-bert, jina-bert,
+modern-bert, EmbeddingGemma — which embeds by the mean of its tokens when its
+header names none. Ollama's own copies are found the way its chat models are,
+so `nomic-embed-text` pulled with `ollama pull` answers without a download; a
+model Ollama 0.40 keeps for its MLX engine (EmbeddingGemma 2 is one) is not a
+GGUF, and is not.
+
+It loads in a place of its own, beside whatever chat model is loaded, with its
+own idle clock. That is the point: an agent asks for vectors between its turns
+— which documents to put in the prompt it is about to send — and unloading the
+chat model for them would cost the next turn a reload, half a minute for
+Flash-Next. One embedding model is loaded at a time; asking for another swaps
+it, not the chat model. It shows in `kinfer ps` and `/api/ps`, `keep_alive`
+governs it as it does a chat model, and `ollama stop` unloads it. A chat request
+naming an embedding model is refused (400) before anything is unloaded, and
+`/api/show` says `"capabilities": ["embedding"]`.
+
+Texts are read in passes of up to 16, as many as fit 8192 tokens — or the
+length the model was trained for, if shorter — and a text never spans two
+passes: an encoder reads a text both ways at once. A longer text is cut to fit,
+keeping the marker that closes it (BERT's `[SEP]`), unless `truncate` is false,
+which refuses it. Pictures and sound in `input` — Ollama 0.40 embeds them with
+EmbeddingGemma 2 — are refused for now.
+
+## Pictures, for a model with a projector
+
+A vision model reads pictures through its projector — the "mmproj" file a
+Hugging Face repo ships beside it, a layer of its own in Ollama's store. kinfer
+loads it with the model when there is one: Ollama's layer for a model borrowed
+from its store, or `NAME.mmproj.gguf` beside `NAME.gguf` in kinfer's own, which
+`kinfer pull` fetches with a vision model (F16 where the repo has it) and
+`kinfer rm` removes with it. It loads before memory is measured, its encoder
+warmed up, so the context is sized around it.
+
+Every dialect carries pictures its own way, and each is read: Ollama's `images`
+(base64, which go before the message's text), OpenAI's `image_url` content parts,
+Anthropic's `image` blocks and the Responses API's `input_image` — base64 or a
+`data:` URL. A link is refused: kinfer does not fetch a picture on a caller's
+behalf. A picture llama.cpp cannot decode (jpg, png, bmp and gif are what it
+reads) is a 400.
+
+A prompt with pictures is read whole when its turn comes, by llama.cpp's libmtmd:
+each picture encoded, then read into its conversation's cells, positions laid out
+in two dimensions where the model wants them so (Qwen-VL). It reads alone — the
+other conversations wait the second or so that takes — and the prefix pool, which
+knows a prompt by its tokens, neither lends to it nor keeps it. Nor is an older
+turn dropped to make it fit: a conversation of pictures longer than its slot is
+refused (413), as a text one too long by itself is. A picture for a model
+without a projector is refused (400), as Ollama refuses it. It used to be said in
+words where it was; told so, a 4B model described a picture it had not seen.
+
 ## `kinfer install` keeps the server up
 
 The daemon `run` starts is a plain background process: a reboot loses it, and

@@ -563,3 +563,17 @@ func TestDownloadBacksOffWhenEveryAddressIsRefused(t *testing.T) {
 		t.Errorf("asked Hugging Face for an address %d times in %s", n, patience)
 	}
 }
+
+// A file downloaded to a name of the caller's lands there, and nowhere else.
+func TestDownloadAs(t *testing.T) {
+	small(t)
+	h := serve(t, 300<<10)
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "Vis-Q4_K_M.mmproj.gguf")
+	path, err := DownloadAs(context.Background(), "o/r", "mmproj-F16.gguf", dest, 4, nil)
+	if err != nil || path != dest {
+		t.Fatalf("DownloadAs = %q, %v", path, err)
+	}
+	holds(t, dest, h.file.Load().data)
+	only(t, dir, "Vis-Q4_K_M.mmproj.gguf")
+}

@@ -45,11 +45,13 @@ type fakeEngine struct {
 	closed bool
 	inChat bool
 	params engine.GenParams // what the last request asked the engine for
+	msgs   []chat.Message   // and the conversation it sent
 }
 
-func (f *fakeEngine) Chat(ctx context.Context, _ []chat.Message, p engine.GenParams, onToken func(string)) (string, error) {
+func (f *fakeEngine) Chat(ctx context.Context, msgs []chat.Message, p engine.GenParams, onToken func(string)) (string, error) {
 	f.mu.Lock()
 	f.params = p
+	f.msgs = msgs
 	if f.closed {
 		f.mu.Unlock()
 		// The real engine segfaults here. Returning an error makes the failure
@@ -1150,6 +1152,7 @@ func (e *staleEngine) Chat(context.Context, []chat.Message, engine.GenParams, fu
 func (f *fakeEngine) Load() (waiting, busy, slots int) { return 0, 0, 1 }
 func (f *fakeEngine) PromptTokens() int64              { return 0 }
 func (f *fakeEngine) EvalTokens() int64                { return 0 }
+func (f *fakeEngine) Drafts() (int64, int64)           { return 0, 0 }
 
 // think:false must reach the engine as NoThink; anything else must not. The
 // asymmetry is deliberate — absent means the model's own default, as it does

@@ -142,6 +142,16 @@ type Options struct {
 	// CacheType is what the attention cache is kept in: "q8_0" where the
 	// model allows it (see CacheQ8), or f16 — the default.
 	CacheType string
+
+	// Projector is a vision model's projector (store.Store.ProjectorFor),
+	// loaded with it so that the model reads pictures; "" for text only.
+	Projector string
+
+	// Draft is how many tokens a step drafts with the model's MTP head, for
+	// one pass to check (see draft.go). 0 drafts four with a dense model that
+	// has a head, one with a mixture of experts, and none when its experts are
+	// in host memory; negative turns it off.
+	Draft int
 }
 
 // GenParams control one generation.
@@ -322,6 +332,10 @@ type Engine struct {
 	// changes, so the context it holds when it stops is the one to free.
 	sched *scheduler
 
+	// mtmd is the projector a vision model reads pictures through; freed
+	// after the scheduler stops, which is what uses it.
+	mtmd llama.Mtmd
+
 	// broken is set when llama.cpp reports a fatal decode. The context cannot
 	// be used again, so the server discards this engine rather than serving
 	// the same error to every request that follows.
@@ -346,6 +360,10 @@ func Open(path string, opts Options) (*Engine, error) {
 	bud := newBudget()
 	shape, _ := store.ReadShape(path)
 	shape.CacheQ8 = CacheQ8(shape, opts.CacheType)
+	var why string
+	if shape.Draft, why = Drafts(shape, opts.Draft); why != "" {
+		log.Printf("draft: none for %s — %s", filepath.Base(path), why)
+	}
 	switch {
 	case shape.CacheQ8:
 		log.Printf("cache: K and V at q8_0, about half what f16 takes")
@@ -368,6 +386,10 @@ func Open(path string, opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	if shape.Draft > 0 && len(peers) > 0 {
+		log.Printf("draft: not with the model split across machines — %s runs without drafts", filepath.Base(path))
+		shape.Draft = 0
+	}
 
 	// Where the weights go, when the operator did not say: a mixture of
 	// experts the GPU cannot hold leaves some layers' experts in host memory,
@@ -386,6 +408,17 @@ func Open(path string, opts Options) (*Engine, error) {
 			}
 		}
 		hostExperts, moeCache = placed.HostExperts, placed.MoeCache
+	}
+	if shape.Draft > 0 && hostExperts != 0 && opts.Draft == 0 {
+		// A draft's experts are read like any other token's, and these come
+		// from host memory — the SSD, when it misses — so the step it saves
+		// costs more than it did.
+		log.Printf("draft: none for %s by default — its experts are read from host memory; -draft %d asks for it", filepath.Base(path), moeDraft)
+		shape.Draft = 0
+	}
+	if shape.Draft > 0 {
+		// The head's weights stay on disk unless asked for.
+		mp.LoadMtp = 1
 	}
 	if devs != nil {
 		mp.Devices = uintptr(unsafe.Pointer(&devs[0]))
@@ -426,6 +459,17 @@ func Open(path string, opts Options) (*Engine, error) {
 	if model == 0 {
 		return nil, fmt.Errorf("load %s: llama.cpp could not read the model (see its output above)", path)
 	}
+	// A vision model reads pictures through its projector, loaded — and its
+	// encoder warmed up — before memory is measured, so the context is sized
+	// around it.
+	var mtmd llama.Mtmd
+	if opts.Projector != "" {
+		if mtmd = llama.LoadProjector(opts.Projector, model, 0); mtmd == 0 {
+			log.Printf("pictures: %s could not be loaded; the model reads text only", opts.Projector)
+		} else {
+			log.Printf("pictures: read through %s", filepath.Base(opts.Projector))
+		}
+	}
 	bud.afterModel = bud.sample()
 
 	// Whatever the operator left at zero is sized here, from the model's
@@ -458,6 +502,7 @@ func Open(path string, opts Options) (*Engine, error) {
 	if byTotal {
 		t, err := SizeTotal(shape, bud.dev.Total, left, opts.Slots)
 		if err != nil {
+			llama.FreeProjector(mtmd)
 			llama.FreeModel(model)
 			return nil, err
 		}
@@ -473,6 +518,7 @@ func Open(path string, opts Options) (*Engine, error) {
 
 	plan, err := AutoSize(shape, left, slotsWant, opts.PrefixSlots, ctx)
 	if err != nil {
+		llama.FreeProjector(mtmd)
 		llama.FreeModel(model)
 		return nil, err
 	}
@@ -527,10 +573,13 @@ func Open(path string, opts Options) (*Engine, error) {
 	}
 
 	var lctx llama.Context
+	var draft *drafter
 sizing:
 	for {
-		lctx = newContext(model, slots, prefix, perSeq, shared, ub, moeCache, shape.CacheQ8)
+		lctx, draft = openLayout(model, layout{slots: slots, prefix: prefix, perSeq: perSeq, shared: shared, ubatch: ub},
+			moeCache, shape.CacheQ8, shape.Draft)
 		if lctx == 0 {
+			llama.FreeProjector(mtmd)
 			llama.FreeModel(model)
 			return nil, fmt.Errorf("create context for %s", path)
 		}
@@ -589,6 +638,7 @@ sizing:
 		default:
 			break sizing
 		}
+		draft.free()
 		llama.FreeContext(lctx)
 	}
 	bud.report(slots, prefix, perSeq, shared)
@@ -597,7 +647,9 @@ sizing:
 	if opts.Template != "" {
 		t, err := chat.Get(opts.Template)
 		if err != nil {
+			draft.free()
 			llama.FreeContext(lctx)
+			llama.FreeProjector(mtmd)
 			llama.FreeModel(model)
 			return nil, err
 		}
@@ -612,7 +664,9 @@ sizing:
 	cells := Plan{Slots: slots, Prefix: prefix, SharedPool: shared}.Cells()
 	wantCtx := perSeq * cells
 	if actualCtx < wantCtx {
+		draft.free()
 		llama.FreeContext(lctx)
+		llama.FreeProjector(mtmd)
 		llama.FreeModel(model)
 		return nil, fmt.Errorf("asked for a %d-token context (%d slots + %d prefix slots x %d) "+
 			"but llama.cpp allocated %d "+
@@ -623,6 +677,7 @@ sizing:
 	vocab := llama.GetVocab(model)
 	e := &Engine{
 		model: model,
+		mtmd:  mtmd,
 		vocab: vocab,
 		tpl:   tpl,
 		path:  path,
@@ -668,7 +723,7 @@ sizing:
 		ub, how, gib(sub(bud.atStart, bud.afterCtx)), gib(bud.atStart))
 	var fx *flex
 	if !opts.FixedLayout {
-		fx = newFlex(home, shape.TrainedCtx, contextBuilder(model, home, bud, moeCache, shape.CacheQ8))
+		fx = newFlex(home, shape.TrainedCtx, contextBuilder(model, home, bud, moeCache, shape.CacheQ8, shape.Draft))
 	}
 	if fx != nil {
 		log.Printf("slots: %d tokens of context as %s; a prompt that needs a longer slot gets %s while it runs "+
@@ -679,12 +734,16 @@ sizing:
 	profile := newExpertProfile(path, moeCache)
 	profile.load(lctx)
 
-	e.sched = newScheduler(lctx, home, vocab, tpl, batchFor(ub), queue,
+	if draft != nil {
+		log.Printf("draft: up to %d tokens a step with the model's MTP head, for one pass to check — -draft -1 turns it off", shape.Draft)
+	}
+	e.sched = newScheduler(lctx, draft, home, vocab, tpl, batchFor(ub), queue,
 		deadlines{
 			generate: pick(opts.MaxGenerate, DefaultMaxGenerate),
 			wait:     pick(opts.MaxWait, DefaultMaxWait),
 		}, recurrent, fx)
 	e.sched.profile = profile
+	e.sched.mtmd = mtmd
 	e.sched.onFatal = func() { e.broken.Store(true) }
 	return e, nil
 }
@@ -697,24 +756,60 @@ sizing:
 // holds the same tokens, so it should cost about the same; if it does not, the
 // place to find out is here, before any batch runs in it — a batch that cannot
 // allocate retires the whole model (see thinHeadroom).
-func contextBuilder(model llama.Model, home layout, bud *budget, moeCache int, q8 bool) func(layout) (llama.Context, uint64, error) {
+func contextBuilder(model llama.Model, home layout, bud *budget, moeCache int, q8 bool, drafts int) func(layout) (llama.Context, *drafter, uint64, error) {
 	floor := sub(min(bud.afterCtx, thinHeadroom), reshapeSlack)
-	return func(l layout) (llama.Context, uint64, error) {
-		lctx := newContext(model, l.slots, l.prefix, l.perSeq, l.shared, l.ubatch, moeCache, q8)
+	return func(l layout) (llama.Context, *drafter, uint64, error) {
+		lctx, draft := openLayout(model, l, moeCache, q8, drafts)
 		if lctx == 0 {
-			return 0, 0, errors.New("llama.cpp could not create it (see its output above)")
+			return 0, nil, 0, errors.New("llama.cpp could not create it (see its output above)")
 		}
 		if got, want := llama.NCtx(lctx), l.perSeq*l.cells(); got < want {
+			draft.free()
 			llama.FreeContext(lctx)
-			return 0, 0, fmt.Errorf("llama.cpp allocated %d tokens of the %d asked for", got, want)
+			return 0, nil, 0, fmt.Errorf("llama.cpp allocated %d tokens of the %d asked for", got, want)
 		}
 		free := bud.sample()
 		if bud.known && l != home && free < floor {
+			draft.free()
 			llama.FreeContext(lctx)
-			return 0, 0, fmt.Errorf("it would leave %s free, where %s left %s", gib(free), home, gib(bud.afterCtx))
+			return 0, nil, 0, fmt.Errorf("it would leave %s free, where %s left %s", gib(free), home, gib(bud.afterCtx))
 		}
-		return lctx, free, nil
+		return lctx, draft, free, nil
 	}
+}
+
+// openLayout makes the contexts a layout runs on: the model's, and with
+// drafts the MTP head's beside it (draft.go). A head that cannot be made is
+// reported and left out; the model's context serves without it.
+func openLayout(model llama.Model, l layout, moeCache int, q8 bool, drafts int) (llama.Context, *drafter) {
+	lctx := newContext(model, l.slots, l.prefix, l.perSeq, l.shared, l.ubatch, moeCache, q8, drafts)
+	if lctx == 0 || drafts == 0 {
+		return lctx, nil
+	}
+	dctx := draftContext(model, l, q8)
+	if dctx == 0 {
+		log.Printf("draft: llama.cpp could not make the MTP head's context (see its output above) — no drafts")
+		return lctx, nil
+	}
+	draft, err := newDrafter(lctx, dctx, model, l.slots+l.prefix, drafts)
+	if err != nil {
+		llama.FreeContext(dctx)
+		log.Printf("draft: %v — no drafts", err)
+		return lctx, nil
+	}
+	return lctx, draft
+}
+
+// draftContext makes the MTP head's context for a layout of the model's: the
+// same sequences, as long, read in passes as large.
+func draftContext(model llama.Model, l layout, q8 bool) llama.Context {
+	cp := contextParams(l.slots, l.prefix, l.perSeq, l.shared, l.ubatch, 0, q8)
+	cp.CtxType = llama.ContextTypeMTP
+	// A pass asks for one row of logits per sequence drafted for, and a
+	// context keeps room for as many as it may be asked for: by default a
+	// whole micro-batch's, n_vocab floats each.
+	cp.NOutputsMax = cp.NSeqMax
+	return llama.NewContext(model, cp)
 }
 
 // batchFor is how many tokens one forward pass may hold with a micro-batch of
@@ -726,8 +821,19 @@ func batchFor(ubatch int) int {
 
 // newContext asks llama.cpp for a cache holding slots+prefix sequences of
 // perSeq tokens each — or, when the pool is shared, slots conversations' worth
-// of tokens that the pool's sequences borrow from — kept at q8_0 when q8.
-func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatch, moeCache int, q8 bool) llama.Context {
+// of tokens that the pool's sequences borrow from — kept at q8_0 when q8. With
+// drafts, each sequence of a hybrid model keeps that many snapshots of its
+// recurrent state, to go back to when drafts are rejected.
+func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatch, moeCache int, q8 bool, drafts int) llama.Context {
+	cp := contextParams(slots, prefix, perSeq, shared, ubatch, moeCache, q8)
+	if drafts > 0 && llama.HasRecurrentState(model) {
+		cp.NRsSeq = uint32(drafts)
+	}
+	return llama.NewContext(model, cp)
+}
+
+// contextParams lays out a context as newContext describes.
+func contextParams(slots, prefix, perSeq int, shared bool, ubatch, moeCache int, q8 bool) llama.ContextParams {
 	cp := llama.DefaultContextParams()
 	cp.MoeCacheSize = uint64(moeCache) << 20
 	if q8 {
@@ -753,7 +859,7 @@ func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatc
 		// prefix — here they are chosen precisely because they do.
 		cp.KVUnified = 1
 	}
-	return llama.NewContext(model, cp)
+	return cp
 }
 
 // sharedNote marks a sizing line whose pool borrows the slots' cells.
@@ -789,13 +895,22 @@ func (e *Engine) Close() {
 		// Stop decoding before anything it decodes into is freed. Once it has
 		// stopped, the context it holds is no longer touched by anything.
 		e.sched.close()
+		if d := e.sched.drafted.Load(); d > 0 {
+			a := e.sched.draftsAccepted.Load()
+			log.Printf("draft: the model accepted %d of the %d tokens its MTP head drafted for %s (%.0f%%)",
+				a, d, filepath.Base(e.path), 100*float64(a)/float64(d))
+		}
 		if e.sched.lctx != 0 {
 			e.sched.profile.save(e.sched.lctx)
+			e.sched.draft.free()
+			e.sched.draft = nil
 			llama.FreeContext(e.sched.lctx)
 			e.sched.lctx = 0
 		}
 		e.sched = nil
 	}
+	llama.FreeProjector(e.mtmd)
+	e.mtmd = 0
 	if e.model != 0 {
 		llama.FreeModel(e.model)
 		e.model = 0
@@ -830,6 +945,13 @@ func (e *Engine) PromptTokens() int64 {
 }
 func (e *Engine) EvalTokens() int64 {
 	return e.counter(func(s *scheduler) int64 { return s.evalSeen.Load() })
+}
+
+// Drafts is how many tokens the model's MTP head drafted since it loaded, and
+// how many of them the model accepted; counters too.
+func (e *Engine) Drafts() (drafted, accepted int64) {
+	return e.counter(func(s *scheduler) int64 { return s.drafted.Load() }),
+		e.counter(func(s *scheduler) int64 { return s.draftsAccepted.Load() })
 }
 
 func (e *Engine) counter(read func(*scheduler) int64) int64 {

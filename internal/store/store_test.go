@@ -470,3 +470,139 @@ func TestResolveSaysAModelIsUnfinished(t *testing.T) {
 		t.Errorf("rm of an unfinished model took the model its name begins: %+v", models)
 	}
 }
+
+// A vision model's projector sits beside it as NAME.mmproj.gguf, and is not a
+// model of its own.
+func TestProjectorBesideAModel(t *testing.T) {
+	s := newStore(t, "Vis-Q4_K_M.gguf", "Vis-Q4_K_M.mmproj.gguf", "Plain.gguf", "mmproj-F16.gguf")
+	models, _ := s.List()
+	if len(models) != 2 {
+		t.Fatalf("List = %v; a projector is not a model", names(models))
+	}
+	want := filepath.Join(s.Root(), "Vis-Q4_K_M.mmproj.gguf")
+	for _, m := range models {
+		if (m.Name == "Vis-Q4_K_M") != (m.Projector == want) {
+			t.Errorf("%s has projector %q", m.Name, m.Projector)
+		}
+	}
+	if got := s.ProjectorFor(filepath.Join(s.Root(), "Vis-Q4_K_M.gguf")); got != want {
+		t.Errorf("ProjectorFor = %q, want %q", got, want)
+	}
+	if got := s.ProjectorFor(filepath.Join(s.Root(), "Plain.gguf")); got != "" {
+		t.Errorf("a text model's projector is %q", got)
+	}
+
+	writeShards(t, s.Root(), "Big", 2, 10)
+	if err := os.WriteFile(filepath.Join(s.Root(), "Big.mmproj.gguf"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ProjectorFor(filepath.Join(s.Root(), "Big-00001-of-00002.gguf")); got != filepath.Join(s.Root(), "Big.mmproj.gguf") {
+		t.Errorf("a split model's projector is %q", got)
+	}
+}
+
+// Ollama keeps a vision model's projector as a layer of its own; a model linked
+// into kinfer's store from there finds it too.
+func TestOllamaProjector(t *testing.T) {
+	root := t.TempDir()
+	blobs := filepath.Join(root, "blobs")
+	manifests := filepath.Join(root, "manifests")
+	path := filepath.Join(manifests, "registry.ollama.ai", "library", "vis", "latest")
+	for _, dir := range []string{blobs, filepath.Dir(path)} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Ollama's store is told from an empty one by weights over a megabyte;
+	// sparse, they take no disk.
+	for name, size := range map[string]int64{"sha256-aaa": 2 << 20, "sha256-bbb": 4} {
+		f, err := os.Create(filepath.Join(blobs, name))
+		if err == nil {
+			err = f.Truncate(size)
+			f.Close()
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := `{"layers":[
+	  {"mediaType":"application/vnd.ollama.image.model","digest":"sha256:aaa","size":2097152},
+	  {"mediaType":"application/vnd.ollama.image.projector","digest":"sha256:bbb","size":4}]}`
+	if err := os.WriteFile(path, []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := readOllamaManifest(root, manifests, path)
+	if !ok || m.Name != "vis:latest" || m.Projector != filepath.Join(blobs, "sha256-bbb") {
+		t.Fatalf("readOllamaManifest = %+v, %v", m, ok)
+	}
+
+	t.Setenv("OLLAMA_MODELS", root)
+	s, _ := OpenAt(t.TempDir())
+	s.borrow = true
+	link := filepath.Join(s.Root(), "vis.gguf")
+	if err := os.Symlink(filepath.Join(blobs, "sha256-aaa"), link); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ProjectorFor(link); got != m.Projector {
+		t.Errorf("a link to Ollama's blob found projector %q, want %q", got, m.Projector)
+	}
+}
+
+// Removing a vision model removes the projector kinfer keeps beside it.
+func TestRemoveTakesTheProjector(t *testing.T) {
+	s := newStore(t, "Vis-Q4_K_M.gguf", "Vis-Q4_K_M.mmproj.gguf", "Other.gguf")
+	if err := s.Remove("Vis-Q4_K_M"); err != nil {
+		t.Fatal(err)
+	}
+	left, _ := os.ReadDir(s.Root())
+	if len(left) != 1 || left[0].Name() != "Other.gguf" {
+		var got []string
+		for _, e := range left {
+			got = append(got, e.Name())
+		}
+		t.Errorf("rm left %v", got)
+	}
+}
+
+// fakeOllama makes root an Ollama store holding library/NAME:latest, whose
+// weights are a sparse 2 MiB blob, and returns that blob's path.
+func fakeOllama(t *testing.T, root, name string) string {
+	t.Helper()
+	blob := filepath.Join(root, "blobs", "sha256-"+name)
+	manifest := filepath.Join(root, "manifests", "registry.ollama.ai", "library", name, "latest")
+	for _, dir := range []string{filepath.Dir(blob), filepath.Dir(manifest)} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f, err := os.Create(blob)
+	if err == nil {
+		err = f.Truncate(2 << 20)
+		f.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := `{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:` + name + `","size":2097152}]}`
+	if err := os.WriteFile(manifest, []byte(m), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return blob
+}
+
+// An Ollama client's bare name is its :latest tag, before any model the name
+// begins — as on the box, where "qwen3.8" also begins two of kinfer's own.
+func TestResolveTakesABareNameAsLatest(t *testing.T) {
+	root := t.TempDir()
+	blob := fakeOllama(t, root, "qwen3.8")
+	t.Setenv("OLLAMA_MODELS", root)
+	s := newStore(t, "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S.gguf", "qwen3.8-27b-q4_k_m.gguf")
+	s.borrow = true
+
+	if got, err := s.Resolve("qwen3.8"); err != nil || got != blob {
+		t.Errorf("Resolve(qwen3.8) = %q, %v; want Ollama's qwen3.8:latest", got, err)
+	}
+	if got, err := s.Resolve("qwen3.8-27b"); err != nil || filepath.Base(got) != "qwen3.8-27b-q4_k_m.gguf" {
+		t.Errorf("Resolve(qwen3.8-27b) = %q, %v; a prefix still finds the one it begins", got, err)
+	}
+}

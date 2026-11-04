@@ -235,3 +235,86 @@ func TestCacheBytesAtEightBits(t *testing.T) {
 		t.Errorf("the recurrent state changed with the cache type: %d, was %d", got, want)
 	}
 }
+
+// A model that embeds says so in its header — a pooling type — or by being an
+// encoder, which embeds whether or not its header names one.
+func TestEmbeds(t *testing.T) {
+	cases := []struct {
+		kvs  map[string]any
+		want bool
+	}{
+		{map[string]any{"general.architecture": "qwen3", "qwen3.pooling_type": uint16(3)}, true},
+		{map[string]any{"general.architecture": "nomic-bert"}, true},
+		{map[string]any{"general.architecture": "gemma-embedding2", "gemma-embedding2.pooling_type": uint16(1)}, true},
+		{map[string]any{"general.architecture": "qwen3"}, false},
+		// A reranker scores, it does not embed.
+		{map[string]any{"general.architecture": "qwen3", "qwen3.pooling_type": uint16(4)}, false},
+		// Pangu Embedded writes text, whatever its name says.
+		{map[string]any{"general.architecture": "pangu-embedded"}, false},
+	}
+	for _, c := range cases {
+		raw := ggufFile(c.kvs, nil)
+		h, err := ReadHeader(bytes.NewReader(raw), int64(len(raw)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := h.Shape.Embeds(); got != c.want {
+			t.Errorf("%v: Embeds = %v, want %v (pooling %d)", c.kvs, got, c.want, h.Shape.Pooling)
+		}
+	}
+}
+
+// Qwen3.8-27B's header counts its MTP head among its 65 blocks. The model
+// proper is the other 64 — 16 attending, 48 recurrent — and the head holds a
+// cache only when it drafts: its own layer's, as long as the model's, beside
+// snapshots of the recurrent state for every sequence to go back to.
+func TestShapeWithAnMTPHead(t *testing.T) {
+	sh := Shape{Layers: 65, Nextn: 1, MTP: true, HeadsKV: 4, Heads: 24, EmbedDim: 5120, KeyLen: 256, ValLen: 256,
+		AttnInterval: 4, SSMConv: 4, SSMState: 128, SSMGroups: 16, SSMInner: 6144}
+	if got := sh.AttnLayers(); got != 16 {
+		t.Errorf("AttnLayers = %d, want 16 of the 64 that are not the head", got)
+	}
+	perLayer := int64(3*(6144+2*16*128)+6144*128) * 4
+	if got, want := sh.RecurrentBytesPerSeq(), 48*perLayer; got != want {
+		t.Errorf("RecurrentBytesPerSeq = %d, want %d (48 recurrent layers, not 49)", got, want)
+	}
+	if got, want := sh.CacheBytes(1), int64(16*4*512*2); got != want {
+		t.Errorf("CacheBytes(1) = %d, want %d: the head has no cache until it drafts", got, want)
+	}
+
+	drafting := sh
+	drafting.Draft = 4
+	if got, want := drafting.CacheBytes(1), int64(17*4*512*2); got != want {
+		t.Errorf("drafting CacheBytes(1) = %d, want %d: the head's layer attends too", got, want)
+	}
+	if got, want := drafting.CacheBytesFor(1024, 6)-drafting.CacheBytes(1024), 6*5*sh.RecurrentBytesPerSeq(); got != want {
+		t.Errorf("drafting recurrent state for 6 sequences = %d, want %d (each its state and 4 snapshots)", got, want)
+	}
+}
+
+// The head's weights are what decide whether a model can draft: a header can
+// count a head whose weights a quantization left out.
+func TestReadShapeFindsTheMTPHead(t *testing.T) {
+	dir := t.TempDir()
+	read := func(name string, tensors []tensorEntry) Shape {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		raw := ggufFile(map[string]any{"general.architecture": "qwen35", "qwen35.nextn_predict_layers": uint16(1)}, tensors)
+		if err := os.WriteFile(p, append(raw, make([]byte, 64)...), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sh, err := ReadShape(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sh
+	}
+	with := read("with.gguf", []tensorEntry{{"blk.0.attn_q.weight", 0}, {"blk.1.nextn.eh_proj.weight", 8}})
+	if with.Nextn != 1 || !with.MTP {
+		t.Errorf("with the head's weights: Nextn %d, MTP %v; want 1, true", with.Nextn, with.MTP)
+	}
+	without := read("without.gguf", []tensorEntry{{"blk.0.attn_q.weight", 0}})
+	if without.Nextn != 1 || without.MTP {
+		t.Errorf("without them: Nextn %d, MTP %v; want 1, false", without.Nextn, without.MTP)
+	}
+}

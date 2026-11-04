@@ -86,7 +86,7 @@ func AutoSize(sh store.Shape, free uint64, slots, prefix, perSeq int) (Plan, err
 	known := sh.CacheBytes(1024) != 0 && free != 0
 	if slots > 0 && perSeq > 0 {
 		if prefixAuto && known {
-			return poolAround(sh, spendableOf(free), slots, prefix, perSeq), nil
+			return poolAround(sh, free, slots, prefix, perSeq), nil
 		}
 		return Plan{Slots: slots, Prefix: prefix, PerSeq: perSeq,
 			Estimated: sh.CacheBytesFor(perSeq*(slots+prefix), slots+prefix)}, nil
@@ -306,19 +306,32 @@ func spendableOf(free uint64) int64 {
 // operator's conversations never pay for a pool nobody asked for. The measured
 // check in Open backs this up, because a hybrid model's cache can cost more
 // than this estimate.
-func poolAround(sh store.Shape, spendable int64, slots, want, perSeq int) Plan {
+//
+// A pool sharing the slots' cells costs only what each of its sequences holds
+// besides them — a hybrid model's recurrent state, and nothing for any other —
+// so it is held to what the slots leave of the memory they were sized against
+// (free less fitReserve, as SizeTotal sizes them), not to spendable: slots that
+// took more than spendable left no room for any pool by that measure, and
+// without a pool no turn reuses the one before. On the box, beside Ollama's
+// ornith, qwen3.8's four slots of 32768 took 8.6 GiB of the 15.4 left and its
+// pool got nothing: a conversation's second turn read all 7,851 tokens again,
+// 26 s where Ollama took 0.3.
+func poolAround(sh store.Shape, free uint64, slots, want, perSeq int) Plan {
+	spendable := spendableOf(free)
 	most := min(want, max(slots/2, 1))
 	for p := most; p >= 1; p-- {
 		if c := sh.CacheBytesFor(perSeq*(slots+p), slots+p); c <= spendable {
 			return Plan{Slots: slots, Prefix: p, PerSeq: perSeq, Estimated: c}
 		}
 	}
+	base := sh.CacheBytesFor(perSeq*slots, slots)
+	room := max(spendable, int64(sub(free, fitReserve))) - base
 	for p := most; p >= 1; p-- {
-		if c := sh.CacheBytesFor(perSeq*slots, slots+p); c <= spendable {
+		if c := sh.CacheBytesFor(perSeq*slots, slots+p); c-base <= room {
 			return Plan{Slots: slots, Prefix: p, PerSeq: perSeq, SharedPool: true, Estimated: c}
 		}
 	}
-	return Plan{Slots: slots, PerSeq: perSeq, Estimated: sh.CacheBytesFor(perSeq*slots, slots)}
+	return Plan{Slots: slots, PerSeq: perSeq, Estimated: base}
 }
 
 // sizedPlan is the largest context s slots and p pool entries fit in, capped

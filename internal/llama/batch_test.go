@@ -87,3 +87,23 @@ func TestBatchBuilderResetAndOverflow(t *testing.T) {
 		t.Error("Reset left a stale logits flag, which would compute an output nobody reads")
 	}
 }
+
+// struct llama_embd, which a drafting batch takes by value: a pointer and two
+// size_t, 24 bytes (llama.h at b11998).
+func TestEmbdMatchesC(t *testing.T) {
+	var e llamaEmbd
+	if unsafe.Sizeof(e) != 24 || unsafe.Offsetof(e.nRows) != 8 || unsafe.Offsetof(e.nEmbd) != 16 {
+		t.Errorf("llamaEmbd: size %d, n_rows at %d, n_embd at %d; C has 24, 8, 16",
+			unsafe.Sizeof(e), unsafe.Offsetof(e.nRows), unsafe.Offsetof(e.nEmbd))
+	}
+}
+
+// The drafter reads a batch back token by token, as it was built.
+func TestBatchBuilderAt(t *testing.T) {
+	b := NewBatchBuilder(4)
+	b.Add(11, 5, 2, false)
+	b.Add(12, 6, 2, true)
+	if tok, pos, seq := b.At(1); tok != 12 || pos != 6 || seq != 2 {
+		t.Errorf("At(1) = %d, %d, %d; want 12, 6, 2", tok, pos, seq)
+	}
+}

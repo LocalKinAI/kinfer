@@ -45,6 +45,11 @@ type Shape struct {
 	// but it changes what batching buys, so fit says so.
 	Experts int
 
+	// Pooling is how an embedding model makes one vector of a text's tokens —
+	// pooling_type: 1 their mean, 2 the first, 3 the last — and 0 for a model
+	// that writes text (4 is a reranker's score). See Embeds.
+	Pooling int
+
 	// LazyBytes is the part of the files llama.cpp leaves on disk and reads a
 	// row at a time, summed over every shard: a model's size less this is
 	// what it takes in memory. See ReadsLazily.
@@ -70,6 +75,24 @@ type Shape struct {
 	// sizes a context sets it to what that context will be asked for, as
 	// engine.Open does.
 	CacheQ8 bool
+
+	// Nextn is how many of the Layers are a multi-token-prediction head
+	// (nextn_predict_layers) rather than the model proper: trained to guess
+	// the token after next, which is what drafting runs on. llama.cpp loads
+	// them only when asked to, and keeps their cache in a context of its own.
+	Nextn int
+
+	// MTP says the file carries that head's weights. A quantization can leave
+	// them out and keep the header's count, and llama.cpp then loads the
+	// model as if it had a head it cannot run.
+	MTP bool
+
+	// Draft is how many tokens a step drafts with that head, 0 for none. Like
+	// CacheQ8 it is set by whoever sizes a context. Drafting adds the head's
+	// own attention cache, and has each sequence of a hybrid model keep Draft
+	// snapshots of its recurrent state, to go back to when a draft is
+	// rejected.
+	Draft int
 }
 
 // ReadsLazily reports whether the embedded llama.cpp reads part of an
@@ -150,6 +173,10 @@ func (h Header) eachTensor(fn func(name string, size int64)) {
 var (
 	layerTensor  = regexp.MustCompile(`^blk\.(\d+)\.`)
 	expertTensor = regexp.MustCompile(`^blk\.\d+\.ffn_(up|down|gate|gate_up)_(ch|)exps\.`)
+
+	// nextnTensor is the projection an MTP head opens with (LLM_TENSOR_NEXTN_EH_PROJ),
+	// which every head has.
+	nextnTensor = regexp.MustCompile(`^blk\.\d+\.nextn\.eh_proj\.`)
 )
 
 // account adds this file's tensors to sh, a model of arch: what is read
@@ -162,6 +189,9 @@ func (h Header) account(sh *Shape, arch string) {
 			return
 		}
 		sh.WeightBytes += size
+		if nextnTensor.MatchString(name) {
+			sh.MTP = true
+		}
 		m := layerTensor.FindStringSubmatch(name)
 		if m == nil {
 			return
@@ -190,13 +220,16 @@ func (s Shape) HeadDim() int {
 	return 0
 }
 
-// AttnLayers is how many layers hold a KV cache.
+// AttnLayers is how many layers of the model proper hold a KV cache.
 func (s Shape) AttnLayers() int {
 	if s.AttnInterval > 1 {
-		return s.Layers / s.AttnInterval
+		return s.trunk() / s.AttnInterval
 	}
-	return s.Layers
+	return s.trunk()
 }
+
+// trunk is the model's layers without its MTP head.
+func (s Shape) trunk() int { return s.Layers - s.Nextn }
 
 // CacheBytes estimates the attention cache for a total token count: two bytes
 // per element at f16 (17/16 of one at q8_0, see CacheQ8), K and V, one entry
@@ -217,7 +250,12 @@ func (s Shape) CacheBytes(tokens int) int64 {
 	if v == 0 {
 		v = d
 	}
-	elems := int64(tokens) * int64(s.AttnLayers()) * int64(s.HeadsKV) * int64(d+v)
+	layers := s.AttnLayers()
+	if s.Draft > 0 {
+		// The head attends too, over a cache as long as the model's.
+		layers += s.Nextn
+	}
+	elems := int64(tokens) * int64(layers) * int64(s.HeadsKV) * int64(d+v)
 	if s.CacheQ8 {
 		return elems * 34 / 32
 	}
@@ -234,7 +272,7 @@ func (s Shape) RecurrentBytesPerSeq() int64 {
 	if s.AttnInterval <= 1 || s.SSMInner == 0 || s.SSMState == 0 {
 		return 0
 	}
-	recurrent := s.Layers - s.AttnLayers()
+	recurrent := s.trunk() - s.AttnLayers()
 	conv := int64(max(s.SSMConv-1, 0)) * int64(s.SSMInner+2*s.SSMGroups*s.SSMState)
 	state := int64(s.SSMInner) * int64(s.SSMState)
 	return int64(recurrent) * (conv + state) * 4
@@ -242,13 +280,29 @@ func (s Shape) RecurrentBytesPerSeq() int64 {
 
 // CacheBytesFor is the whole cache for tokens spread over seqs sequences: the
 // attention part, which scales with tokens, plus the recurrent part, which
-// scales with sequences.
+// scales with sequences — and with the snapshots drafting keeps of it.
 func (s Shape) CacheBytesFor(tokens, seqs int) int64 {
 	attn := s.CacheBytes(tokens)
 	if attn == 0 {
 		return 0
 	}
-	return attn + int64(seqs)*s.RecurrentBytesPerSeq()
+	return attn + int64(seqs)*int64(1+s.Draft)*s.RecurrentBytesPerSeq()
+}
+
+// encoders are the architectures that only embed: they read a text both ways
+// and write nothing, so even a file whose header names no pooling is one to
+// embed with (by the mean of its tokens, as sentence-transformers does).
+// "pangu-embedded" is not among them: Pangu Embedded writes text.
+var encoders = map[string]bool{
+	"bert": true, "modern-bert": true, "nomic-bert": true, "nomic-bert-moe": true, "neo-bert": true,
+	"jina-bert-v2": true, "jina-bert-v3": true, "eurobert": true,
+	"gemma-embedding": true, "gemma-embedding2": true, "llama-embed": true,
+}
+
+// Embeds says whether the model makes vectors of text rather than writing it:
+// nomic-embed-text, bge-m3, EmbeddingGemma, Qwen3-Embedding.
+func (s Shape) Embeds() bool {
+	return (s.Pooling >= 1 && s.Pooling <= 3) || encoders[s.Arch]
 }
 
 // ReadShape reads a GGUF model's header — from its first file, for a split
@@ -371,6 +425,8 @@ func ReadHeader(r io.Reader, fileSize int64) (Header, error) {
 			sh.TrainedCtx = int(n)
 		case strings.HasSuffix(key, ".expert_count"):
 			sh.Experts = int(n)
+		case strings.HasSuffix(key, ".pooling_type"):
+			sh.Pooling = int(n)
 		case strings.HasSuffix(key, ".attention.key_length"):
 			sh.KeyLen = int(n)
 		case strings.HasSuffix(key, ".attention.value_length"):
@@ -385,6 +441,8 @@ func ReadHeader(r io.Reader, fileSize int64) (Header, error) {
 			sh.SSMGroups = int(n)
 		case strings.HasSuffix(key, ".ssm.inner_size"):
 			sh.SSMInner = int(n)
+		case strings.HasSuffix(key, ".nextn_predict_layers"):
+			sh.Nextn = int(n)
 		case key == "tokenizer.ggml.tokens":
 			if a, ok := v.(arrayLen); ok {
 				sh.Vocab = int(a)

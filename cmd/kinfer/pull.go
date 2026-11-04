@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -65,7 +66,17 @@ func cmdPull(args []string) error {
 	default:
 		fmt.Printf("pulling %s\n", pick.Name)
 	}
-	if err := hub.Room(st.Root(), set); err != nil {
+	// A vision model reads pictures through its projector, which comes with
+	// it, kept as NAME.mmproj.gguf beside it: every repo calls its own
+	// mmproj-F16.gguf.
+	want := set
+	proj, sees := hub.Projector(files)
+	if sees {
+		m.total += proj.Size
+		want = append(append([]hub.File(nil), set...), hub.File{Name: hub.ProjectorName(set), Size: proj.Size})
+		fmt.Printf("  and %s (%s), the projector it reads pictures with\n", proj.Name, store.HumanSize(proj.Size))
+	}
+	if err := hub.Room(st.Root(), want); err != nil {
 		return err
 	}
 
@@ -80,6 +91,15 @@ func cmdPull(args []string) error {
 		}
 		if first == "" {
 			first = path
+		}
+		checked = checked && m.last.Total > 0 && m.last.Checked == m.last.Total
+	}
+	if sees {
+		m.start(proj.Name)
+		_, err := hub.DownloadAs(ctx, ref.Repo, proj.Name, filepath.Join(st.Root(), hub.ProjectorName(set)), *conns, m.show)
+		m.end()
+		if err != nil {
+			return err
 		}
 		checked = checked && m.last.Total > 0 && m.last.Checked == m.last.Total
 	}

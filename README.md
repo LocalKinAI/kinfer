@@ -184,7 +184,10 @@ several. How it works, and every measurement behind it:
 - **Serving** ([docs/serving.md](docs/serving.md)): `run` keeps a model warm in
   a daemon; `serve` sizes the context, the slots and the micro-batch to the model
   and the memory left; a prompt too long for its slot gets a longer one;
-  `install` keeps the server up; every reply carries its timings; `/metrics`; a
+  `install` keeps the server up; embeddings (`/api/embed`, `/v1/embeddings`) from a
+  model loaded beside the chat model; pictures, for a model with a projector; a
+  model with an MTP head drafts its next tokens (Qwen3.8-27B: 31.5 → 37–69 tok/s);
+  every reply carries its timings; `/metrics`; a
   bounded queue that refuses rather than hangs; `fit`, `plan` and `can-run` size
   a model before it is loaded or downloaded.
 - **Agents** ([docs/agents.md](docs/agents.md)): a prefix pool, so a repeated

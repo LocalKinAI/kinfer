@@ -100,11 +100,16 @@ func (p permanent) Unwrap() error { return p.error }
 // so neither an interrupted pull nor a resume gone wrong can leave something
 // that looks like a usable model.
 func Download(ctx context.Context, repo, filename, dir string, conns int, onProgress Progress) (string, error) {
+	return DownloadAs(ctx, repo, filename, filepath.Join(dir, filepath.Base(filename)), conns, onProgress)
+}
+
+// DownloadAs is Download to a name of the caller's: a projector, which
+// repos all call mmproj-F16.gguf, kept as its model's NAME.mmproj.gguf.
+func DownloadAs(ctx context.Context, repo, filename, final string, conns int, onProgress Progress) (string, error) {
 	if onProgress == nil {
 		onProgress = func(Status) {}
 	}
 	conns = max(conns, 1)
-	final := filepath.Join(dir, filepath.Base(filename))
 	c := newClients(conns)
 
 	src := fmt.Sprintf("%s/%s/resolve/main/%s", endpoint(), repo, filename)
@@ -160,7 +165,7 @@ func Download(ctx context.Context, repo, filename, dir string, conns int, onProg
 // Room says whether the disk dir is on can take what files still need and
 // keep diskFloor free. A file here already needs nothing, and one an earlier
 // pull stopped in only what that pull did not fetch. Sizes are as List
-// reports them.
+// reports them; each file is kept in dir under the base of its Name.
 func Room(dir string, files []File) error {
 	avail, err := diskFree(dir)
 	if err != nil {

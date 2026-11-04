@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"unsafe"
 
@@ -192,6 +193,10 @@ var (
 	vocabEOS           func(v Vocab) Token
 	tokenToPiece       func(v Vocab, t Token, buf *byte, length, lstrip int32, special bool) int32
 	nCtx               func(c Context) uint32
+	poolingType        func(c Context) int32
+	modelNCtxTrain     func(m Model) int32
+	modelNEmbdOut      func(m Model) int32
+	getEmbeddingsSeq   func(c Context, seq int32) *float32
 
 	samplerChainDefault func() SamplerChainParams
 	samplerChainInit    func(p SamplerChainParams) Sampler
@@ -295,6 +300,10 @@ func bind(dir string) error {
 		{&vocabEOS, "llama_vocab_eos"},
 		{&tokenToPiece, "llama_token_to_piece"},
 		{&nCtx, "llama_n_ctx"},
+		{&poolingType, "llama_pooling_type"},
+		{&modelNCtxTrain, "llama_model_n_ctx_train"},
+		{&modelNEmbdOut, "llama_model_n_embd_out"},
+		{&getEmbeddingsSeq, "llama_get_embeddings_seq"},
 		{&samplerChainDefault, "llama_sampler_chain_default_params"},
 		{&samplerChainInit, "llama_sampler_chain_init"},
 		{&samplerChainAdd, "llama_sampler_chain_add"},
@@ -327,7 +336,9 @@ func bind(dir string) error {
 	bindRPC(dir)
 	bindCPU(dir)
 	bindProfile(lib)
+	bindMTP(lib)
 	bindWarm(dir)
+	bindMtmd(dir)
 	return nil
 }
 
@@ -561,6 +572,15 @@ func ForgetSequence(c Context, seq int32, p0, p1 int32) {
 	memorySeqRm(getMemory(c), seq, p0, p1)
 }
 
+// TrimSequence drops seq's cells from position p0 on, and reports whether it
+// could. A recurrent layer's state can go back only as far as the snapshots
+// the context keeps (ContextParams.NRsSeq), and not at all while another
+// sequence shares it; ForgetSequence would carry on regardless, with the cache
+// still holding what it was meant to have dropped.
+func TrimSequence(c Context, seq, p0 int32) bool {
+	return memorySeqRm(getMemory(c), seq, p0, -1)
+}
+
 // CopySequence makes dst share src's KV cells over [p0, p1).
 //
 // It does not copy anything: llama.cpp tags the existing cells with a second
@@ -569,6 +589,40 @@ func ForgetSequence(c Context, seq int32, p0, p1 int32) {
 // free.
 func CopySequence(c Context, src, dst int32, p0, p1 int32) {
 	memorySeqCp(getMemory(c), src, dst, p0, p1)
+}
+
+// ─── embeddings ──────────────────────────────────────────────────────────────
+
+// How a context made with ContextParams.Embeddings turns a sequence's tokens
+// into one vector: llama_pooling_type. Unspecified, in ContextParams.PoolingType,
+// takes what the model's header says.
+const (
+	PoolingUnspecified int32 = -1
+	PoolingNone        int32 = 0
+	PoolingMean        int32 = 1
+	PoolingCLS         int32 = 2
+	PoolingLast        int32 = 3
+	PoolingRank        int32 = 4 // a reranker's score, not a vector
+)
+
+// PoolingOf is the pooling a context uses.
+func PoolingOf(c Context) int32 { return poolingType(c) }
+
+// TrainedCtx is the context the model was trained for, in tokens.
+func TrainedCtx(m Model) int { return int(modelNCtxTrain(m)) }
+
+// EmbedDims is how long a vector the model makes is.
+func EmbedDims(m Model) int { return int(modelNEmbdOut(m)) }
+
+// SeqEmbedding copies out sequence seq's pooled vector, of dims values, from
+// the last decode; nil when the context pools nothing. llama.cpp's own buffer
+// is overwritten by the next decode, hence the copy.
+func SeqEmbedding(c Context, seq int32, dims int) []float32 {
+	p := getEmbeddingsSeq(c, seq)
+	if p == nil || dims <= 0 {
+		return nil
+	}
+	return slices.Clone(unsafe.Slice(p, dims))
 }
 
 // ─── multi-sequence batches ──────────────────────────────────────────────────
@@ -618,6 +672,11 @@ func (b *BatchBuilder) Len() int { return b.n }
 
 // Reset empties the batch.
 func (b *BatchBuilder) Reset() { b.n = 0 }
+
+// At is the token at index i of the batch, with its position and sequence.
+func (b *BatchBuilder) At(i int) (tok Token, pos, seq int32) {
+	return b.tokens[i], b.pos[i], b.seqIDs[i]
+}
 
 // Add appends one token of sequence seq at position pos, returning the index to
 // read its logits at. Returns -1 if the batch is full.

@@ -77,13 +77,13 @@ const minPrefixMatch = 128
 // 1, 8 and 24 streams — but it climbs because more tokens are in flight, not
 // because they are cheap.
 //
-// The consequence worth writing down is for speculative decoding, which has not
-// been built and on this evidence should not be. It works by putting k drafted
-// tokens into one pass and verifying them together, and it pays only when that
-// fatter pass is nearly free — exactly the property the table says is missing.
-// Feeding the measured step times through the usual expectation, (1-a^(k+1))
-// over (1-a) tokens of progress per step for a per-token acceptance a, with the
-// draft model's own passes charged for:
+// The consequence worth writing down is for speculative decoding (draft.go),
+// of which a mixture of experts gets one token a step. It works by putting k
+// drafted tokens into one pass and verifying them together, and it pays only
+// when that fatter pass is nearly free — exactly the property the table says
+// is missing. Feeding the measured step times through the usual expectation,
+// (1-a^(k+1)) over (1-a) tokens of progress per step for a per-token
+// acceptance a, with the draft model's own passes charged for:
 //
 //	                        per stream, baseline -> speculative
 //	ornith  N=1  k=3 a=0.9   69.9 -> 102.6 tok/s   +47%
@@ -96,7 +96,11 @@ const minPrefixMatch = 128
 // Speculation buys a lot for one stream and nothing for eight, and below about
 // 90% acceptance it costs, because a rejected draft is wasted expert traffic
 // rather than wasted arithmetic. A fleet of agents lives in the bottom rows.
-// One person waiting for one answer lives in the top ones.
+// One person waiting for one answer lives in the top ones. Measured since, with
+// the models' own MTP heads drafting: ornith-1.5-35b fell from 108 tok/s to
+// 78-85 at four drafts, accepting one in five, and rose to 118-131 at one,
+// accepting two in three or more — and Qwen3.8-27B, which is dense and reads
+// every weight for one token as for five, rose from 31.5 to 37-69 at four.
 //
 // Exactly one goroutine — run — touches the context. Everything else hands it
 // work over a channel. A llama.cpp context is mutable state with no locking of
@@ -117,6 +121,11 @@ type scheduler struct {
 	// wholePrefixes is the pool's rule for a model with recurrent state, kept
 	// so a rebuilt context's pool follows it too; see prefixPool.exact.
 	wholePrefixes bool
+
+	// draft guesses each generating slot's next tokens with the model's MTP
+	// head, for one pass to check; nil when the model has none or drafting is
+	// off. It is rebuilt with the context. See draft.go.
+	draft *drafter
 
 	// flex rebuilds the context in another layout when a prompt needs longer
 	// slots, and back when nothing does; nil keeps the layout it loaded with.
@@ -140,6 +149,12 @@ type scheduler struct {
 	// engine can be marked unusable and replaced rather than kept in service.
 	onFatal func()
 
+	// mtmd reads pictures, when the model has a projector. fatal is a failure
+	// that ended the context outside a step — reading pictures — which the
+	// next step reports as its own.
+	mtmd  llama.Mtmd
+	fatal error
+
 	incoming chan *job
 	stop     chan struct{}
 	stopped  chan struct{}
@@ -158,6 +173,10 @@ type scheduler struct {
 	promptSeen atomic.Int64
 	evalSeen   atomic.Int64
 
+	// drafted and draftsAccepted count the MTP head's drafts the model read
+	// and the ones it agreed with, across every context this scheduler had.
+	drafted, draftsAccepted atomic.Int64
+
 	// debug counters, printed when KINFER_DEBUG_SCHED is set. Batch
 	// composition is the thing worth watching: if steps mostly carry one token
 	// the slots are not filling and the batching is theoretical.
@@ -169,6 +188,9 @@ type scheduler struct {
 	promptTok int
 	reusedTok int
 	lastLog   time.Time
+
+	// The drafting counters as the last debug line left them.
+	loggedDrafts, loggedAccepted int64
 
 	// Where a step's time goes, for the same debug line: queueing the forward
 	// pass, waiting for the GPU to finish it, and sampling. What is left of the
@@ -196,6 +218,10 @@ type job struct {
 	// to follow the prompt.
 	resume []llama.Token
 
+	// media is a prompt with pictures, cut into text and picture chunks in
+	// place of full; see prepareMedia.
+	media *llama.MediaPrompt
+
 	// frags carries generated text; it is closed when the reply ends. err holds
 	// the failure, if any, and is only read after frags is closed.
 	frags chan string
@@ -208,6 +234,8 @@ type job struct {
 }
 
 func (j *job) finish(err error) {
+	j.media.Free()
+	j.media = nil
 	j.err = err
 	close(j.frags)
 	close(j.done)
@@ -229,6 +257,14 @@ type slot struct {
 	nPast  int32 // tokens of this sequence already in the KV cache
 	reused int   // tokens of nPast that came from the prefix pool
 	next   llama.Token
+
+	// drafts are the tokens the MTP head expects after next, read with it in
+	// this step's pass; see draft.go.
+	drafts []llama.Token
+
+	// media is how many cells a prompt with pictures took, read whole by
+	// startMedia; its prompt is then empty, and nPast its last position.
+	media int
 
 	// publishLen is how much of the prompt to pool once the decode that just
 	// landed is in the cache, or 0 for nothing; publishShared marks it as a
@@ -268,7 +304,7 @@ type slot struct {
 // newScheduler takes over lctx, laid out as home: from here on the scheduler
 // owns the context, frees and rebuilds it when fx changes the layout, and hands
 // whatever context it holds last to the engine to free once it has stopped.
-func newScheduler(lctx llama.Context, home layout, vocab llama.Vocab, tpl *chat.Template, batchCap, maxQueue int, limits deadlines, wholePrefixes bool, fx *flex) *scheduler {
+func newScheduler(lctx llama.Context, draft *drafter, home layout, vocab llama.Vocab, tpl *chat.Template, batchCap, maxQueue int, limits deadlines, wholePrefixes bool, fx *flex) *scheduler {
 	s := &scheduler{
 		vocab:         vocab,
 		tpl:           tpl,
@@ -281,7 +317,7 @@ func newScheduler(lctx llama.Context, home layout, vocab llama.Vocab, tpl *chat.
 		stopped:       make(chan struct{}),
 		debug:         os.Getenv("KINFER_DEBUG_SCHED") != "",
 	}
-	s.install(lctx, home)
+	s.install(lctx, draft, home)
 	go s.run()
 	return s
 }
@@ -348,7 +384,7 @@ func (s *scheduler) run() {
 			return
 		}
 
-		if s.active() == 0 {
+		if s.active() == 0 && s.fatal == nil {
 			// Nothing to do. Block rather than spin — an idle fleet should not
 			// keep a core warm.
 			select {
@@ -480,6 +516,13 @@ func (s *scheduler) prepare(j *job) bool {
 	if !s.stillWanted(j) {
 		return false
 	}
+	if showsPictures(j.msgs) {
+		if s.mtmd == 0 {
+			j.finish(PictureError{ErrNoPictures})
+			return false
+		}
+		return s.prepareMedia(j)
+	}
 	full, err := s.tokenizer(j)(j.msgs)
 	if err == nil {
 		j.resume, err = s.resumeTokens(j)
@@ -527,6 +570,10 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	if !s.stillWanted(j) {
 		return
 	}
+	if j.media != nil {
+		s.startMedia(sl, j)
+		return
+	}
 
 	render := s.renderer(j)
 	tokenize := s.tokenizer(j)
@@ -571,7 +618,7 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 	// The previous occupant's cells are still tagged with this seq_id. Drop
 	// them, and only them: clearing the whole cache would take the other slots'
 	// conversations with it.
-	llama.ForgetSequence(s.lctx, sl.seq, -1, -1)
+	s.forget(sl.seq)
 
 	// Adopt whatever of this prompt is already in the cache. An agent's system
 	// prompt is identical on every turn it takes, so this is usually most of
@@ -652,9 +699,16 @@ func (s *scheduler) startIn(sl *slot, j *job) {
 		s.reusedTok += reused
 	}
 
+	s.occupy(sl, j, tokens, reused, checkpoints, maxGen)
+}
+
+// occupy gives sl to j, its prompt tokens read as far as reused, to reply in
+// up to maxGen tokens.
+func (s *scheduler) occupy(sl *slot, j *job, tokens []llama.Token, reused int, checkpoints []checkpoint, maxGen int) {
 	sl.job = j
 	s.busy.Add(1)
 	sl.prompt = tokens
+	sl.media = 0
 	sl.nPast = int32(reused)
 	sl.reused = reused
 	sl.publishLen = 0
@@ -723,9 +777,13 @@ func (s *scheduler) active() int {
 // step builds one batch across every active slot, decodes it once, and samples
 // a token for each slot that asked for logits.
 func (s *scheduler) step() error {
+	if err := s.fatal; err != nil {
+		s.fatal = nil
+		return err
+	}
 	s.batch.Reset()
 
-	var prefilling []*slot
+	var prefilling, generating []*slot
 	for _, sl := range s.slots {
 		if sl.job == nil {
 			continue
@@ -742,10 +800,25 @@ func (s *scheduler) step() error {
 		if int(sl.nPast) < len(sl.prompt) {
 			prefilling = append(prefilling, sl)
 		} else {
-			// Generating slots go in first: one token each, never displaced
-			// by however much prompt is waiting behind them.
-			s.addDecode(sl)
+			generating = append(generating, sl)
 		}
+	}
+	if s.draft != nil {
+		if each := draftsEach(len(generating)); each > 0 {
+			s.draft.propose(generating, func(sl *slot) int { return min(each, s.allowance(sl)) })
+		} else {
+			// Too many are writing for drafts to pay, and the head would read
+			// every token they write for nothing: it stops following them,
+			// and follows each slot again from its next request.
+			for _, sl := range generating {
+				s.draft.untrack(sl.seq)
+			}
+		}
+	}
+	// Generating slots go in first: a token each, and its drafts, never
+	// displaced by however much prompt is waiting behind them.
+	for _, sl := range generating {
+		s.addDecode(sl)
 	}
 	for _, sl := range prefillOrder(prefilling) {
 		s.addPrefill(sl)
@@ -765,6 +838,10 @@ func (s *scheduler) step() error {
 					s.admitted, s.promptTok, s.reusedTok,
 					100*float64(s.reusedTok)/float64(s.promptTok))
 			}
+			if d, a := s.drafted.Load()-s.loggedDrafts, s.draftsAccepted.Load()-s.loggedAccepted; d > 0 {
+				reuse += fmt.Sprintf("   drafts %d, %.0f%% accepted", d, 100*float64(a)/float64(d))
+			}
+			s.loggedDrafts, s.loggedAccepted = s.drafted.Load(), s.draftsAccepted.Load()
 			ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) / float64(s.steps) }
 			wall := float64(time.Since(s.lastLog)) / float64(time.Millisecond) / float64(s.steps)
 			log.Printf("sched: %4d steps/s   mean batch %5.1f tokens   mean active slots %4.1f   "+
@@ -821,6 +898,12 @@ func (s *scheduler) step() error {
 		if s.debug {
 			s.tWait += now.Sub(decoded)
 		}
+	}
+	// The head reads what the model just read before anything is pooled or
+	// sampled: a pooled prompt takes the head's cells with it, and a rejected
+	// draft takes them back.
+	if s.draft != nil {
+		s.draft.catchUp(s.batch)
 	}
 
 	for _, sl := range s.slots {
@@ -904,20 +987,35 @@ func (s *scheduler) addPrefill(sl *slot) {
 	}
 }
 
-// addDecode queues the one token a generating slot needs this step.
+// addDecode queues the token a generating slot reads this step, and the
+// drafts that follow it, each with its logits to check the draft after it by.
 func (s *scheduler) addDecode(sl *slot) {
-	if s.batch.Cap()-s.batch.Len() <= 0 {
+	room := s.batch.Cap() - s.batch.Len()
+	if room <= 0 {
+		sl.drafts = sl.drafts[:0]
 		return
 	}
+	sl.drafts = sl.drafts[:min(len(sl.drafts), room-1)]
 	idx := s.batch.Add(sl.next, sl.nPast, sl.seq, true)
-	if idx < 0 {
-		return
+	for i, d := range sl.drafts {
+		s.batch.Add(d, sl.nPast+1+int32(i), sl.seq, true)
 	}
 	sl.logitIdx = idx
-	sl.nPast++
+	sl.nPast += 1 + int32(len(sl.drafts))
 }
 
-// harvest samples a slot's next token and decides whether it is finished.
+// allowance is how many tokens may be drafted for a generating slot: as many
+// as still fit its context and its reply's budget after the one it reads.
+func (s *scheduler) allowance(sl *slot) int {
+	if sl.media > 0 {
+		return 0 // the head did not read the pictures
+	}
+	return min(s.ctxPerSeq-int(sl.nPast)-1, sl.maxGen-sl.nGen-1)
+}
+
+// harvest samples a slot's next token and decides whether it is finished —
+// and with drafts, the token after each the model agrees with, until one it
+// does not: the token it wrote there instead is the last this step.
 //
 // now is when the decode these logits came from finished.
 func (s *scheduler) harvest(sl *slot, now time.Time) {
@@ -933,23 +1031,53 @@ func (s *scheduler) harvest(sl *slot, now time.Time) {
 		sl.evalStart = now
 	}
 
-	var t0 time.Time
-	if s.debug {
-		t0 = time.Now()
+	drafts := sl.drafts
+	sl.drafts = sl.drafts[:0]
+	first := sl.nPast - 1 - int32(len(drafts)) // the position read at idx
+	n, goesOn := checkDrafts(drafts,
+		func(i int) llama.Token {
+			var t0 time.Time
+			if s.debug {
+				t0 = time.Now()
+			}
+			tok := sl.sampler.Sample(s.lctx, idx+int32(i))
+			if s.debug {
+				s.tSample += time.Since(t0)
+			}
+			return tok
+		},
+		func(tok llama.Token, i int) bool { return s.take(sl, tok, first+int32(i)+1) })
+	s.drafted.Add(int64(len(drafts)))
+	s.draftsAccepted.Add(int64(n))
+	if !goesOn || n == len(drafts) {
+		return
 	}
-	tok := sl.sampler.Sample(s.lctx, idx)
-	if s.debug {
-		s.tSample += time.Since(t0)
+	// The model wrote something else after the n-th draft, so what it read past
+	// that was the wrong text: back to just after it.
+	last := first + int32(n)
+	if s.draft != nil {
+		s.draft.settle(sl.seq, last, idx+int32(n))
 	}
+	if !llama.TrimSequence(s.lctx, sl.seq, last+1) {
+		s.release(sl, fmt.Errorf("the model could not go back over %d rejected drafts", len(drafts)-n))
+		return
+	}
+	sl.nPast = last + 1
+}
+
+// take adds a token to a slot's reply and reports whether the slot goes on,
+// false when the token ended it. past is the slot's positions in the cache
+// with the token it was sampled at.
+func (s *scheduler) take(sl *slot, tok llama.Token, past int32) bool {
 	if llama.IsEOG(s.vocab, tok) {
 		s.finishSlot(sl)
-		return
+		return false
 	}
 
 	piece := llama.TokenToPiece(s.vocab, tok, false)
 	if piece == "" {
 		s.finishSlot(sl)
-		return
+		return false
 	}
 	sl.out.WriteString(piece)
 	sl.next = tok
@@ -977,12 +1105,14 @@ func (s *scheduler) harvest(sl *slot, now time.Time) {
 
 	if hitStop {
 		s.finishSlot(sl)
-		return
+		return false
 	}
-	if sl.nGen >= sl.maxGen || int(sl.nPast) >= s.ctxPerSeq {
+	if sl.nGen >= sl.maxGen || int(past) >= s.ctxPerSeq {
 		sl.job.stats.Truncated = true
 		s.finishSlot(sl)
+		return false
 	}
+	return true
 }
 
 // finishSlot ends a reply normally, flushing whatever was held back.
@@ -1007,7 +1137,7 @@ func (s *scheduler) release(sl *slot, err error) {
 		return
 	}
 	if s.lctx != 0 {
-		llama.ForgetSequence(s.lctx, sl.seq, -1, -1)
+		s.forget(sl.seq)
 	}
 	if sl.sampler != nil {
 		sl.sampler.Close()
@@ -1018,7 +1148,7 @@ func (s *scheduler) release(sl *slot, err error) {
 	// out, a cancelled request, a dead backend — so this is the one place the
 	// measurements have to be handed over. A request that died during prefill
 	// reports its prompt and a zero eval, which is what happened.
-	sl.job.stats.PromptTokens = len(sl.prompt)
+	sl.job.stats.PromptTokens = len(sl.prompt) + sl.media
 	sl.job.stats.EvalTokens = sl.nGen
 	sl.job.stats.PromptEvalDuration = sl.promptEval
 	if !sl.evalStart.IsZero() {
@@ -1028,14 +1158,21 @@ func (s *scheduler) release(sl *slot, err error) {
 	sl.job.finish(err)
 	s.rate.done()
 	s.busy.Add(-1)
-	s.promptSeen.Add(int64(len(sl.prompt)))
+	s.promptSeen.Add(int64(len(sl.prompt) + sl.media))
 	s.evalSeen.Add(int64(sl.nGen))
 	sl.job = nil
 	sl.prompt = nil
+	sl.drafts = sl.drafts[:0]
 	sl.logitIdx = -1
 	sl.admitted = time.Time{}
 	sl.evalStart = time.Time{}
 	sl.out.Reset()
+}
+
+// forget drops a sequence's cells, from the head's cache too.
+func (s *scheduler) forget(seq int32) {
+	llama.ForgetSequence(s.lctx, seq, -1, -1)
+	s.draft.forget(seq)
 }
 
 // ErrNotStarted means a request was still queued when the engine went down, so

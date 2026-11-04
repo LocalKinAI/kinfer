@@ -62,7 +62,54 @@ type responsesItem struct {
 	Output    json.RawMessage `json:"output"`
 }
 
-// responsesText reads content that is either a string or an array of parts.
+// responsesContent reads a message's content, a string or an array of parts,
+// with its pictures apart and a marker in the text where each was.
+func responsesContent(raw json.RawMessage) (string, [][]byte, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil, nil
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s, nil, nil
+	}
+	var parts []struct {
+		Type     string          `json:"type"`
+		Text     string          `json:"text"`
+		ImageURL json.RawMessage `json:"image_url"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "", nil, err
+	}
+	var out []string
+	var pics [][]byte
+	for _, p := range parts {
+		switch p.Type {
+		case "input_text", "output_text", "text":
+			out = append(out, p.Text)
+		case "input_image":
+			var url string
+			if json.Unmarshal(p.ImageURL, &url) != nil {
+				var obj struct {
+					URL string `json:"url"`
+				}
+				_ = json.Unmarshal(p.ImageURL, &obj)
+				url = obj.URL
+			}
+			pic, err := picture(url)
+			if err != nil {
+				return "", nil, err
+			}
+			out = append(out, engine.ImageMarker)
+			pics = append(pics, pic)
+		case "input_file":
+			out = append(out, omittedAttachment("file"))
+		}
+	}
+	return strings.Join(out, "\n"), pics, nil
+}
+
+// responsesText reads content that is either a string or an array of parts,
+// where a picture cannot go — a tool's output — and is said in words.
 func responsesText(raw json.RawMessage) (string, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return "", nil
@@ -118,7 +165,7 @@ func responsesToChat(req *responsesRequest) ([]chat.Message, error) {
 		}
 		switch kind {
 		case "message":
-			text, err := responsesText(it.Content)
+			text, pics, err := responsesContent(it.Content)
 			if err != nil {
 				return nil, fmt.Errorf("input[%d]: %w", i, err)
 			}
@@ -129,7 +176,7 @@ func responsesToChat(req *responsesRequest) ([]chat.Message, error) {
 			case "assistant":
 				role = "assistant"
 			}
-			out = append(out, chat.Message{Role: role, Content: text})
+			out = append(out, chat.Message{Role: role, Content: text, Images: pics})
 
 		case "function_call", "custom_tool_call":
 			args := json.RawMessage(it.Arguments)
@@ -255,7 +302,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	eng, release, err := s.acquire(req.Model)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{
+		writeJSON(w, acquireStatus(err), map[string]any{"error": map[string]string{
 			"message": err.Error(), "type": "invalid_request_error"}})
 		return
 	}
