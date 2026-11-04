@@ -219,3 +219,19 @@ func TestReadShapeCountsWeightsAndExpertsByLayer(t *testing.T) {
 			sh.WeightBytes, sh.LayerBytes, sh.ExpertBytes, err)
 	}
 }
+
+// At q8_0 the cache is 34 bytes for every 32 values, where f16 takes 64; the
+// recurrent state of a hybrid stays f32 either way.
+func TestCacheBytesAtEightBits(t *testing.T) {
+	sh := Shape{Layers: 48, HeadsKV: 2, Heads: 32, EmbedDim: 4096, KeyLen: 256, ValLen: 256,
+		AttnInterval: 4, SSMConv: 4, SSMState: 128, SSMGroups: 16, SSMInner: 6144}
+	f16 := sh.CacheBytes(65536)
+	q8 := sh
+	q8.CacheQ8 = true
+	if got := q8.CacheBytes(65536); got != f16*17/32 {
+		t.Errorf("q8_0 cache of 65536 tokens: %d bytes, want %d (17/32 of f16's %d)", got, f16*17/32, f16)
+	}
+	if got, want := q8.CacheBytesFor(65536, 4)-q8.CacheBytes(65536), sh.CacheBytesFor(65536, 4)-f16; got != want {
+		t.Errorf("the recurrent state changed with the cache type: %d, was %d", got, want)
+	}
+}

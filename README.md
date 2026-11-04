@@ -106,6 +106,13 @@ kinfer worker -on <user>     # start one on the Mac at the other end of the cabl
 kinfer version               # this build, and the llama.cpp inside it
 ```
 
+`kinfer pull` fetches a file in pieces over eight connections at once
+(`-connections n`), and keeps what has arrived when it stops — Ctrl-C, a dropped
+network, a full disk: the same pull again fetches only the rest, and until then
+`kinfer list` shows it unfinished. A split model arrives with every piece, and
+each file takes its name only once it matches the sha256 Hugging Face publishes
+for it.
+
 What each does, and how serve sizes itself: [docs/serving.md](docs/serving.md).
 
 ## Models bigger than the machine

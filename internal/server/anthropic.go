@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -111,6 +112,21 @@ func anthropicText(raw json.RawMessage) (string, error) {
 	return strings.Join(parts, "\n"), nil
 }
 
+// billingStamp is the part of the line Claude Code opens its system prompt with
+// that changes on every request, the cch:
+//
+//	x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch=a5145;You are Claude Code, …
+//
+// It means nothing to a model, but as the prompt's first tokens it kept the
+// prefix pool from matching past it, so every turn of a Claude Code session —
+// tens of thousands of tokens of system prompt and tools — was read whole.
+// llama.cpp's server pins it the same way (#21793).
+var billingStamp = regexp.MustCompile(`(?m)^(x-anthropic-billing-header:[^\n]*?\bcch=)[0-9A-Za-z]+;`)
+
+func pinBillingStamp(system string) string {
+	return billingStamp.ReplaceAllString(system, "${1}00000;")
+}
+
 // anthropicToChat flattens a Messages request into the turns a chat template
 // renders. The two disagree about where a tool result lives: here it is a block
 // inside a user turn, and a template wants it as a "tool" turn of its own — in
@@ -122,6 +138,7 @@ func anthropicToChat(req *anthropicRequest) ([]chat.Message, error) {
 	if err != nil {
 		return nil, fmt.Errorf("system: %w", err)
 	}
+	system = pinBillingStamp(system)
 	if oc := req.OutputConfig; oc != nil && oc.Format != nil && oc.Format.Type == "json_schema" && len(oc.Format.Schema) > 0 {
 		// Nothing here holds a model to a schema while it samples, so the
 		// schema is stated instead. Claude Code uses this for a session title:

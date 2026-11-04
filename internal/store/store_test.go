@@ -354,3 +354,119 @@ func TestOpenAtDoesNotBorrow(t *testing.T) {
 		t.Errorf("OpenAt on an empty directory returned %d models: %+v", len(all), all)
 	}
 }
+
+// writePart leaves what a stopped pull leaves: name.part, as long as the whole
+// file and holding done of it, and the record beside it.
+func writePart(t *testing.T, dir, name string, size int64, done ...int64) {
+	t.Helper()
+	f, err := os.Create(filepath.Join(dir, name+".part"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	rec := fmt.Sprintf(`{"size":%d,"etag":"e","piece":%d,"done":%s}`, size, size, strings.Join(strings.Fields(fmt.Sprint(done)), ","))
+	if err := os.WriteFile(filepath.Join(dir, name+".part.json"), []byte(rec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListLeavesOutASetMissingAPiece(t *testing.T) {
+	dir := t.TempDir()
+	writeShards(t, dir, "Big", 3, 10)
+	if err := os.Remove(filepath.Join(dir, "Big-00002-of-00003.gguf")); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := OpenAt(dir)
+	if models, _ := s.List(); len(models) != 0 {
+		t.Errorf("a set missing a piece was listed as loadable: %+v", models)
+	}
+	unfinished, _ := s.Unfinished()
+	if len(unfinished) != 1 || unfinished[0].Name != "Big" || unfinished[0].Size != 20 || unfinished[0].Total != 0 || len(unfinished[0].Files) != 2 {
+		t.Errorf("Unfinished = %+v, want Big with its two pieces, 20 bytes, its whole size unknown", unfinished)
+	}
+}
+
+func TestUnfinishedShowsWhatAPullLeft(t *testing.T) {
+	dir := t.TempDir()
+	writePart(t, dir, "Small-Q4_K_M.gguf", 1000, 300)
+	writeShards(t, dir, "Big", 2, 50)
+	if err := os.Remove(filepath.Join(dir, "Big-00002-of-00002.gguf")); err != nil {
+		t.Fatal(err)
+	}
+	writePart(t, dir, "Big-00002-of-00002.gguf", 50, 10)
+
+	s, _ := OpenAt(dir)
+	if models, _ := s.List(); len(models) != 0 {
+		t.Errorf("unfinished models were listed as loadable: %+v", models)
+	}
+	unfinished, err := s.Unfinished()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Unfinished{}
+	for _, u := range unfinished {
+		got[u.Name] = u
+	}
+	if u := got["Small-Q4_K_M"]; u.Size != 300 || u.Total != 1000 || len(u.Files) != 2 {
+		t.Errorf("a part 300 bytes into 1000 shows as %+v", u)
+	}
+	// Piece 1 whole, and 10 bytes of piece 2's 50.
+	if u := got["Big"]; u.Size != 60 || u.Total != 100 || len(u.Files) != 3 {
+		t.Errorf("a split model with its second piece arriving shows as %+v", u)
+	}
+}
+
+func TestRemoveDeletesAnUnfinishedPull(t *testing.T) {
+	dir := t.TempDir()
+	writePart(t, dir, "Small-Q4_K_M.gguf", 1000, 300)
+	writeShards(t, dir, "Big", 3, 10)
+	if err := os.Remove(filepath.Join(dir, "Big-00003-of-00003.gguf")); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := OpenAt(dir)
+
+	for _, name := range []string{"small-q4_k_m", "Big"} {
+		if err := s.Remove(name); err != nil {
+			t.Fatalf("rm %s: %v", name, err)
+		}
+	}
+	if left, _ := os.ReadDir(dir); len(left) != 0 {
+		t.Errorf("rm left %d files behind", len(left))
+	}
+}
+
+// A model being pulled again — a new version of it upstream — is removed
+// together with what arrived of the new one.
+func TestRemoveTakesAModelsUnfinishedPullWithIt(t *testing.T) {
+	s := newStore(t, "Small-Q4_K_M.gguf")
+	writePart(t, s.Root(), "Small-Q4_K_M.gguf", 1000, 300)
+	if models, _ := s.List(); len(models) != 1 {
+		t.Fatalf("the finished model is not listed: %+v", models)
+	}
+	if err := s.Remove("Small-Q4_K_M"); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := os.ReadDir(s.Root()); len(left) != 0 {
+		t.Errorf("rm left %d files behind", len(left))
+	}
+}
+
+// Asked for by its exact name, an unfinished model is said to be unfinished —
+// not run as some other model the name happens to begin.
+func TestResolveSaysAModelIsUnfinished(t *testing.T) {
+	s := newStore(t, "Small-Q4_K_M-imatrix.gguf")
+	writePart(t, s.Root(), "Small-Q4_K_M.gguf", 1000, 300)
+	_, err := s.Resolve("Small-Q4_K_M")
+	if err == nil || !strings.Contains(err.Error(), "not finished") {
+		t.Errorf("Resolve of an unfinished model returned %v", err)
+	}
+	if err := s.Remove("Small-Q4_K_M"); err != nil {
+		t.Fatal(err)
+	}
+	if models, _ := s.List(); len(models) != 1 {
+		t.Errorf("rm of an unfinished model took the model its name begins: %+v", models)
+	}
+}

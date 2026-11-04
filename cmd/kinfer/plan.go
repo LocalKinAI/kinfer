@@ -27,11 +27,15 @@ func cmdPlan(args []string) error {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
 	ctxWant := fs.Int("ctx", 0, "context per conversation to plan for (0 = what serve would choose unasked)")
 	slotsWant := fs.Int("slots", 0, "conversations at once, with the context they share sized as serve -slots N sizes it")
+	kvCache := fs.String("kv-cache", "f16", "the attention cache to plan for, as serve -kv-cache: f16 or q8_0")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if err := checkCacheType(*kvCache); err != nil {
+		return err
+	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: kinfer plan [-slots N] [-ctx N] <model>")
+		return fmt.Errorf("usage: kinfer plan [-slots N] [-ctx N] [-kv-cache f16|q8_0] <model>")
 	}
 
 	st, err := store.Open()
@@ -48,6 +52,7 @@ func cmdPlan(args []string) error {
 	}
 
 	sh, shErr := store.ReadShape(m.Path)
+	sh.CacheQ8 = engine.CacheQ8(sh, *kvCache)
 	// A table llama.cpp reads from disk as needed is in the files, not in
 	// memory; see store.ReadsLazily.
 	weights := m.Size - sh.LazyBytes

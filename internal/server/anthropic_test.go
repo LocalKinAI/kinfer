@@ -261,3 +261,42 @@ func TestAnthropicToolsNeedAToolTemplate(t *testing.T) {
 		t.Errorf("status %d %s; want 400 naming the missing convention", w.Code, w.Body.String())
 	}
 }
+
+// Claude Code's system prompt opens with a stamp that changes on every request.
+// Two turns of one session must reach the model as the same system prompt, or
+// the prefix pool reuses nothing after the stamp and every turn is read whole.
+func TestAnthropicPinsClaudeCodesBillingStamp(t *testing.T) {
+	system := func(cch string) string {
+		raw := `{"model":"alpha",
+		  "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch=` + cch + `;"},
+		            {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],
+		  "messages":[{"role":"user","content":"hi"}]}`
+		var req anthropicRequest
+		if err := json.Unmarshal([]byte(raw), &req); err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := anthropicToChat(&req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return msgs[0].Content
+	}
+	first, second := system("a5145"), system("9c0d2")
+	if first != second {
+		t.Errorf("two turns of one session differ in their system prompt:\n%q\n%q", first, second)
+	}
+	if !strings.Contains(first, "cc_entrypoint=cli; cch=00000;\nYou are Claude Code") {
+		t.Errorf("the stamp was not pinned in place: %q", first)
+	}
+
+	// Anything else that mentions a cch is left as it is.
+	for _, keep := range []string{
+		"cch=a5145; is what the header says",
+		"note: x-anthropic-billing-header: cch=a5145;",
+		"x-anthropic-billing-header: cc_version=2.1.101.e51; notcch=a5145;",
+	} {
+		if got := pinBillingStamp(keep); got != keep {
+			t.Errorf("pinBillingStamp(%q) = %q", keep, got)
+		}
+	}
+}

@@ -64,6 +64,12 @@ type Shape struct {
 	WeightBytes int64
 	LayerBytes  []int64
 	ExpertBytes []int64
+
+	// CacheQ8 is the attention cache kept at 8 bits — q8_0, 34 bytes for
+	// every 32 elements — rather than f16. It is not in the file: whoever
+	// sizes a context sets it to what that context will be asked for, as
+	// engine.Open does.
+	CacheQ8 bool
 }
 
 // ReadsLazily reports whether the embedded llama.cpp reads part of an
@@ -192,8 +198,9 @@ func (s Shape) AttnLayers() int {
 	return s.Layers
 }
 
-// CacheBytes estimates the attention cache for a total token count, at f16:
-// two bytes per element, K and V, one entry per attending layer per KV head.
+// CacheBytes estimates the attention cache for a total token count: two bytes
+// per element at f16 (17/16 of one at q8_0, see CacheQ8), K and V, one entry
+// per attending layer per KV head.
 //
 // This is the part that grows with the context. A hybrid model also holds a
 // per-sequence state that does not — see CacheBytesFor, which is what sizing
@@ -210,7 +217,11 @@ func (s Shape) CacheBytes(tokens int) int64 {
 	if v == 0 {
 		v = d
 	}
-	return int64(tokens) * int64(s.AttnLayers()) * int64(s.HeadsKV) * int64(d+v) * 2
+	elems := int64(tokens) * int64(s.AttnLayers()) * int64(s.HeadsKV) * int64(d+v)
+	if s.CacheQ8 {
+		return elems * 34 / 32
+	}
+	return elems * 2
 }
 
 // RecurrentBytesPerSeq is the state one sequence holds in the recurrent

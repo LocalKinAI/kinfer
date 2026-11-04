@@ -209,6 +209,30 @@ would leave less memory than the loaded one did is refused before any batch runs
 in it, and not tried again. The prefix pool lives only in the loaded layout.
 `-flex=false` keeps the layout fixed.
 
+## `-kv-cache q8_0` buys context, not speed
+
+The attention cache is f16 unless `-kv-cache q8_0` says otherwise: K and V at 8
+bits, half the memory (34 bytes for every 32 values, where f16 takes 64), and
+sizing counts it at that. The same memory then holds twice the context — on the
+box, Flash-Next unasked goes from 8 slots × 32768 tokens to 8 × 65536, which a
+45,000-token agent prompt fits whole. llama.cpp turns flash attention on for it,
+which a quantized V cache needs.
+
+It is not the default because the memory is all it saves. On the box, with
+20,000-token prompts:
+
+| model | decode, f16 → q8_0 | prompt, f16 → q8_0 | context, f16 → q8_0 |
+|---|---:|---:|---:|
+| qwen3.8-27b Q4_K_M | 28.8 → 28.4 tok/s | 295 → 296 tok/s | 6.5 → 4.6 GiB |
+| ornith-1.5-35b (MoE) | 97.4 → 92.3 tok/s | 1665 → 1700 tok/s | 1280 → 680 MiB of cache |
+| Qwen2.5-0.5B | 259 → 222 tok/s | 7720 → 7630 tok/s | 576 → 306 MiB of cache |
+
+(ornith's context as a whole grew: sizing spent what the cache saved on a
+micro-batch of 2048 instead of 1024, which read the prompt 2% faster.) The DeepSeek
+family, whose latent and compressed caches are not the per-head K and V this
+counts, and a model whose heads 32 does not divide, stay at f16 when asked;
+the log says which. `kinfer plan -kv-cache q8_0` shows the sizing first.
+
 ## `kinfer install` keeps the server up
 
 The daemon `run` starts is a plain background process: a reboot loses it, and

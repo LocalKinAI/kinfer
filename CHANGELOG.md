@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — Claude Code's every turn was read from the start
+
+Claude Code opens its system prompt with a billing line whose `cch=` is new on
+every request. The prefix pool adopts a prompt only up to its first difference,
+so with that line first, each turn of a Claude Code session read its system
+prompt and tools whole — tens of thousands of tokens — where it should have
+read only what was new. The stamp means nothing to a model; kinfer now pins it
+to `cch=00000;`, as llama.cpp's server does (#21793), and two turns reach the
+model with the same system prompt.
+
+### Added — `-kv-cache q8_0`: the attention cache at 8 bits
+
+`serve -kv-cache q8_0` keeps K and V at q8_0, half f16's memory, and sizes for
+it: the same memory holds twice the context — Flash-Next unasked on the box
+goes from 8 slots × 32768 tokens to 8 × 65536. It costs decode speed at long
+contexts, so f16 stays the default: with 20,000-token prompts on the box,
+qwen3.8-27b went from 28.8 to 28.4 tok/s, ornith-1.5-35b from 97.4 to 92.3, and
+Qwen2.5-0.5B from 259 to 222; prompts read as fast. The DeepSeek family, and a
+model whose heads q8_0's blocks of 32 do not divide, stay f16. `kinfer plan
+-kv-cache q8_0` shows the sizing without loading.
+
+### Fixed — a pull that stopped started over, over one connection
+
+`kinfer pull` fetched a file in one request over one connection, and deleted
+what had arrived whenever the request failed: a dropped network anywhere in a
+50 GB model meant fetching all 50 GB again, and a download still running after
+six hours was cut off. A file now arrives in 32 MB pieces, eight at a time over
+connections of their own (`-connections n`; HTTP/2 would carry them all over
+one), written in place in `name.part` while `name.part.json` records how far
+each piece has got. A pull that stops — Ctrl-C, a dropped network, a full disk
+— leaves both, and the same pull fetches only what is missing. A connection
+that delivers nothing for a minute is dropped and its piece asked for again,
+and the CDN's address, signed for an hour, is renewed when it expires. A
+network or a Hugging Face that is down is waited out for ten minutes — a Mac's
+sleep not counted — and the progress line says why it waits.
+
+Each file is hashed as it arrives and takes its name only if it matches the
+sha256 Hugging Face publishes for it, and only once it is on disk whole, so
+neither a resume gone wrong nor a power cut can leave something that passes
+for a model. A split model now arrives with every piece; pull fetched only the
+first, which llama.cpp cannot open without the rest. A link copied from the
+website works too, folder and `?download=true` included.
+
+A pull checks first that the disk can take what it still needs, and stops
+before the disk is down to 2 GB: a full disk fails everything on the machine,
+swap among it, and what a stopped pull fetched stays there. `kinfer list`
+shows what a stopped pull left, and how far it got; `kinfer rm` deletes it. A
+split model with a piece missing is shown there too, no longer as a model that
+loads. Off a terminal — a log, ssh without one — the progress line comes every
+half minute rather than redrawn in place.
+
+Qwen2.5-0.5B-Instruct Q4_K_M (469 MB) on the Mac mini's Wi-Fi: one connection
+averaged 22 MB/s, eight reached 35 MB/s. Stopped with Ctrl-C at 152 MB and run
+again, the pull went on from 152 MB, and the file matched its sha256.
+
 ## v0.1.6 — 2026-11-02
 
 ### Fixed — a model was placed as if the GPU were its own

@@ -27,6 +27,14 @@ Measured on the M3 Ultra with a 3,100-word system prompt, time to first token:
 The last row is the control that matters: prefixes that do not repeat get no
 benefit, and pay no penalty for the attempt.
 
+"Identical byte for byte" is the condition, and Claude Code breaks it on
+purpose: its system prompt opens with a billing line whose `cch=` is new on every
+request (`x-anthropic-billing-header: cc_version=…; cc_entrypoint=cli;
+cch=a5145;`). Nothing after a prompt's first difference can be adopted, so each
+turn of a session was read whole, system prompt and tools — tens of thousands of
+tokens. The stamp means nothing to a model, and kinfer pins it to `cch=00000;`
+before the prompt is rendered, as llama.cpp's server does (#21793).
+
 ```
 $ kinfer serve -slots 8 -prefix 4
   8 slots × 4096 tokens — conversations share one forward pass

@@ -21,6 +21,16 @@ func TestParseRef(t *testing.T) {
 			"https://huggingface.co/Qwen/X-GGUF/resolve/main/model-q8.gguf",
 			"Qwen/X-GGUF", "", "model-q8.gguf",
 		},
+		// A file in a folder, as a link copied from the website has it.
+		{
+			"https://huggingface.co/unsloth/Big-GGUF/resolve/main/Q2_K/Big-Q2_K-00001-of-00003.gguf?download=true",
+			"unsloth/Big-GGUF", "", "Q2_K/Big-Q2_K-00001-of-00003.gguf",
+		},
+		{
+			"https://hf-mirror.com/Qwen/X-GGUF/blob/main/model-q4.gguf",
+			"Qwen/X-GGUF", "", "model-q4.gguf",
+		},
+		{"https://huggingface.co/Qwen/X-GGUF/tree/main", "Qwen/X-GGUF", "", ""},
 	}
 	for _, c := range cases {
 		got, err := ParseRef(c.in)
@@ -36,7 +46,7 @@ func TestParseRef(t *testing.T) {
 }
 
 func TestParseRef_Rejects(t *testing.T) {
-	for _, bad := range []string{"", "   ", "just-a-name", "too/many/slashes"} {
+	for _, bad := range []string{"", "   ", "just-a-name", "too/many/slashes", "https://huggingface.co/", "https://huggingface.co/Qwen"} {
 		if _, err := ParseRef(bad); err == nil {
 			t.Errorf("ParseRef(%q) should fail", bad)
 		}
@@ -115,5 +125,28 @@ func TestEndpoint_HonoursMirrorVariables(t *testing.T) {
 	t.Setenv("KINFER_HF_ENDPOINT", "   ")
 	if got := endpoint(); got != "https://hf-mirror.com" {
 		t.Errorf("blank KINFER_HF_ENDPOINT should fall through, got %q", got)
+	}
+}
+
+// A pull of a split model needs every piece, whichever one Pick landed on.
+func TestShards(t *testing.T) {
+	files := []File{
+		{Name: "Q2/big-Q2-00001-of-00003.gguf"},
+		{Name: "Q2/big-Q2-00002-of-00003.gguf"},
+		{Name: "Q2/big-Q2-00003-of-00003.gguf"},
+		{Name: "Q4/big-Q4-00001-of-00002.gguf"},
+		{Name: "Q4/big-Q4-00002-of-00002.gguf"},
+		{Name: "small-Q8_0.gguf"},
+	}
+	names := func(fs []File) string { return join(fs) }
+
+	if got := names(Shards(files, files[0])); got != names(files[:3]) {
+		t.Errorf("Shards(part 1 of 3) = %s", got)
+	}
+	if got := names(Shards(files, files[4])); got != names(files[3:5]) {
+		t.Errorf("Shards(part 2 of 2) = %s", got)
+	}
+	if got := names(Shards(files, files[5])); got != files[5].Name {
+		t.Errorf("Shards(a file that stands alone) = %s", got)
 	}
 }

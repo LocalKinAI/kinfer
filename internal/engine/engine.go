@@ -138,6 +138,10 @@ type Options struct {
 	// the ones in use (Place); and with Peers but no Split, the peers take only
 	// the layers that do not fit here (PlaceDevices).
 	NoPlace bool
+
+	// CacheType is what the attention cache is kept in: "q8_0" where the
+	// model allows it (see CacheQ8), or f16 — the default.
+	CacheType string
 }
 
 // GenParams control one generation.
@@ -341,6 +345,13 @@ func Open(path string, opts Options) (*Engine, error) {
 	// model's and the context's real costs can be measured rather than guessed.
 	bud := newBudget()
 	shape, _ := store.ReadShape(path)
+	shape.CacheQ8 = CacheQ8(shape, opts.CacheType)
+	switch {
+	case shape.CacheQ8:
+		log.Printf("cache: K and V at q8_0, about half what f16 takes")
+	case opts.CacheType == "q8_0":
+		log.Printf("cache: K and V at f16 — q8_0 does not suit %s (heads of %d)", shape.Arch, shape.HeadDim())
+	}
 
 	peers := opts.Peers
 	if opts.FindPeers && opts.HostExperts == 0 && opts.MoeCache == 0 && !opts.NoPlace && len(opts.Split) == 0 {
@@ -518,7 +529,7 @@ func Open(path string, opts Options) (*Engine, error) {
 	var lctx llama.Context
 sizing:
 	for {
-		lctx = newContext(model, slots, prefix, perSeq, shared, ub, moeCache)
+		lctx = newContext(model, slots, prefix, perSeq, shared, ub, moeCache, shape.CacheQ8)
 		if lctx == 0 {
 			llama.FreeModel(model)
 			return nil, fmt.Errorf("create context for %s", path)
@@ -657,7 +668,7 @@ sizing:
 		ub, how, gib(sub(bud.atStart, bud.afterCtx)), gib(bud.atStart))
 	var fx *flex
 	if !opts.FixedLayout {
-		fx = newFlex(home, shape.TrainedCtx, contextBuilder(model, home, bud, moeCache))
+		fx = newFlex(home, shape.TrainedCtx, contextBuilder(model, home, bud, moeCache, shape.CacheQ8))
 	}
 	if fx != nil {
 		log.Printf("slots: %d tokens of context as %s; a prompt that needs a longer slot gets %s while it runs "+
@@ -686,10 +697,10 @@ sizing:
 // holds the same tokens, so it should cost about the same; if it does not, the
 // place to find out is here, before any batch runs in it — a batch that cannot
 // allocate retires the whole model (see thinHeadroom).
-func contextBuilder(model llama.Model, home layout, bud *budget, moeCache int) func(layout) (llama.Context, uint64, error) {
+func contextBuilder(model llama.Model, home layout, bud *budget, moeCache int, q8 bool) func(layout) (llama.Context, uint64, error) {
 	floor := sub(min(bud.afterCtx, thinHeadroom), reshapeSlack)
 	return func(l layout) (llama.Context, uint64, error) {
-		lctx := newContext(model, l.slots, l.prefix, l.perSeq, l.shared, l.ubatch, moeCache)
+		lctx := newContext(model, l.slots, l.prefix, l.perSeq, l.shared, l.ubatch, moeCache, q8)
 		if lctx == 0 {
 			return 0, 0, errors.New("llama.cpp could not create it (see its output above)")
 		}
@@ -715,10 +726,15 @@ func batchFor(ubatch int) int {
 
 // newContext asks llama.cpp for a cache holding slots+prefix sequences of
 // perSeq tokens each — or, when the pool is shared, slots conversations' worth
-// of tokens that the pool's sequences borrow from.
-func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatch, moeCache int) llama.Context {
+// of tokens that the pool's sequences borrow from — kept at q8_0 when q8.
+func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatch, moeCache int, q8 bool) llama.Context {
 	cp := llama.DefaultContextParams()
 	cp.MoeCacheSize = uint64(moeCache) << 20
+	if q8 {
+		// llama.cpp turns flash attention on for it, which a quantized V
+		// cache needs and Metal has for every head size CacheQ8 lets by.
+		cp.TypeK, cp.TypeV = llama.TypeQ8_0, llama.TypeQ8_0
+	}
 	// Pooled prefixes live in sequence ids above the slots, and each needs a
 	// sequence's worth of cache unless it borrows the slots'.
 	cp.NSeqMax = uint32(slots + prefix)

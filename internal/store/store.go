@@ -8,6 +8,7 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,18 +27,21 @@ import (
 var shardSuffix = regexp.MustCompile(`-(\d{5})-of-(\d{5})\.gguf$`)
 
 // shardOf reports a file's place in a split model: the name the whole set
-// should be known by, and which piece this is. An index of 0 means the file is
-// not a shard.
-func shardOf(filename string) (base string, index int) {
+// should be known by, which piece this is, and of how many. An index of 0
+// means the file is not a shard.
+func shardOf(filename string) (base string, index, of int) {
 	m := shardSuffix.FindStringSubmatch(filename)
 	if m == nil {
-		return "", 0
+		return "", 0, 0
 	}
-	n := 0
-	for _, c := range m[1] {
-		n = n*10 + int(c-'0')
+	number := func(digits string) int {
+		n := 0
+		for _, c := range digits {
+			n = n*10 + int(c-'0')
+		}
+		return n
 	}
-	return filename[:len(filename)-len(m[0])], n
+	return filename[:len(filename)-len(m[0])], number(m[1]), number(m[2])
 }
 
 // Model is one GGUF file on disk.
@@ -106,7 +110,11 @@ func (s *Store) List() ([]Model, error) {
 	// A split model is one model. Gather its pieces before building the list,
 	// or it appears once per piece, each showing a fraction of its true size,
 	// and asking for it by name is ambiguous.
-	shards := map[string]*Model{}
+	type set struct {
+		Model
+		have, of int // pieces here, and of how many
+	}
+	shards := map[string]*set{}
 
 	var out []Model
 	for _, e := range entries {
@@ -125,12 +133,13 @@ func (s *Store) List() ([]Model, error) {
 			continue // vanished, or a link with nothing at the end of it
 		}
 
-		if base, idx := shardOf(e.Name()); idx > 0 {
+		if base, idx, of := shardOf(e.Name()); idx > 0 {
 			m := shards[base]
 			if m == nil {
-				m = &Model{Name: base, Source: FromKinfer}
+				m = &set{Model: Model{Name: base, Source: FromKinfer}, of: of}
 				shards[base] = m
 			}
+			m.have++
 			m.Size += info.Size()
 			// The first piece is the handle: llama.cpp opens it and finds the
 			// rest itself.
@@ -153,10 +162,11 @@ func (s *Store) List() ([]Model, error) {
 	}
 
 	for _, m := range shards {
-		// A set missing its first piece cannot be loaded; listing it would only
-		// move the failure to a more confusing place.
-		if m.Path != "" {
-			out = append(out, *m)
+		// A set missing a piece cannot be loaded — llama.cpp opens the first
+		// and looks for the rest beside it — so listing it would only move the
+		// failure to a more confusing place. Unfinished shows it instead.
+		if m.Path != "" && m.have == m.of {
+			out = append(out, m.Model)
 		}
 	}
 
@@ -242,6 +252,12 @@ func (s *Store) Resolve(name string) (string, error) {
 		}
 	}
 
+	// The exact name of a model a pull has not finished means that model, not
+	// another the name is the start of.
+	if u, ok := s.unfinished(name); ok {
+		return "", fmt.Errorf("%s has not finished arriving — the kinfer pull that fetched it goes on when run again", u.Name)
+	}
+
 	var matches []Model
 	for _, m := range models {
 		if strings.HasPrefix(strings.ToLower(m.Name), lower) {
@@ -261,8 +277,14 @@ func (s *Store) Resolve(name string) (string, error) {
 	}
 }
 
-// Remove deletes a model.
+// Remove deletes a model, and whatever a pull of it left unfinished. The name
+// of an unfinished model alone removes what is here of it.
 func (s *Store) Remove(name string) error {
+	if u, ok := s.unfinished(name); ok {
+		if _, err := s.Lookup(name); err != nil {
+			return removeAll(u.Files)
+		}
+	}
 	path, err := s.Resolve(name)
 	if err != nil {
 		return err
@@ -286,8 +308,22 @@ func (s *Store) Remove(name string) error {
 	if err != nil {
 		return err
 	}
+	if err := removeAll(files); err != nil {
+		return err
+	}
+	model, idx, _ := shardOf(filepath.Base(path))
+	if idx == 0 {
+		model = nameOf(filepath.Base(path))
+	}
+	if u, ok := s.unfinished(model); ok {
+		return removeAll(u.Files)
+	}
+	return nil
+}
+
+func removeAll(files []string) error {
 	for _, f := range files {
-		if err := os.Remove(f); err != nil {
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
@@ -297,7 +333,7 @@ func (s *Store) Remove(name string) error {
 // Shards lists every file a model is made of — its own path, unless it is
 // split, in which case all the pieces in name order.
 func (s *Store) Shards(path string) ([]string, error) {
-	base, idx := shardOf(filepath.Base(path))
+	base, idx, _ := shardOf(filepath.Base(path))
 	if idx == 0 {
 		return []string{path}, nil
 	}
@@ -308,12 +344,142 @@ func (s *Store) Shards(path string) ([]string, error) {
 	}
 	var out []string
 	for _, e := range entries {
-		if b, i := shardOf(e.Name()); i > 0 && b == base {
+		if b, i, _ := shardOf(e.Name()); i > 0 && b == base {
 			out = append(out, filepath.Join(dir, e.Name()))
 		}
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// Unfinished is a model a pull has not finished: a file still arriving as
+// name.part, or a split model some of whose pieces are not here. It cannot be
+// loaded, so List leaves it out; it is listed here so that it is finished or
+// removed rather than forgotten, holding tens of gigabytes.
+type Unfinished struct {
+	Name     string
+	Files    []string // all of it on disk, the pull's records with it
+	Size     int64    // bytes of it on disk
+	Total    int64    // its size once whole; 0 when nothing here says
+	Modified time.Time
+}
+
+// Unfinished lists the unfinished models in the store, newest first.
+func (s *Store) Unfinished() ([]Unfinished, error) {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", s.root, err)
+	}
+	type model struct {
+		Unfinished
+		pieces    []string // its pieces here whole
+		piecesLen int64
+		have, of  int // pieces here whole, and of how many
+		arriving  int // files of it still name.part
+		unsized   bool
+	}
+	models := map[string]*model{}
+	get := func(name string, of int) *model {
+		m := models[name]
+		if m == nil {
+			m = &model{Unfinished: Unfinished{Name: name}, of: of}
+			models[name] = m
+		}
+		return m
+	}
+
+	for _, e := range entries {
+		path := filepath.Join(s.root, e.Name())
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if final, ok := strings.CutSuffix(e.Name(), ".part"); ok && strings.HasSuffix(strings.ToLower(final), ".gguf") {
+			name, idx, of := shardOf(final)
+			if idx == 0 {
+				name, of = nameOf(final), 1
+			}
+			m := get(name, of)
+			m.arriving++
+			m.Files = append(m.Files, path)
+			for _, kept := range []string{path + ".json", path + ".json.tmp"} {
+				if _, err := os.Lstat(kept); err == nil {
+					m.Files = append(m.Files, kept)
+				}
+			}
+			if done, size, ok := readRecord(path + ".json"); ok {
+				m.Size += done
+				m.Total += size
+			} else {
+				m.unsized = true
+			}
+			if info.ModTime().After(m.Modified) {
+				m.Modified = info.ModTime()
+			}
+			continue
+		}
+		if name, idx, of := shardOf(e.Name()); idx > 0 {
+			m := get(name, of)
+			m.have++
+			m.pieces = append(m.pieces, path)
+			m.piecesLen += info.Size()
+			if info.ModTime().After(m.Modified) {
+				m.Modified = info.ModTime()
+			}
+		}
+	}
+
+	var out []Unfinished
+	for _, m := range models {
+		whole := m.have == m.of
+		if whole && m.arriving == 0 {
+			continue // a model, in List
+		}
+		if !whole {
+			m.Files = append(m.Files, m.pieces...)
+			m.Size += m.piecesLen
+			m.Total += m.piecesLen
+		}
+		// A piece neither here nor arriving has a size nothing here says.
+		if m.unsized || (!whole && m.have+m.arriving < m.of) {
+			m.Total = 0
+		}
+		sort.Strings(m.Files)
+		out = append(out, m.Unfinished)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Modified.After(out[j].Modified) })
+	return out, nil
+}
+
+// unfinished finds an unfinished model by its name.
+func (s *Store) unfinished(name string) (Unfinished, bool) {
+	all, _ := s.Unfinished()
+	for _, u := range all {
+		if strings.EqualFold(u.Name, name) {
+			return u, true
+		}
+	}
+	return Unfinished{}, false
+}
+
+// readRecord reads what kinfer pull keeps beside a name.part as it fills it
+// (hub's record): the file's size, and how much of each piece has arrived.
+func readRecord(path string) (done, size int64, ok bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	var rec struct {
+		Size int64   `json:"size"`
+		Done []int64 `json:"done"`
+	}
+	if json.Unmarshal(b, &rec) != nil {
+		return 0, 0, false
+	}
+	for _, n := range rec.Done {
+		done += n
+	}
+	return done, rec.Size, true
 }
 
 func nameOf(filename string) string {

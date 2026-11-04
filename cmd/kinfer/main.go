@@ -19,7 +19,6 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/engine"
 	"github.com/LocalKinAI/kinfer/internal/hardware"
-	"github.com/LocalKinAI/kinfer/internal/hub"
 	"github.com/LocalKinAI/kinfer/internal/server"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
@@ -118,61 +117,6 @@ func main() {
 	}
 }
 
-func cmdPull(args []string) error {
-	fs := flag.NewFlagSet("pull", flag.ExitOnError)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: kinfer pull <repo>[:quant]")
-	}
-
-	ref, err := hub.ParseRef(fs.Arg(0))
-	if err != nil {
-		return err
-	}
-	st, err := store.Open()
-	if err != nil {
-		return err
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	fmt.Printf("querying %s via %s…\n", ref.Repo, hub.Endpoint())
-	files, err := hub.List(ctx, ref.Repo)
-	if err != nil {
-		return err
-	}
-	pick, err := hub.Pick(files, ref)
-	if err != nil {
-		return err
-	}
-
-	// Hugging Face's model API omits file sizes unless asked for blobs, so
-	// pick.Size is usually 0. The real size arrives with the download headers.
-	if pick.Size > 0 {
-		fmt.Printf("pulling %s (%s)\n", pick.Name, store.HumanSize(pick.Size))
-	} else {
-		fmt.Printf("pulling %s\n", pick.Name)
-	}
-	path, err := hub.Download(ctx, ref.Repo, pick.Name, st.Root(), func(done, total int64) {
-		if total > 0 {
-			fmt.Printf("\r  %s / %s  (%.0f%%)   ",
-				store.HumanSize(done), store.HumanSize(total), float64(done)/float64(total)*100)
-		} else {
-			fmt.Printf("\r  %s   ", store.HumanSize(done))
-		}
-	})
-	fmt.Println()
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("✅ %s\n", path)
-	return nil
-}
-
 func cmdList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	own := fs.Bool("own", false, "only models in kinfer's own directory")
@@ -193,7 +137,11 @@ func cmdList(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(models) == 0 {
+	unfinished, err := st.Unfinished()
+	if err != nil {
+		return err
+	}
+	if len(models) == 0 && len(unfinished) == 0 {
 		fmt.Println("no models yet — kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M")
 		return nil
 	}
@@ -202,6 +150,19 @@ func cmdList(args []string) error {
 	for _, m := range models {
 		fmt.Printf("%-44s %10s  %-12s %s\n",
 			m.Name, store.HumanSize(m.Size), humanTime(m.Modified), m.Source)
+	}
+	// What a stopped pull left takes room like a model and loads like none;
+	// shown here, it gets finished or removed rather than forgotten.
+	for _, u := range unfinished {
+		state := "unfinished pull"
+		if u.Total > 0 {
+			state = fmt.Sprintf("unfinished pull, %.0f%%", float64(u.Size)/float64(u.Total)*100)
+		}
+		fmt.Printf("%-44s %10s  %-12s %s\n",
+			u.Name, store.HumanSize(u.Size), humanTime(u.Modified), state)
+	}
+	if len(unfinished) > 0 {
+		fmt.Println("\nan unfinished pull goes on when run again; kinfer rm <name> deletes what it left")
 	}
 	return nil
 }
@@ -434,6 +395,7 @@ type serveOpts struct {
 	hostExperts     int
 	moeCache        int
 	place           bool
+	kvCache         string
 }
 
 // prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
@@ -511,6 +473,14 @@ func (o *serveOpts) check() error {
 	if isAuto(o.peers) && len(o.split) > 0 {
 		return fmt.Errorf("-split shares the layers among peers named by hand, not -peers auto")
 	}
+	return checkCacheType(o.kvCache)
+}
+
+// checkCacheType refuses a -kv-cache other than the two kinfer sizes for.
+func checkCacheType(v string) error {
+	if v != "q8_0" && v != "f16" {
+		return fmt.Errorf("-kv-cache is q8_0 or f16, not %q", v)
+	}
 	return nil
 }
 
@@ -530,6 +500,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.BoolVar(&o.flex, "flex", true, "give a prompt too long for a slot a longer one: fewer slots, the same tokens, while it runs (false = keep the layout)")
 	fs.IntVar(&o.hostExperts, "host-experts", 0, "a mixture of experts' routed experts stay in host memory, mapped from the file, for this many of the first layers (-1 = every layer; 0 = as many as -place decides, none for a model that fits)")
 	fs.IntVar(&o.moeCache, "moe-cache", 0, "MiB of GPU memory caching the host experts in use, so only a miss is copied (0 = what -place decides, none for a model that fits)")
+	fs.StringVar(&o.kvCache, "kv-cache", "f16", "what the attention cache is kept in: f16, or q8_0 — about half the memory, so twice the context per conversation, and decode up to a seventh slower at long contexts (a model q8_0 does not suit stays f16: the DeepSeek family, and heads it does not divide)")
 	fs.BoolVar(&o.place, "place", true, "when a mixture of experts does not fit the GPU, keep as many layers' experts in host memory as it must, with a GPU cache for the ones in use, unless -host-experts or -moe-cache say otherwise; with -peers and no -split, give the peers only the layers that do not fit here (false = load it whole, and let llama.cpp split by free memory)")
 	fs.Func("peers", "kinfer workers on other machines (host:port, comma-separated) whose GPUs take the first layers of each model; auto = those that answer over the Thunderbolt cable, for a model that does not fit here (default none)", func(v string) (err error) {
 		o.peers, err = parsePeers(v)
@@ -573,7 +544,7 @@ func cmdServe(args []string) error {
 		GPULayers: o.ngl, ContextSize: o.nCtx, Slots: o.slots, PrefixSlots: int(o.prefix),
 		MaxQueue: o.queue, MaxGenerate: noLimit(o.maxGen), MaxWait: noLimit(o.maxWait),
 		FixedLayout: !o.flex, Batch: o.batch, Peers: o.peers, FindPeers: findPeers, Split: o.split,
-		HostExperts: o.hostExperts, MoeCache: o.moeCache, NoPlace: !o.place,
+		HostExperts: o.hostExperts, MoeCache: o.moeCache, NoPlace: !o.place, CacheType: o.kvCache,
 	})
 	srv.SetKeepAlive(o.keepAlive)
 	defer srv.Close()

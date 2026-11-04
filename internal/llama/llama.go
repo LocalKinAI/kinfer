@@ -360,6 +360,14 @@ func DefaultModelParams() ModelParams { return modelDefaultParams() }
 // DefaultContextParams likewise.
 func DefaultContextParams() ContextParams { return ctxDefaultParams() }
 
+// TypeQ8_0 is ggml's q8_0, for ContextParams.TypeK and TypeV: 8 bits a value,
+// in blocks of 32 with a scale each. TypeF16, two bytes a value, is llama.cpp's
+// default for both.
+const (
+	TypeF16  int32 = 1
+	TypeQ8_0 int32 = 8
+)
+
 // LoadModel reads a GGUF file. A zero Model means failure; llama.cpp has
 // already written the reason to stderr.
 func LoadModel(path string, p ModelParams) Model { return modelLoadFromFile(path, p) }

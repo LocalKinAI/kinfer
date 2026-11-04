@@ -10,13 +10,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
-	"time"
 )
 
 const defaultEndpoint = "https://huggingface.co"
@@ -69,20 +68,23 @@ func ParseRef(s string) (Ref, error) {
 		return Ref{}, fmt.Errorf("empty model reference")
 	}
 
-	// A full URL: pull out the repo and, if present, the exact file.
+	// A full URL: pull out the repo and, if present, the exact file — with
+	// its folder, as in .../resolve/main/Q2_K/model-00001-of-00003.gguf, and
+	// without the ?download=true a link copied from the website carries. The
+	// host may be a mirror's.
 	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
-		trimmed := strings.TrimPrefix(strings.TrimPrefix(s, "https://"), "http://")
-		trimmed = strings.TrimPrefix(trimmed, "huggingface.co/")
-		parts := strings.Split(trimmed, "/")
-		if len(parts) < 2 {
+		u, err := url.Parse(s)
+		if err != nil {
+			return Ref{}, fmt.Errorf("cannot read a repo from %q", s)
+		}
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if len(parts) < 2 || parts[0] == "" {
 			return Ref{}, fmt.Errorf("cannot read a repo from %q", s)
 		}
 		ref := Ref{Repo: parts[0] + "/" + parts[1]}
-		// .../blob/main/file.gguf or .../resolve/main/file.gguf
-		for i := 2; i < len(parts)-1; i++ {
-			if parts[i] == "blob" || parts[i] == "resolve" {
-				ref.File = parts[len(parts)-1]
-			}
+		// .../blob/<revision>/<path> or .../resolve/<revision>/<path>
+		if len(parts) > 4 && (parts[2] == "blob" || parts[2] == "resolve") {
+			ref.File = strings.Join(parts[4:], "/")
 		}
 		return ref, nil
 	}
@@ -104,9 +106,6 @@ type File struct {
 	Name string
 	Size int64
 }
-
-// Progress reports download state. Total is 0 when the server sends no length.
-type Progress func(downloaded, total int64)
 
 // List returns the GGUF files in a repo, smallest first.
 func List(ctx context.Context, repo string) ([]File, error) {
@@ -214,73 +213,27 @@ func Pick(files []File, ref Ref) (File, error) {
 	return files[0], nil
 }
 
-// Download fetches a file into dir and returns its path.
-//
-// Downloads land in a .part file and are renamed on success, so an interrupted
-// pull can never leave something that looks like a usable model.
-func Download(ctx context.Context, repo, filename, dir string, onProgress Progress) (string, error) {
-	url := fmt.Sprintf("%s/%s/resolve/main/%s", endpoint(), repo, filename)
+// pieceNumber is where a split model's piece numbers itself, as in
+// "-00002-of-00005.gguf". Taking the number out leaves a name every piece of
+// one set shares.
+var pieceNumber = regexp.MustCompile(`-\d{5}(-of-\d{5}\.gguf)$`)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
+// Shards returns every piece of the split model f is a piece of, in order, or
+// just f when it stands alone. llama.cpp opens a split model from its first
+// piece and finds the rest beside it, so one piece on its own is no model.
+func Shards(files []File, f File) []File {
+	set := pieceNumber.ReplaceAllString(f.Name, "-*${1}")
+	if set == f.Name {
+		return []File{f}
 	}
-
-	client := &http.Client{Timeout: 6 * time.Hour} // large models on slow links
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("download %s: %w", filename, err)
+	var out []File
+	for _, g := range files {
+		if pieceNumber.ReplaceAllString(g.Name, "-*${1}") == set {
+			out = append(out, g)
+		}
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download %s: %s", filename, resp.Status)
-	}
-
-	final := filepath.Join(dir, filepath.Base(filename))
-	part := final + ".part"
-
-	f, err := os.Create(part)
-	if err != nil {
-		return "", fmt.Errorf("create %s: %w", part, err)
-	}
-	defer func() {
-		f.Close()
-		os.Remove(part) // no-op after a successful rename
-	}()
-
-	w := &progressWriter{w: f, total: resp.ContentLength, onProgress: onProgress}
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		return "", fmt.Errorf("download %s: %w", filename, err)
-	}
-	if err := f.Close(); err != nil {
-		return "", fmt.Errorf("finish %s: %w", part, err)
-	}
-	if err := os.Rename(part, final); err != nil {
-		return "", fmt.Errorf("install %s: %w", final, err)
-	}
-	return final, nil
-}
-
-type progressWriter struct {
-	w          io.Writer
-	total      int64
-	done       int64
-	lastReport time.Time
-	onProgress Progress
-}
-
-func (p *progressWriter) Write(b []byte) (int, error) {
-	n, err := p.w.Write(b)
-	p.done += int64(n)
-
-	// Throttle: a multi-GB download would otherwise repaint thousands of times
-	// a second and cost more than the transfer.
-	if p.onProgress != nil && time.Since(p.lastReport) > 100*time.Millisecond {
-		p.onProgress(p.done, p.total)
-		p.lastReport = time.Now()
-	}
-	return n, err
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 func join(files []File) string {
