@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.10 — 2026-11-04
 
 ### Added — `kinfer launch`: Claude Code or Codex on a local model
 
