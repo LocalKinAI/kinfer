@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.9 — 2026-11-04
 
 ### Fixed — a model with experts in host memory lost its prefix pool on a busy machine
 
