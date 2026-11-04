@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.8 — 2026-11-04
 
 ### Added — drafting with the model's MTP head
 
