@@ -79,7 +79,9 @@ refused a 45k-token prompt that Ollama took without comment. That evening is why
 this exists. After the context is built the cost is measured, and if the measure
 leaves under 2 GiB it is rebuilt smaller — seconds, against the weights'
 half-minute — in the same order of sacrifice: slots first, then the prefix
-pool's own cells, then pool entries, and the context only after that. A pool
+pool's own cells, then — for a model with experts in host memory — as much as
+half of the expert cache placement chose, then pool entries, and the context
+only after that. A pool
 without cells of its own keeps its prompts in whatever the slots leave free and
 gives them back when a slot needs the room, which on a machine with room for one
 conversation still carries an agent's turns forward:

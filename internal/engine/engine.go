@@ -571,6 +571,10 @@ func Open(path string, opts Options) (*Engine, error) {
 	if shape.TrainedCtx > 0 {
 		floor = min(floor, shape.TrainedCtx)
 	}
+	// The expert cache placement chose may give up as much as half of itself
+	// to keep the prefix pool; a cache the operator sized is theirs.
+	cacheAuto := hostExperts != 0 && opts.MoeCache == 0 && moeCache > 0
+	cacheFloor := moeCache / 2
 
 	var lctx llama.Context
 	var draft *drafter
@@ -608,6 +612,7 @@ sizing:
 		// matters most, because a hybrid's per-sequence state is what the
 		// estimate undercounts — and dropping a sequence frees a whole one of
 		// them. Halving alone took the box to 4 slots of 4096.
+		cut := cacheCut(enough, bud.afterCtx)
 		switch {
 		// A bigger micro-batch is speed, not capacity: it goes before
 		// anything a conversation would notice — unless experts are in host
@@ -626,6 +631,15 @@ sizing:
 			// cells, it still carries an agent's turns forward.
 			shared = true
 			log.Printf("%s — the prefix pool shares the slots' cells instead, keeping %d tokens each", measured, perSeq)
+		// Placement sized the expert cache before this measurement saw what a
+		// pool costs: a pool needs the KV cache unified, and a pass over all
+		// of it — on the box, Flash-Next's 4 x 32768 took a pass of 5.8 GiB
+		// where the conversations' own caches took 2.2. The cache gives that
+		// up before the pool goes: a smaller cache costs some decode speed,
+		// no pool reads every turn whole again (11.8 s for 7,800 tokens there).
+		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0 && cacheAuto && moeCache-cut >= cacheFloor:
+			moeCache -= cut
+			log.Printf("%s — the expert cache gives up %d MiB instead, keeping %d prefix with %d MiB of cache", measured, cut, prefix, moeCache)
 		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0:
 			prefix--
 			log.Printf("%s — %d prefix instead, keeping %d tokens each", measured, prefix, perSeq)

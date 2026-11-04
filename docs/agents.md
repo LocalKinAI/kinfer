@@ -66,7 +66,9 @@ off for callers who need it.
 `-prefix` takes `auto` (the default), `off`, or a number of entries. A number is
 taken as given. `auto` gets only the memory the conversations leave: with
 `-slots` and `-ctx` both set, the pool takes cells of its own if they fit, shares
-the slots' cells if only that fits, and is left out otherwise — `-prefix 0`
+the slots' cells if only that fits, and is left out otherwise — a model with
+experts in host memory first gives up as much as half of its expert cache for
+it, because without a pool every turn is read whole again. `-prefix 0`
 used to mean "sized with the rest", and on a 96 GB box running a 73.4 GiB model
 that sized four entries of 16384 into 0.0 GiB. `0` now means none, like `off`.
 

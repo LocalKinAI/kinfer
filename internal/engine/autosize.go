@@ -286,6 +286,16 @@ func lowerUbatch(b int) int {
 	return max(b/2, ubatchDefault)
 }
 
+// cacheSlack is what the expert cache gives up beyond the shortfall, so the
+// next measurement is not short again by what the reading wanders.
+const cacheSlack = 512 << 20
+
+// cacheCut is how many MiB the expert cache gives up when a context left only
+// left free where it needed enough: the shortfall and cacheSlack, rounded up.
+func cacheCut(enough, left uint64) int {
+	return int((sub(enough, left) + cacheSlack + 1<<20 - 1) >> 20)
+}
+
 // spendableOf is what the cache may cost: half of what the weights left, and
 // never the last thinHeadroom of it. The other half is for company — see the
 // policy at the top of this file.

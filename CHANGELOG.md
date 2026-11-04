@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — a model with experts in host memory lost its prefix pool on a busy machine
+
+A prefix pool needs llama.cpp's KV cache unified, and a pass over a unified
+cache is sized for all of it: on the box, Flash-Next's four slots of 32768 took a
+pass of 5.8 GiB, where the conversations' own caches took 2.2. Placement had
+given that memory to the expert cache, so the pool was measured out and every
+turn of a conversation was read whole again — with the box's other memory in
+use, 12.6–13.1 s for a turn of 7,800 tokens, about 70 s for one of kinclaw's
+45,000. The expert cache placement chose now gives up as much as half of itself
+before the pool goes: there it gave up 2.5–3.1 GiB, kept one entry, and the same
+turns took 1.0–1.2 s. Decode is slower with the smaller cache, 21.3–21.8 tok/s
+on a 113-token reply against 24.2–25.1, and the three-turn conversation took 26 s
+instead of 47. A cache set with `-moe-cache` is left as given, and nothing changes
+where the pool already fit: the laptop's Flash-Next and Ornith-397B load as they
+did.
+
 ## v0.1.8 — 2026-11-04
 
 ### Added — drafting with the model's MTP head

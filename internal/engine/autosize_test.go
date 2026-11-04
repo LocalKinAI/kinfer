@@ -311,6 +311,25 @@ func TestLowerUbatchHalves(t *testing.T) {
 	}
 }
 
+// The expert cache gives up the shortfall and half a GiB, in whole MiB: the
+// box's 0.0 GiB left against 2 GiB needed cuts 2560 MiB.
+func TestCacheCutCoversTheShortfall(t *testing.T) {
+	const gib, mib = uint64(1 << 30), uint64(1 << 20)
+	for _, c := range []struct {
+		enough, left uint64
+		want         int
+	}{
+		{2 * gib, 0, 2560},
+		{2 * gib, gib + gib/2, 1024},
+		{2 * gib, 2*gib - 1, 513},
+		{gib, 300 * mib, 1236},
+	} {
+		if got := cacheCut(c.enough, c.left); got != c.want {
+			t.Errorf("cacheCut(%d, %d) = %d MiB, want %d", c.enough, c.left, got, c.want)
+		}
+	}
+}
+
 // A forward pass holds a whole micro-batch when it is larger than
 // batchCapacity, or llama.cpp would cut the micro-batch down to the pass.
 func TestBatchHoldsTheMicroBatch(t *testing.T) {
