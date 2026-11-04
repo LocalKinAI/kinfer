@@ -114,6 +114,8 @@ type generator interface {
 	PromptTokens() int64
 	EvalTokens() int64
 	Drafts() (drafted, accepted int64)
+	Context() (perSlot, most int)
+	CountTokens(msgs []chat.Message, p engine.GenParams) (int, error)
 	Close()
 }
 
@@ -156,6 +158,13 @@ func (s *Server) Handler() http.Handler {
 	// Code, OpenAI's Responses API for Codex. Same engine, same split of thinking
 	// from prose from calls — two more ways of writing it down.
 	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", s.handleAnthropicCountTokens)
+	// Claude Code's first request to a server: HEAD /api/hello, to see that
+	// one answers. It was a 404, counted as a rejected request every session.
+	mux.HandleFunc("/api/hello", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/v1/models/", s.handleModel)
 	mux.HandleFunc("/v1/responses", s.handleResponses)
 
 	mux.HandleFunc("/metrics", s.handleMetrics)
@@ -794,27 +803,33 @@ func (s *Server) handlePS(w http.ResponseWriter, r *http.Request) {
 		Model     string     `json:"model"`
 		Size      int64      `json:"size"`
 		ExpiresAt *time.Time `json:"expires_at,omitempty"`
+		// What each conversation has, as Ollama's ps says it, and the most one
+		// can have (kinfer's own): see engine.Engine.Context.
+		ContextLength int `json:"context_length,omitempty"`
+		ContextMax    int `json:"context_max,omitempty"`
 	}
 
 	type resident struct {
-		path   string
-		expiry time.Time
-		lazy   int64
+		path      string
+		expiry    time.Time
+		lazy      int64
+		ctx, most int
 	}
 	var held []resident
 	s.mu.Lock()
 	if s.cur != nil {
-		held = append(held, resident{s.cur.path, s.expiry, s.cur.lazy})
+		ctx, most := s.cur.eng.Context()
+		held = append(held, resident{s.cur.path, s.expiry, s.cur.lazy, ctx, most})
 	}
 	if s.emb != nil {
-		held = append(held, resident{s.emb.path, s.embExpiry, 0})
+		held = append(held, resident{s.emb.path, s.embExpiry, 0, 0, 0})
 	}
 	s.mu.Unlock()
 
 	loaded := []entry{}
 	for _, h := range held {
 		path, expiry, lazy := h.path, h.expiry, h.lazy
-		e := entry{Name: modelName(path), Model: modelName(path)}
+		e := entry{Name: modelName(path), Model: modelName(path), ContextLength: h.ctx, ContextMax: h.most}
 		if fi, err := os.Stat(path); err == nil {
 			e.Size = fi.Size()
 		}
@@ -1163,8 +1178,12 @@ func withReasoning(m map[string]any, thinking string) map[string]any {
 	return m
 }
 
+// handleOpenAIModels answers GET /v1/models. It lists what /api/tags lists —
+// the models borrowed from Ollama's store as well as kinfer's own — since a
+// request names either. It listed kinfer's own only, and on the box that was
+// five of the ten a request could name.
 func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
-	models, err := s.store.List()
+	models, err := s.store.All()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": err.Error()}})
 		return
@@ -1172,11 +1191,50 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 
 	data := make([]any, len(models))
 	for i, m := range models {
-		data[i] = map[string]any{
-			"id": m.Name, "object": "model", "created": m.Modified.Unix(), "owned_by": "kinfer",
+		data[i] = modelEntry(m.Name, m.Modified)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data, "has_more": false})
+}
+
+// handleModel answers GET /v1/models/{id}: the one model, or 404. OpenAI's
+// clients and Anthropic's both ask for a model this way — Codex and Claude Code
+// do, before using one — and each dialect has its own fields, so the entry
+// carries both.
+func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/v1/models/")
+	path, err := s.store.Resolve(id)
+	if err == nil {
+		if models, err := s.store.All(); err == nil {
+			for _, m := range models {
+				if m.Path == path {
+					writeJSON(w, http.StatusOK, modelEntry(id, m.Modified))
+					return
+				}
+			}
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	msg := fmt.Sprintf("model %q not found", id)
+	if err != nil {
+		msg = err.Error()
+	}
+	writeJSON(w, http.StatusNotFound, map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": "not_found_error", "message": msg, "code": "model_not_found"},
+	})
+}
+
+// modelEntry is a model as OpenAI's models API writes one (id, object,
+// created, owned_by) and as Anthropic's does (type, id, display_name,
+// created_at).
+func modelEntry(name string, modified time.Time) map[string]any {
+	return map[string]any{
+		"id": name, "object": "model", "created": modified.Unix(), "owned_by": "kinfer",
+		"type": "model", "display_name": name, "created_at": modified.UTC().Format(time.RFC3339),
+	}
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

@@ -2,6 +2,53 @@
 
 What kinfer does for agents that send the same long prompts, call tools and think out loud — part of [kinfer](../README.md).
 
+## Starting a coding agent: kinfer launch
+
+```bash
+kinfer launch claude -model qwen3.8                 # Claude Code
+kinfer launch codex -model ornith-1.5:35b           # Codex
+kinfer launch -host 192.168.0.21:11590 claude       # a kinfer on another machine; asks for the model
+kinfer launch claude -model qwen3.8 -- --continue   # the agent's own arguments after --
+```
+
+Claude Code speaks Anthropic's Messages API and Codex OpenAI's Responses API,
+and kinfer serves both, so an agent needs only an address and a model. `launch`
+supplies them and nothing else:
+
+- With no `-host`, it starts the daemon `kinfer run` uses, if nothing answers.
+  That daemon keeps an idle model for 30 minutes, because an agent is idle while
+  you read.
+- It loads the model first, so the agent's first turn does not wait for it.
+- It asks the server how long one conversation can grow, and tells the agent:
+  - Claude Code gets `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. A model it does not know
+    it takes for 200k tokens, and it compacts a session only near that.
+  - Codex gets `model_context_window`.
+- Claude Code gets the model under every name it asks for one:
+  `ANTHROPIC_MODEL`, the opus, sonnet and haiku defaults, and the subagent's. A
+  server that knows no `claude-haiku` would answer its first background request
+  with a 404.
+- Codex gets a provider of its own on the command line (`-c
+  model_providers.kinfer=…`).
+- Nothing is written to either agent's configuration, so there is nothing to
+  restore afterwards. Then launch execs the agent.
+
+`/api/ps` says the context a loaded model gives each conversation
+(`context_length`, as Ollama's does) and the most one can have
+(`context_max`), which is where launch reads it.
+
+Besides `/v1/messages` and `/v1/responses`, the agents ask for a few other
+things, and kinfer answers them:
+
+- `HEAD /api/hello`, which Claude Code opens a session with.
+- `POST /v1/messages/count_tokens`. Its count is the same as the request's
+  `usage.input_tokens`: 288 and 288 on ornith-1.5:35b.
+- `GET /v1/models/{id}`, in both dialects' fields.
+
+Measured from the Mac mini against the box, with ornith-1.5:35b, on the same
+task: write a word counter and three unittest cases, run them, fix what fails.
+Claude Code (2.1.318) finished in 37 s, model load included. Codex (0.155.1)
+finished in 15 s. All three tests passed both times.
+
 ## Prefix pool
 
 An agent's system prompt is identical byte for byte on every turn it ever takes,

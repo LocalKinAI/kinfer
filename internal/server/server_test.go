@@ -451,6 +451,34 @@ func TestPSNamesASplitModelAsTagsDoes(t *testing.T) {
 	}
 }
 
+// ps says the context a loaded model gives each conversation, as Ollama's
+// does, and the most one conversation can have — what kinfer launch tells an
+// agent that compacts its history.
+func TestPSSaysTheContext(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	defer srv.Close()
+	_, release, err := srv.acquire("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/ps", nil))
+	var out struct {
+		Models []struct {
+			ContextLength int `json:"context_length"`
+			ContextMax    int `json:"context_max"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Models) != 1 || out.Models[0].ContextLength != 4096 || out.Models[0].ContextMax != 16384 {
+		t.Errorf("ps = %+v, want 4096 a conversation and 16384 at most", out.Models)
+	}
+}
+
 // TestKeepAliveUnloadsIdleModel checks that an idle model is eventually
 // released — a 7B left resident forever would own most of a 16 GB machine.
 func TestKeepAliveUnloadsIdleModel(t *testing.T) {
@@ -1153,6 +1181,20 @@ func (f *fakeEngine) Load() (waiting, busy, slots int) { return 0, 0, 1 }
 func (f *fakeEngine) PromptTokens() int64              { return 0 }
 func (f *fakeEngine) EvalTokens() int64                { return 0 }
 func (f *fakeEngine) Drafts() (int64, int64)           { return 0, 0 }
+func (f *fakeEngine) Context() (int, int)              { return 4096, 16384 }
+
+// CountTokens counts a token a word, and one more for each tool offered, so a
+// test can tell the tools were passed.
+func (f *fakeEngine) CountTokens(msgs []chat.Message, p engine.GenParams) (int, error) {
+	f.mu.Lock()
+	f.params, f.msgs = p, msgs
+	f.mu.Unlock()
+	n := len(p.Tools)
+	for _, m := range msgs {
+		n += len(strings.Fields(m.Content))
+	}
+	return n, nil
+}
 
 // think:false must reach the engine as NoThink; anything else must not. The
 // asymmetry is deliberate — absent means the model's own default, as it does
@@ -1275,5 +1317,43 @@ func TestMetricsCountA4xxAsRejected(t *testing.T) {
 	}
 	if got := srv.stats.failed.Load() + srv.stats.refused.Load() + srv.stats.ok.Load(); got != 0 {
 		t.Errorf("a 4xx leaked into another outcome: ok+refused+failed = %d", got)
+	}
+}
+
+// A model asked for by id is described in both dialects' fields, and one the
+// store does not have is a 404.
+func TestModelByID(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	defer srv.Close()
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models/alpha", nil))
+	var m map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil || w.Code != http.StatusOK {
+		t.Fatalf("status %d, %s (%v)", w.Code, w.Body.String(), err)
+	}
+	for k, want := range map[string]any{"id": "alpha", "object": "model", "type": "model", "display_name": "alpha", "owned_by": "kinfer"} {
+		if m[k] != want {
+			t.Errorf("%s = %v, want %v", k, m[k], want)
+		}
+	}
+	if _, ok := m["created_at"].(string); !ok {
+		t.Errorf("created_at = %v, want a time", m["created_at"])
+	}
+
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models/nope", nil))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("an unknown model: status %d, want 404", w.Code)
+	}
+}
+
+// Claude Code opens a session with HEAD /api/hello.
+func TestHelloAnswers(t *testing.T) {
+	srv, _ := newTestServer(t)
+	defer srv.Close()
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/api/hello", nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("HEAD /api/hello: status %d, want 200", w.Code)
 	}
 }

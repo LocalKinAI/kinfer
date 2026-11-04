@@ -300,3 +300,35 @@ func TestAnthropicPinsClaudeCodesBillingStamp(t *testing.T) {
 		}
 	}
 }
+
+// count_tokens measures the request as /v1/messages would render it: the
+// system prompt, the history and the tools offered, for the model named.
+func TestAnthropicCountTokens(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	body := `{"model":"alpha",
+	  "system":[{"type":"text","text":"You are Claude Code."}],
+	  "messages":[{"role":"user","content":[{"type":"text","text":"weather in Berlin?"}]}],
+	  "tools":[{"name":"get_weather","input_schema":{"type":"object"}},{"name":"get_time","input_schema":{"type":"object"}}]}`
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/v1/messages/count_tokens?beta=true", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		InputTokens int `json:"input_tokens"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	// The fake engine counts a token a word and one a tool: 4 + 3 + 2.
+	if got.InputTokens != 9 {
+		t.Errorf("input_tokens = %d, want 9", got.InputTokens)
+	}
+
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/v1/messages/count_tokens",
+		strings.NewReader(`{"model":"nope","messages":[{"role":"user","content":"hi"}]}`)))
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), `"not_found_error"`) {
+		t.Errorf("an unknown model: status %d, %s; want 404 in Anthropic's envelope", w.Code, w.Body.String())
+	}
+}

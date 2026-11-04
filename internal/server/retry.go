@@ -172,7 +172,12 @@ func (rt *retrying) Load() (waiting, busy, slots int) { return rt.current().Load
 func (rt *retrying) PromptTokens() int64              { return rt.current().PromptTokens() }
 func (rt *retrying) EvalTokens() int64                { return rt.current().EvalTokens() }
 func (rt *retrying) Drafts() (int64, int64)           { return rt.current().Drafts() }
+func (rt *retrying) Context() (int, int)              { return rt.current().Context() }
 func (rt *retrying) ToolFormat() tools.Format         { return rt.current().ToolFormat() }
+
+func (rt *retrying) CountTokens(msgs []chat.Message, p engine.GenParams) (int, error) {
+	return rt.current().CountTokens(msgs, p)
+}
 
 // Close is the model's lifecycle, not one request's. The server closes engines
 // when it retires them; a handler holding this wrapper must not.

@@ -446,6 +446,54 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 // writeAnthropicError is this dialect's error envelope. Its clients switch on
 // error.type, so the type matters as much as the status.
+// handleAnthropicCountTokens answers POST /v1/messages/count_tokens: how many
+// tokens the request's system prompt, history and tools come to, rendered as
+// /v1/messages would render them for the model. Claude Code asks it to measure a
+// conversation; it went unanswered (404), and Claude Code estimated instead.
+// The model is loaded if it is not, as it would be for the turn being sized.
+func (s *Server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req anthropicRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	msgs, err := anthropicToChat(&req)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	eng, release, err := s.acquire(req.Model)
+	if err != nil {
+		kind := "not_found_error"
+		if acquireStatus(err) == http.StatusBadRequest {
+			kind = "invalid_request_error"
+		}
+		writeAnthropicError(w, acquireStatus(err), kind, err.Error())
+		return
+	}
+	defer release()
+
+	params := engine.DefaultGenParams()
+	if !toolChoiceNone(req.ToolChoice) {
+		params.Tools = anthropicTools(req.Tools)
+	}
+	params.NoThink = req.Thinking != nil && req.Thinking.Type == "disabled"
+	n, err := eng.CountTokens(msgs, params)
+	if err != nil {
+		status, kind := http.StatusInternalServerError, "api_error"
+		if pictureFault(err) {
+			status, kind = http.StatusBadRequest, "invalid_request_error"
+		}
+		writeAnthropicError(w, status, kind, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"input_tokens": n})
+}
+
 func writeAnthropicError(w http.ResponseWriter, status int, kind, message string) {
 	writeJSON(w, status, map[string]any{
 		"type": "error", "error": map[string]string{"type": kind, "message": message},

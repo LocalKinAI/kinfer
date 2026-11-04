@@ -324,6 +324,7 @@ type Engine struct {
 	path  string
 	nCtx  int // per conversation, in the layout it loaded with
 	slots int // likewise; the scheduler's layout can change, see Slots
+	most  int // the longest one conversation can be: flex's longest slot, or nCtx
 
 	// what this model counts toward keeping the GPU warm (warm.go), each 0 or 1
 	warmSplit, warmCache int
@@ -739,7 +740,9 @@ sizing:
 	if !opts.FixedLayout {
 		fx = newFlex(home, shape.TrainedCtx, contextBuilder(model, home, bud, moeCache, shape.CacheQ8, shape.Draft))
 	}
+	e.most = e.nCtx
 	if fx != nil {
+		e.most = fx.most
 		log.Printf("slots: %d tokens of context as %s; a prompt that needs a longer slot gets %s while it runs "+
 			"— the rest wait, and %s comes back when nothing needs the longer slots. -flex=false keeps %s.",
 			fx.total, home, fx.offers(), home, home)
@@ -895,6 +898,39 @@ func (e *Engine) Slots() int {
 	}
 	return int(sched.nSlots.Load())
 }
+
+// CountTokens is how many tokens msgs come to as a prompt, rendered with the
+// tools and thinking p asks for: what Anthropic's count_tokens answers, and
+// what an agent sizes its history by. A picture counts as the cells the
+// projector lays it out in, as it does when the prompt is read. Tokenizing
+// with libmtmd prepares the pictures on the CPU only; the encoder, which the
+// scheduler alone runs, is not touched.
+func (e *Engine) CountTokens(msgs []chat.Message, p GenParams) (int, error) {
+	text := e.tpl.RenderWith(msgs, p.Tools, p.thinking())
+	if !showsPictures(msgs) {
+		toks, err := llama.Tokenize(e.vocab, text, true, true)
+		return len(toks), err
+	}
+	if e.mtmd == 0 {
+		return 0, PictureError{ErrNoPictures}
+	}
+	var pictures [][]byte
+	for _, m := range msgs {
+		pictures = append(pictures, m.Images...)
+	}
+	mp, err := llama.TokenizeMedia(e.mtmd, text, pictures)
+	if err != nil {
+		return 0, PictureError{err}
+	}
+	defer mp.Free()
+	return mp.Tokens, nil
+}
+
+// Context is the context each conversation has in the layout the model loaded
+// with, and the most one conversation can have: flex gives a longer prompt a
+// longer slot while it runs, and the others wait. An agent compacting its
+// history should know the second, or it is cut off where it thought it had room.
+func (e *Engine) Context() (perSlot, most int) { return e.nCtx, e.most }
 
 // Broken reports that llama.cpp's backend failed fatally and this engine can no
 // longer generate. The usual cause is the GPU running out of memory, after

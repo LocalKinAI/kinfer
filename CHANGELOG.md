@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Added — `kinfer launch`: Claude Code or Codex on a local model
+
+`kinfer launch claude` and `kinfer launch codex` start the agent talking to
+kinfer: to the daemon `kinfer run` uses, started if nothing answers, or with
+`-host` to a kinfer on another machine. With no agent or no `-model`, launch
+asks. The model is loaded before the agent starts. The agent is told how long a
+conversation can grow, so it compacts its history before kinfer would have to
+drop turns. Claude Code is given the model under every name it asks for one, so
+no background request asks for a claude-haiku the server does not have. Codex is
+given a provider on its command line. Nothing is written to either agent's
+configuration. From the Mac mini, against ornith-1.5:35b on the box, each wrote a
+word counter and its tests and ran them: Claude Code in 37 s, Codex in 15 s.
+
+`/api/ps` says the context a loaded model gives each conversation
+(`context_length`, as Ollama's does) and the most one can have (`context_max`).
+
+### Added — what Claude Code and Codex ask for besides a reply
+
+- **`POST /v1/messages/count_tokens`**: Anthropic's count of a request's tokens,
+  rendered the way `/v1/messages` renders it — system prompt, history and tools,
+  with thinking on or off. On ornith-1.5:35b it gave 288 and 284 for a request
+  whose `usage.input_tokens` came back 288 and 284.
+- **`GET /v1/models/{id}`**: one model, in OpenAI's fields and Anthropic's.
+- **`HEAD /api/hello`**: Claude Code's first request to a server. Every session
+  used to count it as a rejected request in `/metrics`.
+
+A Claude Code session and a Codex session through `kinfer launch` now make no
+request kinfer refuses: 18 answered, none rejected.
+
+`GET /v1/models` now lists the models borrowed from Ollama's store as well as
+kinfer's own, as `/api/tags` does. On the box it listed five of the ten that a
+request could name.
+
 ## v0.1.9 — 2026-11-04
 
 ### Fixed — a model with experts in host memory lost its prefix pool on a busy machine

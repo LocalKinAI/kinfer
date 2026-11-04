@@ -29,6 +29,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer list                  show models kinfer can load, including Ollama's
   kinfer rm <model>            delete a model
   kinfer run <model> [prompt]  chat with a model (no prompt = interactive)
+  kinfer launch [agent]        start Claude Code or Codex talking to kinfer
   kinfer ps                    show which model is loaded right now
   kinfer stop                  stop the background daemon run started
   kinfer plan <model>          what -slots and -ctx to serve it with
@@ -44,6 +45,7 @@ Examples:
   kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
   kinfer run qwen                        # interactive, model stays warm
   kinfer run qwen "explain merkle trees" # one shot, same warm model
+  kinfer launch claude -model qwen3.8    # Claude Code on a local model
   kinfer worker -on jackysub             # lend the GPU of the Mac at the other end of the cable
   kinfer serve -addr :11500
 
@@ -85,6 +87,8 @@ func main() {
 		err = cmdRemove(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "launch":
+		err = cmdLaunch(os.Args[2:])
 	case "stop":
 		err = cmdStop(os.Args[2:])
 	case "ps":
