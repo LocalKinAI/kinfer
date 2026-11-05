@@ -316,7 +316,15 @@ func FromModel(model llama.Model, path string) *Template {
 	if llama.ModelMeta(model, "general.architecture") == "deepseek41" {
 		return deepseekV41
 	}
-	tmpl := llama.ChatTemplate(model)
+	return FromTemplate(llama.ChatTemplate(model), path)
+}
+
+// FromTemplate is FromModel for a template that did not come from a GGUF —
+// the chat_template.jinja beside an MLX model's safetensors. It renders
+// through llama.cpp's template engine all the same, which needs the library
+// bound but no model loaded, so a model reaches the same prompt whichever
+// backend runs it.
+func FromTemplate(tmpl, path string) *Template {
 	if tmpl == "" {
 		return Detect(path)
 	}

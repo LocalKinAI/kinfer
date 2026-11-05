@@ -26,6 +26,7 @@ import (
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/engine"
+	"github.com/LocalKinAI/kinfer/internal/mlxengine"
 	"github.com/LocalKinAI/kinfer/internal/store"
 	"github.com/LocalKinAI/kinfer/internal/tools"
 )
@@ -120,6 +121,10 @@ type generator interface {
 }
 
 func openEngine(path string, opts engine.Options) (generator, error) {
+	// A directory of safetensors is an MLX model; a file is a GGUF.
+	if mlxengine.IsModelDir(path) {
+		return mlxengine.Open(path, opts)
+	}
 	return engine.Open(path, opts)
 }
 
