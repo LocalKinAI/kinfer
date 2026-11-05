@@ -1,0 +1,26 @@
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -206,6 +206,23 @@
+ 
+ // the tensor API headers are exposed to the shader compiler only at Metal language version 4.0
+ static void ggml_metal_compile_options_set_lang(MTLCompileOptions * options, bool has_tensor) {
++    // The default language version follows the SDK the main executable says it
++    // was linked against, not the OS: an executable from Go's own linker (Go
++    // without cgo) says macOS 12 and gets Metal 2.4, where common.h drops the
++    // bfloat kernels the device reports having, and the first BF16 matmul
++    // finds none. Ask for what an executable linked against a current SDK gets.
++    MTLLanguageVersion want = options.languageVersion;
++    if (@available(macOS 26.0, iOS 26.0, *)) {
++        want = (MTLLanguageVersion) MTLLanguageVersion4_0_GGML;
++    } else if (@available(macOS 15.0, iOS 18.0, *)) {
++        want = MTLLanguageVersion3_2;
++    } else if (@available(macOS 14.0, iOS 17.0, *)) {
++        want = MTLLanguageVersion3_1;
++    }
++    if (options.languageVersion < want) {
++        options.languageVersion = want;
++    }
++
+     if (!has_tensor) {
+         return;
+     }

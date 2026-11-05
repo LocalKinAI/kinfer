@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — a kinfer built without cgo died on its first BF16 GGUF
+
+Metal compiles llama.cpp's kernels at the language version of the SDK the
+executable says it was linked against, not the one the Mac has. Go's own
+linker, which links kinfer when cgo is off (`CGO_ENABLED=0`, or a Mac without a C
+compiler), says macOS 12, and that gets Metal 2.4. Below 3.1 llama.cpp's kernels
+leave out their bfloat versions while the GPU still reports bfloat, so the first
+BF16 matrix product found no kernel (`kernel not found in any metal library`)
+and the server crashed. The released binaries come from the system linker and
+were not affected. The patched libraries (`scripts/build-libs.sh`, now
+`darwin_arm64_b11998k6`) ask for what a current SDK gets, 4.0 on macOS 26,
+however kinfer was linked. On the box, Qwen3.5-0.8B BF16 now gives the same
+reply from either build. The release set that `scripts/fetch-libs.sh` takes is
+not patched.
+
 ## v0.1.10 — 2026-11-04
 
 ### Added — `kinfer launch`: Claude Code or Codex on a local model

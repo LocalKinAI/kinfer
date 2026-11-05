@@ -24,9 +24,11 @@
 # for two seconds when a worker turning from its last connection refuses the
 # next, rather than abort the load; and a worker can report the free memory of
 # the whole GPU, not just its own share (GGML_METAL_FREE_DEVICE), so it is not
-# given the memory its machine's other apps hold. The libraries land in
-# internal/nativelib/libs/darwin_arm64_${VERSION}k5, which replaces the release
-# set the way one release replaces another (see fetch-libs.sh).
+# given the memory its machine's other apps hold. Metal compiles the kernels at
+# the language version a current SDK gets, also for a kinfer built without cgo,
+# which would otherwise get Metal 2.4 and lose the bfloat kernels. The libraries
+# land in internal/nativelib/libs/darwin_arm64_${VERSION}k6, which replaces the
+# release set the way one release replaces another (see fetch-libs.sh).
 #
 # Needs cmake, ninja and Xcode's command line tools; about two minutes on an M4.
 # Without a source tarball it downloads one from GitHub, about 39 MB.
@@ -34,12 +36,12 @@
 set -euo pipefail
 
 VERSION=b11998 # the release the patches are made against
-LEVEL=k5       # bumped when the patches change, so a cached copy is not reused
+LEVEL=k6       # bumped when the patches change, so a cached copy is not reused
 SRC=""
 for arg in "$@"; do
   case "$arg" in
   -h | --help)
-    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *) SRC=$arg ;;
