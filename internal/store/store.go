@@ -58,6 +58,10 @@ type Model struct {
 	// Format is "gguf", or "safetensors" for a directory.
 	Format string
 
+	// EditOf names the model an edited one was made from (kinfer edit), or
+	// is empty.
+	EditOf string
+
 	// Size in bytes.
 	Size int64
 
@@ -132,7 +136,7 @@ func (s *Store) List() ([]Model, error) {
 		path := filepath.Join(s.root, e.Name())
 		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
 			if d := readModelDir(path); d.complete() {
-				out = append(out, Model{Name: e.Name(), Path: path, Format: "safetensors",
+				out = append(out, Model{Name: e.Name(), Path: path, Format: "safetensors", EditOf: editOf(path),
 					Size: d.size, Modified: d.modified, Source: FromKinfer})
 			}
 			continue
@@ -611,6 +615,19 @@ func readModelDir(dir string) modelDir {
 		}
 	}
 	return d
+}
+
+// editOf is the base an edited model's edit.json names, or "".
+func editOf(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, "edit.json"))
+	if err != nil {
+		return ""
+	}
+	var rec struct {
+		Base string `json:"base"`
+	}
+	json.Unmarshal(b, &rec)
+	return rec.Base
 }
 
 func nameOf(filename string) string {

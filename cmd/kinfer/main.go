@@ -39,6 +39,9 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer uninstall             stop it and remove the service
   kinfer fit                   what this machine can actually run
   kinfer can-run <hf-repo>     whether a model on Hugging Face will run here
+  kinfer edit -from <model> <base> <name>   an edited model: the base's files, and the tensors that differ
+  kinfer eval <model> <set>    run a set of problems many at once and grade the replies
+  kinfer eval -compare <a> <b> two runs side by side: what each got right, and whether it is chance
   kinfer version               this build, and the llama.cpp inside it
 
 Examples:
@@ -108,6 +111,10 @@ func main() {
 		err = cmdPlan(os.Args[2:])
 	case "can-run":
 		err = cmdCanRun(os.Args[2:])
+	case "edit":
+		err = cmdEdit(os.Args[2:])
+	case "eval":
+		err = cmdEval(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -156,6 +163,9 @@ func cmdList(args []string) error {
 		source := string(m.Source)
 		if m.Format == "safetensors" {
 			source += ", MLX"
+		}
+		if m.EditOf != "" {
+			source += ", edit of " + m.EditOf
 		}
 		fmt.Printf("%-44s %10s  %-12s %s\n",
 			m.Name, store.HumanSize(m.Size), humanTime(m.Modified), source)

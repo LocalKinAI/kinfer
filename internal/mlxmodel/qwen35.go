@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/LocalKinAI/kinfer/internal/mlx"
@@ -219,6 +220,39 @@ func (m *Qwen35) head() Linear {
 // LoadQwen35 reads config.json and the safetensors files in dir: a Hugging
 // Face release, or an MLX conversion of one (mlx_lm.convert), quantized or not.
 //
+// EditFile is an edited model's weights that differ from its base's, beside
+// the base's own files (see kinfer edit): loaded last, each of its tensors
+// takes the place of the base's of the same name.
+const EditFile = "edit.safetensors"
+
+// applyEdit puts the tensors of the edit file at path in place of raw's. A
+// tensor the base does not have, or has in another shape or dtype, is an
+// error: an edit that changes nothing it means to is worse than none.
+func applyEdit(raw map[string]mlx.Array, path string) error {
+	t, err := mlx.LoadSafetensors(path)
+	if err != nil {
+		return err
+	}
+	var bad error
+	for k, v := range t {
+		old, ok := raw[k]
+		switch {
+		case bad != nil:
+		case !ok:
+			bad = fmt.Errorf("%s: the base model has no tensor %s", path, k)
+		case old.Dtype() != v.Dtype() || !slices.Equal(old.Shape(), v.Shape()):
+			bad = fmt.Errorf("%s: %s is %v %v, the base's is %v %v", path, k, v.Dtype(), v.Shape(), old.Dtype(), old.Shape())
+		}
+		if bad != nil {
+			v.Free()
+			continue
+		}
+		old.Free()
+		raw[k] = v
+	}
+	return bad
+}
+
 // A Hugging Face release stores what mlx-lm's sanitize changes: conv1d
 // weights as [C, 1, K] where MLX's conv1d wants [C, K, 1], and the five
 // RMSNorm weights Qwen3.5 centres on zero (the layer norms, the final norm,
@@ -232,6 +266,13 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 		return nil, err
 	}
 	files, _ := filepath.Glob(filepath.Join(dir, "*.safetensors"))
+	var edit string
+	for i, f := range files {
+		if filepath.Base(f) == EditFile {
+			edit, files = f, append(files[:i:i], files[i+1:]...)
+			break
+		}
+	}
 	if len(files) == 0 {
 		return nil, fmt.Errorf("no .safetensors in %s", dir)
 	}
@@ -243,6 +284,14 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 		}
 		for k, v := range t {
 			raw[k] = v
+		}
+	}
+	if edit != "" {
+		if err := applyEdit(raw, edit); err != nil {
+			for _, v := range raw {
+				v.Free()
+			}
+			return nil, err
 		}
 	}
 	// Weights used as stored are taken out of raw; whatever is left — the
