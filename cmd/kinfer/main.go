@@ -25,7 +25,7 @@ import (
 
 const usage = `kinfer — a single-file local inference runtime
 
-  kinfer pull <repo>[:quant]   download a model from Hugging Face
+  kinfer pull <repo>[:quant]   download a model from Hugging Face: a GGUF, or an MLX repo of safetensors
   kinfer list                  show models kinfer can load, including Ollama's
   kinfer rm <model>            delete a model
   kinfer run <model> [prompt]  chat with a model (no prompt = interactive)
@@ -43,6 +43,7 @@ const usage = `kinfer — a single-file local inference runtime
 
 Examples:
   kinfer pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
+  kinfer pull mlx-community/Qwen3.8-27B-4bit  # served on MLX (macOS 26.2 or later)
   kinfer run qwen                        # interactive, model stays warm
   kinfer run qwen "explain merkle trees" # one shot, same warm model
   kinfer launch claude -model qwen3.8    # Claude Code on a local model
@@ -152,8 +153,12 @@ func cmdList(args []string) error {
 
 	fmt.Printf("%-44s %10s  %-12s %s\n", "NAME", "SIZE", "MODIFIED", "SOURCE")
 	for _, m := range models {
+		source := string(m.Source)
+		if m.Format == "safetensors" {
+			source += ", MLX"
+		}
 		fmt.Printf("%-44s %10s  %-12s %s\n",
-			m.Name, store.HumanSize(m.Size), humanTime(m.Modified), m.Source)
+			m.Name, store.HumanSize(m.Size), humanTime(m.Modified), source)
 	}
 	// What a stopped pull left takes room like a model and loads like none;
 	// shown here, it gets finished or removed rather than forgotten.

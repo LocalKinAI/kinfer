@@ -1,6 +1,9 @@
 package hub
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseRef(t *testing.T) {
 	cases := []struct {
@@ -194,5 +197,40 @@ func TestPickLeavesProjectorsOut(t *testing.T) {
 	}
 	if got, _ := Pick([]File{{Name: "mmproj-F16.gguf"}, {Name: "model-Q8_0.gguf"}}, Ref{Repo: "o/r"}); got.Name != "model-Q8_0.gguf" {
 		t.Errorf("Pick with no quantization = %q", got.Name)
+	}
+}
+
+// An MLX repo is pulled as the directory it is, minus what kinfer does not
+// read; config.json comes last, so the directory is no model until the end.
+func TestMLXFiles(t *testing.T) {
+	repo := []File{
+		{Name: ".gitattributes"}, {Name: "README.md"}, {Name: "chat_template.jinja"},
+		{Name: "config.json"}, {Name: "merges.txt"}, {Name: "model-00001-of-00002.safetensors", Size: 5},
+		{Name: "model-00002-of-00002.safetensors", Size: 3}, {Name: "model.safetensors.index.json"},
+		{Name: "original/model.safetensors"}, {Name: "tokenizer.json"}, {Name: "tokenizer_config.json"},
+	}
+	got, ok := MLXFiles(repo)
+	if !ok {
+		t.Fatal("a repo with config.json, tokenizer.json and safetensors is no MLX model")
+	}
+	want := "model-00001-of-00002.safetensors model-00002-of-00002.safetensors chat_template.jinja merges.txt " +
+		"model.safetensors.index.json tokenizer.json tokenizer_config.json config.json"
+	if s := strings.TrimSpace(join(got)); strings.ReplaceAll(s, ", ", " ") != want {
+		t.Errorf("MLXFiles = %s\nwant          %s", s, want)
+	}
+	// Without its config, its tokenizer or its weights, it is no model.
+	for _, drop := range []string{"config.json", "tokenizer.json", ".safetensors"} {
+		var less []File
+		for _, f := range repo {
+			if !strings.HasSuffix(f.Name, drop) {
+				less = append(less, f)
+			}
+		}
+		if _, ok := MLXFiles(less); ok {
+			t.Errorf("without its %s it is still an MLX model", drop)
+		}
+	}
+	if len(GGUFs(repo)) != 0 {
+		t.Error("an MLX repo has GGUFs")
 	}
 }

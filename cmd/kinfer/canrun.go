@@ -12,6 +12,8 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/hardware"
 	"github.com/LocalKinAI/kinfer/internal/hub"
 	"github.com/LocalKinAI/kinfer/internal/llama"
+	"github.com/LocalKinAI/kinfer/internal/mlxengine"
+	"github.com/LocalKinAI/kinfer/internal/mlxmodel"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
@@ -25,7 +27,8 @@ import (
 // quantisation must fit in memory. The third is where most large models fail,
 // and it is about total parameters — a mixture-of-experts model activates a
 // fraction of its weights per token, which makes it fast, but every expert
-// still has to be resident because routing may reach any of them.
+// still has to be resident because routing may reach any of them. A repo of
+// safetensors kinfer serves on MLX needs no conversion, only the room.
 func cmdCanRun(args []string) error {
 	fs := flag.NewFlagSet("can-run", flag.ExitOnError)
 	all := fs.Bool("all", false, "list every quantisation, not just the ones that fit")
@@ -53,10 +56,11 @@ func cmdCanRun(args []string) error {
 	// The repo listing comes first and its failure is fatal. Carrying on would
 	// print "architecture unknown" and "nothing fits", which read as findings
 	// about the model rather than as a network that did not answer.
-	quants, err := hub.Quants(ctx, repo)
+	files, err := hub.Files(ctx, repo)
 	if err != nil {
 		return err
 	}
+	quants := hub.QuantsIn(repo, files)
 	arch, archFrom := "", ""
 	var archErr error
 
@@ -86,6 +90,9 @@ func cmdCanRun(args []string) error {
 	case arch == "":
 		fmt.Printf("  architecture   unknown — no GGUF metadata and no config.json\n")
 
+	case archFrom == "config.json" && len(quants) == 0 && mlxmodel.Serves(arch):
+		fmt.Printf("  architecture   %-16s ✓ kinfer serves it on MLX  (from config.json)\n", arch)
+
 	case archFrom == "config.json":
 		// A repo's config.json names the architecture in Hugging Face's
 		// vocabulary, and the GGUF converter renames it: DeepSeek-V4.1 is
@@ -114,8 +121,30 @@ func cmdCanRun(args []string) error {
 	}
 
 	// ── where the weights are ────────────────────────────────────────────────
+	if set, ok := hub.MLXFiles(files); len(quants) == 0 && ok && mlxmodel.Serves(arch) {
+		// What a model on MLX holds in memory is its weights as they are.
+		var size int64
+		for _, f := range set {
+			if strings.HasSuffix(f.Name, ".safetensors") {
+				size += f.Size
+			}
+		}
+		fmt.Printf("  weights        safetensors, served on MLX\n")
+		if err := mlxengine.Usable(); err != nil {
+			fmt.Printf("\n  Not on this Mac: %v.\n", err)
+			return nil
+		}
+		fmt.Printf("  machine        %s\n", hardware.Detect())
+		fmt.Printf("  budget         %s for weights\n\n", store.HumanSize(rec.Budget))
+		fmt.Printf("  %-22s %10s  %s\n", "WEIGHTS", "IN MEMORY", "")
+		fmt.Printf("  %-22s %10s  %s\n", "safetensors", store.HumanSize(size), rec.Fits(size))
+		if size <= rec.Budget {
+			fmt.Printf("\n  kinfer pull %s\n", repo)
+		}
+		return nil
+	}
 	if len(quants) == 0 {
-		fmt.Printf("  weights        safetensors only — kinfer needs GGUF\n\n")
+		fmt.Printf("  weights        safetensors only — kinfer needs GGUF, or a model it serves on MLX\n\n")
 		name := repo
 		if i := strings.LastIndex(name, "/"); i >= 0 {
 			name = name[i+1:]

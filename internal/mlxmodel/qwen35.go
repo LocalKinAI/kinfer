@@ -92,6 +92,10 @@ func (q *Quantization) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// Serves reports whether a config.json's model_type is one this package
+// implements.
+func Serves(modelType string) bool { return modelType == "qwen3_5" || modelType == "qwen3_5_text" }
+
 // ReadQwen35Config reads dir/config.json, from text_config when the file is
 // a multimodal release's.
 func ReadQwen35Config(dir string) (*Qwen35Config, error) {
@@ -107,7 +111,7 @@ func ReadQwen35Config(dir string) (*Qwen35Config, error) {
 	if err := json.Unmarshal(raw, &outer); err != nil {
 		return nil, err
 	}
-	if outer.ModelType != "qwen3_5" && outer.ModelType != "qwen3_5_text" {
+	if !Serves(outer.ModelType) {
 		return nil, fmt.Errorf("model_type %q is not qwen3_5", outer.ModelType)
 	}
 	text := raw

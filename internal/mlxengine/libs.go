@@ -59,10 +59,8 @@ func ensureLibs() (string, error) {
 	if os.Getenv("KINFER_MLX_LIB") != "" || complete(dir) {
 		return dir, nil
 	}
-	if major, minor, ok := macOS(); ok && (major < mlxLibs.MinMacOS[0] ||
-		major == mlxLibs.MinMacOS[0] && minor < mlxLibs.MinMacOS[1]) {
-		return "", fmt.Errorf("MLX models need macOS %d.%d or later; this Mac has %d.%d",
-			mlxLibs.MinMacOS[0], mlxLibs.MinMacOS[1], major, minor)
+	if err := Usable(); err != nil {
+		return "", err
 	}
 	url := mlxLibs.URL
 	if u := os.Getenv("KINFER_MLX_LIBS_URL"); u != "" {
@@ -99,6 +97,17 @@ func ensureLibs() (string, error) {
 	}
 	log.Printf("mlx: libraries ready in %s", dir)
 	return dir, nil
+}
+
+// Usable says why this Mac cannot serve MLX models, or nil when it can: the
+// libraries kinfer fetches need macOS 26.2.
+func Usable() error {
+	if major, minor, ok := macOS(); ok && (major < mlxLibs.MinMacOS[0] ||
+		major == mlxLibs.MinMacOS[0] && minor < mlxLibs.MinMacOS[1]) {
+		return fmt.Errorf("MLX models need macOS %d.%d or later; this Mac has %d.%d",
+			mlxLibs.MinMacOS[0], mlxLibs.MinMacOS[1], major, minor)
+	}
+	return nil
 }
 
 // complete reports that dir holds every file of the pinned package.

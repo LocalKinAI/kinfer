@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/hub"
+	"github.com/LocalKinAI/kinfer/internal/mlxengine"
+	"github.com/LocalKinAI/kinfer/internal/mlxmodel"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
 
@@ -21,7 +25,7 @@ func cmdPull(args []string) error {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: kinfer pull [-connections n] <repo>[:quant]")
+		return fmt.Errorf("usage: kinfer pull [-connections n] <repo>[:quant]   (a GGUF repo, or an MLX one of safetensors)")
 	}
 
 	ref, err := hub.ParseRef(fs.Arg(0))
@@ -40,9 +44,16 @@ func cmdPull(args []string) error {
 	context.AfterFunc(ctx, stop)
 
 	fmt.Printf("querying %s via %s…\n", ref.Repo, hub.Endpoint())
-	files, err := hub.List(ctx, ref.Repo)
+	all, err := hub.Files(ctx, ref.Repo)
 	if err != nil {
 		return err
+	}
+	files := hub.GGUFs(all)
+	if len(files) == 0 {
+		if set, ok := hub.MLXFiles(all); ok {
+			return pullMLX(ctx, st, ref, set, *conns)
+		}
+		return fmt.Errorf("%s contains no .gguf files, nor safetensors kinfer can serve on MLX", ref.Repo)
 	}
 	pick, err := hub.Pick(files, ref)
 	if err != nil {
@@ -107,6 +118,64 @@ func cmdPull(args []string) error {
 		fmt.Printf("✅ %s (sha256 matches Hugging Face's)\n", first)
 	} else {
 		fmt.Printf("✅ %s\n", first)
+	}
+	return nil
+}
+
+// pullMLX fetches a model kinfer serves on MLX: the repo's safetensors and the
+// files that describe them, into a directory of the store named for the repo.
+func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, conns int) error {
+	if ref.Quant != "" || ref.File != "" {
+		return fmt.Errorf("%s is safetensors, pulled whole: kinfer pull %s", ref.Repo, ref.Repo)
+	}
+	arch, err := hub.ModelType(ctx, ref.Repo)
+	if err != nil {
+		return err
+	}
+	if !mlxmodel.Serves(arch) {
+		return fmt.Errorf("%s is safetensors of model_type %q, which kinfer does not serve on MLX (Qwen3.5 dense, qwen3_5, it does); a GGUF of it may run on llama.cpp: kinfer can-run %s",
+			ref.Repo, arch, ref.Repo)
+	}
+	if err := mlxengine.Usable(); err != nil {
+		return err
+	}
+
+	name := path.Base(ref.Repo)
+	dir := filepath.Join(st.Root(), name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	m := &pullMeter{tty: isTerminal(int(os.Stdout.Fd()))}
+	if m.tty {
+		m.width = termWidth(int(os.Stdout.Fd()))
+	}
+	for _, f := range set {
+		m.total += f.Size
+	}
+	fmt.Printf("pulling %s, %d files (%s), served on MLX\n", name, len(set), store.HumanSize(m.total))
+	if err := hub.Room(dir, set); err != nil {
+		os.Remove(dir) // only if nothing is in it yet
+		return err
+	}
+
+	// Only the weights are stored by sha256 on Hugging Face; the small files
+	// are git's, with a hash of another kind.
+	checked := true
+	for _, f := range set {
+		m.start(f.Name)
+		_, err := hub.Download(ctx, ref.Repo, f.Name, dir, conns, m.show)
+		m.end()
+		if err != nil {
+			return err
+		}
+		if strings.HasSuffix(f.Name, ".safetensors") {
+			checked = checked && m.last.Total > 0 && m.last.Checked == m.last.Total
+		}
+	}
+	if checked {
+		fmt.Printf("✅ %s (the weights' sha256 matches Hugging Face's)\n", dir)
+	} else {
+		fmt.Printf("✅ %s\n", dir)
 	}
 	return nil
 }

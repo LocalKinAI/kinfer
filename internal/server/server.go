@@ -888,10 +888,14 @@ func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
 	if sh, err := store.ReadShape(path); err == nil && sh.Embeds() {
 		capabilities = []string{"embedding"}
 	}
+	format := "gguf"
+	if mlxengine.IsModelDir(path) {
+		format = "safetensors"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"details": map[string]any{
 			"family":             chat.Detect(path).Name,
-			"format":             "gguf",
+			"format":             format,
 			"parameter_size":     "",
 			"quantization_level": "",
 		},

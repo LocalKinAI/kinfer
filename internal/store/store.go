@@ -44,13 +44,19 @@ func shardOf(filename string) (base string, index, of int) {
 	return filename[:len(filename)-len(m[0])], number(m[1]), number(m[2])
 }
 
-// Model is one GGUF file on disk.
+// Model is one GGUF file on disk, or one directory of safetensors that kinfer
+// serves on MLX.
 type Model struct {
-	// Name is how the user refers to it — the filename without .gguf.
+	// Name is how the user refers to it — the filename without .gguf, or the
+	// directory's name.
 	Name string
 
-	// Path is the absolute location.
+	// Path is the absolute location: the file, the first piece of a split
+	// model, or the directory.
 	Path string
+
+	// Format is "gguf", or "safetensors" for a directory.
+	Format string
 
 	// Size in bytes.
 	Size int64
@@ -123,10 +129,17 @@ func (s *Store) List() ([]Model, error) {
 
 	var out []Model
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") || isProjector(e.Name()) {
+		path := filepath.Join(s.root, e.Name())
+		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+			if d := readModelDir(path); d.complete() {
+				out = append(out, Model{Name: e.Name(), Path: path, Format: "safetensors",
+					Size: d.size, Modified: d.modified, Source: FromKinfer})
+			}
 			continue
 		}
-		path := filepath.Join(s.root, e.Name())
+		if !strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") || isProjector(e.Name()) {
+			continue
+		}
 
 		// os.Stat, not DirEntry.Info: the latter does not follow symlinks, and
 		// a symlinked model would report the size of the link itself — a
@@ -141,7 +154,7 @@ func (s *Store) List() ([]Model, error) {
 		if base, idx, of := shardOf(e.Name()); idx > 0 {
 			m := shards[base]
 			if m == nil {
-				m = &set{Model: Model{Name: base, Source: FromKinfer}, of: of}
+				m = &set{Model: Model{Name: base, Format: "gguf", Source: FromKinfer}, of: of}
 				shards[base] = m
 			}
 			m.have++
@@ -160,6 +173,7 @@ func (s *Store) List() ([]Model, error) {
 		out = append(out, Model{
 			Name:      nameOf(e.Name()),
 			Path:      path,
+			Format:    "gguf",
 			Size:      info.Size(),
 			Modified:  info.ModTime(),
 			Source:    FromKinfer,
@@ -316,6 +330,11 @@ func (s *Store) Remove(name string) error {
 		return fmt.Errorf("%s is outside the model directory; delete it yourself", path)
 	}
 
+	// A directory goes whole, with whatever else a download left in it.
+	if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+		return os.RemoveAll(path)
+	}
+
 	// A split model is deleted whole. Removing only the piece that was resolved
 	// would leave tens of gigabytes behind that nothing can load.
 	files, err := s.Shards(path)
@@ -344,7 +363,11 @@ func (s *Store) Remove(name string) error {
 
 func removeAll(files []string) error {
 	for _, f := range files {
-		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+		remove := os.Remove
+		if fi, err := os.Lstat(f); err == nil && fi.IsDir() {
+			remove = os.RemoveAll // a directory model's, found in the store
+		}
+		if err := remove(f); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
@@ -400,6 +423,7 @@ func (s *Store) Unfinished() ([]Unfinished, error) {
 		unsized   bool
 	}
 	models := map[string]*model{}
+	var out []Unfinished
 	get := func(name string, of int) *model {
 		m := models[name]
 		if m == nil {
@@ -412,7 +436,16 @@ func (s *Store) Unfinished() ([]Unfinished, error) {
 	for _, e := range entries {
 		path := filepath.Join(s.root, e.Name())
 		info, err := os.Stat(path)
-		if err != nil || info.IsDir() {
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			// A directory a pull of an MLX model is filling, or stopped
+			// filling. How big it will be, nothing here says until the last
+			// file has started.
+			if d := readModelDir(path); d.unfinished() {
+				out = append(out, Unfinished{Name: e.Name(), Files: []string{path}, Size: d.size, Modified: d.modified})
+			}
 			continue
 		}
 		if final, ok := strings.CutSuffix(e.Name(), ".part"); ok && strings.HasSuffix(strings.ToLower(final), ".gguf") {
@@ -450,7 +483,6 @@ func (s *Store) Unfinished() ([]Unfinished, error) {
 		}
 	}
 
-	var out []Unfinished
 	for _, m := range models {
 		whole := m.have == m.of
 		if whole && m.arriving == 0 {
@@ -501,6 +533,84 @@ func readRecord(path string) (done, size int64, ok bool) {
 		done += n
 	}
 	return done, rec.Size, true
+}
+
+// modelDir is what a directory in the store holds of a model kinfer serves on
+// MLX, laid out as Hugging Face publishes one: config.json, tokenizer.json,
+// and the weights in safetensors, one file or the pieces
+// model.safetensors.index.json lists.
+type modelDir struct {
+	config, tokenizer bool
+	weights           int   // safetensors files here
+	missing           int   // pieces the index names that are not here
+	arriving          int   // files still name.part
+	size              int64 // bytes here; of a file arriving, what has arrived
+	modified          time.Time
+}
+
+func (d modelDir) complete() bool {
+	return d.config && d.tokenizer && d.weights > 0 && d.missing == 0 && d.arriving == 0
+}
+
+// unfinished is a directory a pull is filling or stopped filling; any other
+// directory someone keeps in the store is none of the store's business.
+func (d modelDir) unfinished() bool { return !d.complete() && (d.arriving > 0 || d.weights > 0) }
+
+func readModelDir(dir string) modelDir {
+	var d modelDir
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return d
+	}
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		name := e.Name()
+		switch {
+		case strings.HasSuffix(name, ".part"):
+			d.arriving++
+			if done, _, ok := readRecord(path + ".json"); ok {
+				d.size += done
+			}
+		case strings.HasSuffix(name, ".part.json"), strings.HasSuffix(name, ".part.json.tmp"):
+			continue // the pull's records of a file arriving
+		default:
+			d.size += info.Size()
+			switch {
+			case name == "config.json":
+				d.config = true
+			case name == "tokenizer.json":
+				d.tokenizer = true
+			case strings.HasSuffix(name, ".safetensors"):
+				d.weights++
+			}
+		}
+		if info.ModTime().After(d.modified) {
+			d.modified = info.ModTime()
+		}
+	}
+	// One piece missing and the model cannot load.
+	if b, err := os.ReadFile(filepath.Join(dir, "model.safetensors.index.json")); err == nil {
+		var index struct {
+			WeightMap map[string]string `json:"weight_map"`
+		}
+		if json.Unmarshal(b, &index) == nil {
+			seen := map[string]bool{}
+			for _, f := range index.WeightMap {
+				if seen[f] {
+					continue
+				}
+				seen[f] = true
+				if fi, err := os.Stat(filepath.Join(dir, f)); err != nil || fi.IsDir() {
+					d.missing++
+				}
+			}
+		}
+	}
+	return d
 }
 
 func nameOf(filename string) string {

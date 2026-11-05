@@ -1,4 +1,5 @@
-// Package hub downloads GGUF models from Hugging Face.
+// Package hub downloads models from Hugging Face: GGUF files, and the
+// safetensors directories kinfer serves on MLX.
 //
 // No registry sits in between: a Hugging Face repo id is the model name, and
 // the file lands on disk under the name it has upstream. There is nothing to
@@ -108,8 +109,32 @@ type File struct {
 	Size int64
 }
 
-// List returns the GGUF files in a repo, smallest first.
+// List returns the GGUF files in a repo, in name order.
 func List(ctx context.Context, repo string) ([]File, error) {
+	files, err := Files(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	out := GGUFs(files)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s contains no .gguf files", repo)
+	}
+	return out, nil
+}
+
+// GGUFs is the GGUF files among a repo's files.
+func GGUFs(files []File) []File {
+	var out []File
+	for _, f := range files {
+		if strings.HasSuffix(strings.ToLower(f.Name), ".gguf") {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// Files returns every file in a repo, in name order.
+func Files(ctx context.Context, repo string) ([]File, error) {
 	// blobs=true is what makes Hugging Face report file sizes; without it every
 	// file comes back as zero bytes, and a size-based decision silently becomes
 	// a decision about nothing.
@@ -155,16 +180,40 @@ func List(ctx context.Context, repo string) ([]File, error) {
 
 	var out []File
 	for _, s := range payload.Siblings {
-		if strings.HasSuffix(strings.ToLower(s.Filename), ".gguf") {
-			out = append(out, File{Name: s.Filename, Size: s.Size})
-		}
+		out = append(out, File{Name: s.Filename, Size: s.Size})
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("%s contains no .gguf files", repo)
-	}
-
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// MLXFiles picks, from a repo's files, the ones a model kinfer serves on MLX
+// is made of, and reports whether they are one: config.json, tokenizer.json
+// and the weights in safetensors, with what else at the top of the repo
+// describes them (the chat template, the safetensors index, the other
+// configs). The weights come first and config.json last, so the directory
+// they land in is no model to the store until all of it has arrived.
+func MLXFiles(files []File) ([]File, bool) {
+	var weights, rest []File
+	var config File
+	tokenizer := false
+	for _, f := range files {
+		if strings.Contains(f.Name, "/") {
+			continue // another copy, another framework's weights, a picture
+		}
+		switch ext := strings.ToLower(filepath.Ext(f.Name)); {
+		case f.Name == "config.json":
+			config = f
+		case ext == ".safetensors":
+			weights = append(weights, f)
+		case ext == ".json" || ext == ".jinja" || ext == ".txt":
+			tokenizer = tokenizer || f.Name == "tokenizer.json"
+			rest = append(rest, f)
+		}
+	}
+	if config.Name == "" || !tokenizer || len(weights) == 0 {
+		return nil, false
+	}
+	return append(append(weights, rest...), config), true
 }
 
 // Pick chooses which file to download.

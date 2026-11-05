@@ -121,6 +121,7 @@ func readOllamaManifest(root, manifests, path string) (Model, bool) {
 	return Model{
 		Name:      name,
 		Path:      blob,
+		Format:    "gguf",
 		Size:      info.Size(),
 		Modified:  info.ModTime(),
 		Source:    FromOllama,

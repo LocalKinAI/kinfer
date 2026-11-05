@@ -49,16 +49,22 @@ var auxiliary = regexp.MustCompile(`(?i)(mmproj|imatrix|[.\-_]mtp[.\-_]|(^|/)mtp
 // shipped alongside one.
 func IsModel(filename string) bool { return !auxiliary.MatchString(filename) }
 
-// Quants groups a repo's GGUF files by quantisation, summing split models.
+// Quants groups a repo's GGUF files by quantisation, summing split models; a
+// repo of safetensors alone has none.
 //
 // A model past roughly 50 GB is always split, so treating each piece as its own
 // download would report a 79 GB model as three unrelated ones — and none of
 // them loadable.
 func Quants(ctx context.Context, repo string) ([]Quant, error) {
-	files, err := List(ctx, repo)
+	files, err := Files(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
+	return QuantsIn(repo, files), nil
+}
+
+// QuantsIn is Quants of a listing already in hand.
+func QuantsIn(repo string, files []File) []Quant {
 
 	// Group by what a file is a piece OF, never by the directory it sits in.
 	// A directory can hold several unrelated quantisations — one repo keeps six
@@ -90,7 +96,7 @@ func Quants(ctx context.Context, repo string) ([]Quant, error) {
 		out = append(out, *q)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Size < out[j].Size })
-	return out, nil
+	return out
 }
 
 // quantName is what to call a quantisation: uploaders put it either in a

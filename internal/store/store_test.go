@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -605,4 +606,93 @@ func TestResolveTakesABareNameAsLatest(t *testing.T) {
 	if got, err := s.Resolve("qwen3.8-27b"); err != nil || filepath.Base(got) != "qwen3.8-27b-q4_k_m.gguf" {
 		t.Errorf("Resolve(qwen3.8-27b) = %q, %v; a prefix still finds the one it begins", got, err)
 	}
+}
+
+// writeDir makes dir in s with the given files, each holding its own name.
+func writeDir(t *testing.T, s *Store, dir string, files ...string) string {
+	t.Helper()
+	path := filepath.Join(s.Root(), dir)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(path, f), []byte(f), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return path
+}
+
+// A directory of safetensors is a model once every file of it is here, and
+// until then an unfinished pull; a directory of anything else is neither.
+func TestModelDirectories(t *testing.T) {
+	s := newStore(t, "small-Q4_K_M.gguf")
+	index := `{"weight_map": {"a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors"}}`
+	whole := writeDir(t, s, "Qwen3.8-27B-4bit", "config.json", "tokenizer.json", "chat_template.jinja",
+		"model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+	if err := os.WriteFile(filepath.Join(whole, "model.safetensors.index.json"), []byte(index), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A pull stopped after the first piece, with the second arriving.
+	half := writeDir(t, s, "Qwen3.5-0.8B", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors.part")
+	if err := os.WriteFile(filepath.Join(half, "model.safetensors.index.json"), []byte(index), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeDir(t, s, "notes", "todo.txt")
+
+	models, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, m := range models {
+		got = append(got, m.Name+" "+m.Format)
+	}
+	if want := "Qwen3.8-27B-4bit safetensors, small-Q4_K_M gguf"; strings.Join(sortedCopy(got), ", ") != want {
+		t.Errorf("List = %v, want %s", got, want)
+	}
+	for _, m := range models {
+		if m.Name == "Qwen3.8-27B-4bit" {
+			// Every file but the index: config, tokenizer, template and two pieces.
+			want := int64(len("config.json") + len("tokenizer.json") + len("chat_template.jinja") +
+				2*len("model-00001-of-00002.safetensors") + len(index))
+			if m.Size != want || m.Path != whole {
+				t.Errorf("directory model: size %d at %s, want %d at %s", m.Size, m.Path, want, whole)
+			}
+		}
+	}
+
+	un, err := s.Unfinished()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(un) != 1 || un[0].Name != "Qwen3.5-0.8B" {
+		t.Fatalf("Unfinished = %+v, want only Qwen3.5-0.8B", un)
+	}
+	if _, err := s.Resolve("Qwen3.5-0.8B"); err == nil || !strings.Contains(err.Error(), "not finished") {
+		t.Errorf("Resolve of the half-pulled directory: %v, want a not-finished error", err)
+	}
+	if p, err := s.Resolve("qwen3.8-27b"); err != nil || p != whole {
+		t.Errorf("Resolve(qwen3.8-27b) = %q, %v; want %s", p, err, whole)
+	}
+
+	for _, name := range []string{"Qwen3.8-27B-4bit", "Qwen3.5-0.8B"} {
+		if err := s.Remove(name); err != nil {
+			t.Fatalf("Remove(%s): %v", name, err)
+		}
+	}
+	for _, dir := range []string{whole, half} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("%s is still there after Remove", dir)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(s.Root(), "notes", "todo.txt")); err != nil {
+		t.Errorf("a directory that is no model was touched: %v", err)
+	}
+}
+
+func sortedCopy(s []string) []string {
+	out := append([]string(nil), s...)
+	sort.Strings(out)
+	return out
 }
