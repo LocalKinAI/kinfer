@@ -192,6 +192,12 @@ func open(dir string) error {
 	if err := bindRandom(lib); err != nil {
 		return err
 	}
+	if err := bindQuant(lib); err != nil {
+		return err
+	}
+	if err := bindMemory(lib); err != nil {
+		return err
+	}
 	setErrorHandler(purego.NewCallback(func(msg *byte, _ uintptr) {
 		lastErr = goString(msg)
 	}), 0, 0)

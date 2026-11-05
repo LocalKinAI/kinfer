@@ -2,8 +2,11 @@ package mlxmodel
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -253,6 +256,61 @@ func TestQwen35Batch(t *testing.T) {
 		y.Free()
 		return out, gaps
 	}
+	// matches checks that got, a row's tokens in a batch, is what p decodes to
+	// alone, up to a near tie.
+	matches := func(what string, got, p []int32) {
+		want, gaps := alone(p)
+		same := 0
+		for same < len(got) && got[same] == want[same] {
+			same++
+		}
+		switch {
+		case same == len(got):
+			t.Logf("%s: all %d tokens match decoding alone", what, len(got))
+		case gaps[same] < 0.25:
+			t.Logf("%s: first %d tokens match; at token %d the top two were %.3f apart (a near tie)",
+				what, same, same, gaps[same])
+		default:
+			t.Errorf("%s: token %d differs (%d vs %d) though alone it led by %.3f",
+				what, same, got[same], want[same], gaps[same])
+		}
+	}
+	// join reads p alone and adds it to b, returning its first token and row.
+	join := func(b *Qwen35Batch, p []int32, room int) (int32, int) {
+		c := m.NewCache()
+		lg, err := m.Forward([][]int32{p}, c, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := mlx.Astype(mlx.Argmax(lg, -1, false), mlx.Int32).Int32s()[0]
+		lg.Free()
+		row, err := b.Add(c, room)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok, row
+	}
+	// run decodes n steps from the tokens first, one per row, and returns
+	// each row's tokens and the ones the last step chose.
+	run := func(b *Qwen35Batch, first []int32, n int) ([][]int32, []int32) {
+		y := mlx.FromInt32(first, len(first), 1)
+		rows := make([][]int32, len(first))
+		for i := 0; i < n; i++ {
+			s := mlx.NewScope()
+			next := greedy(b.Step(y))
+			s.Keep(next)
+			s.Close()
+			mlx.AsyncEval(append([]mlx.Array{next}, b.Arrays()...)...)
+			for r, tok := range y.Int32s() {
+				rows[r] = append(rows[r], tok)
+			}
+			y.Free()
+			y = next
+		}
+		last := y.Int32s()
+		y.Free()
+		return rows, last
+	}
 
 	for _, B := range []int{4, 16, 64} {
 		b := m.NewBatch()
@@ -265,7 +323,7 @@ func TestQwen35Batch(t *testing.T) {
 			}
 			first = append(first, mlx.Astype(mlx.Argmax(lg, -1, false), mlx.Int32).Int32s()[0])
 			lg.Free()
-			if _, err := b.Add(c); err != nil {
+			if _, err := b.Add(c, B); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -292,21 +350,93 @@ func TestQwen35Batch(t *testing.T) {
 
 		// The rows decode what they decode alone (checked on a few).
 		for _, r := range []int{0, B / 2, B - 1} {
-			want, gaps := alone(prompt(r, 40+(r*37)%200))
-			same := 0
-			for same < steps && rows[r][same] == want[same] {
-				same++
+			matches(fmt.Sprintf("batch of %d, row %d", B, r), rows[r], prompt(r, 40+(r*37)%200))
+		}
+	}
+
+	// A long sequence that has ended leaves its columns behind; the next one
+	// to join cuts them off, and both rows go on as they would alone.
+	b := m.NewBatch()
+	defer b.Free()
+	long, short, next := prompt(100, 1500), prompt(101, 60), prompt(102, 100)
+	var first []int32
+	for _, p := range [][]int32{long, short} {
+		tok, _ := join(b, p, 2)
+		first = append(first, tok)
+	}
+	const before = 8
+	rows, last := run(b, first, before)
+	b.Release(0)
+	wide := b.idx
+	tok, row := join(b, next, 2)
+	if row != 0 {
+		t.Fatalf("the newcomer went to row %d, not the free row 0", row)
+	}
+	if b.idx != len(next) {
+		t.Errorf("after the long row ended and another joined, the batch is %d columns wide (was %d); want %d",
+			b.idx, wide, len(next))
+	}
+	later, _ := run(b, []int32{tok, last[1]}, steps-before)
+	matches("the short row", append(rows[1], later[1]...), short)
+	matches("the row that joined", later[0], next)
+}
+
+// How a decode step's time grows with the batch — the model alone, greedy,
+// no server and no sampling. KINFER_MLX_BATCHES lists the sizes ("1,4,16").
+func TestQwen35BatchStepTime(t *testing.T) {
+	lib, dir, sizes := os.Getenv("KINFER_MLX_LIB"), os.Getenv("KINFER_MLX_MODEL"), os.Getenv("KINFER_MLX_BATCHES")
+	if lib == "" || dir == "" || sizes == "" {
+		t.Skip("KINFER_MLX_LIB, KINFER_MLX_MODEL and KINFER_MLX_BATCHES not all set")
+	}
+	if err := mlx.Open(lib); err != nil {
+		t.Fatal(err)
+	}
+	m, err := LoadQwen35(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	for _, f := range strings.Split(sizes, ",") {
+		B, _ := strconv.Atoi(f)
+		b := m.NewBatch()
+		first := make([]int32, B)
+		for r := 0; r < B; r++ {
+			p := make([]int32, 100)
+			for i := range p {
+				p[i] = int32(1000 + (r*7919+i*104729)%50000)
 			}
-			switch {
-			case same == steps:
-				t.Logf("batch of %d, row %d: all %d tokens match decoding alone", B, r, steps)
-			case gaps[same] < 0.25:
-				t.Logf("batch of %d, row %d: first %d tokens match; at token %d the top two were %.3f apart (a near tie)",
-					B, r, same, same, gaps[same])
-			default:
-				t.Errorf("batch of %d, row %d: token %d differs (%d vs %d) though alone it led by %.3f",
-					B, r, same, rows[r][same], want[same], gaps[same])
+			c := m.NewCache()
+			lg, err := m.Forward([][]int32{p}, c, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first[r] = mlx.Astype(mlx.Argmax(lg, -1, false), mlx.Int32).Int32s()[0]
+			lg.Free()
+			if _, err := b.Add(c, B); err != nil {
+				t.Fatal(err)
 			}
 		}
+		y := mlx.FromInt32(first, B, 1)
+		const steps = 32
+		var start time.Time
+		for i := 0; i < steps+4; i++ {
+			if i == 4 {
+				start = time.Now()
+			}
+			s := mlx.NewScope()
+			next := mlx.Reshape(mlx.Astype(mlx.Argmax(b.Step(y), -1, false), mlx.Int32), B, 1)
+			s.Keep(next)
+			s.Close()
+			mlx.AsyncEval(append([]mlx.Array{next}, b.Arrays()...)...)
+			y.Int32s()
+			y.Free()
+			y = next
+		}
+		y.Int32s()
+		el := time.Since(start)
+		y.Free()
+		b.Free()
+		t.Logf("batch %2d: %.1f ms a step, %.0f tok/s together", B, float64(el.Microseconds())/1000/steps,
+			float64(B*steps)/el.Seconds())
 	}
 }

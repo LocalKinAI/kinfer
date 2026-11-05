@@ -37,6 +37,7 @@ const (
 	defaultSlots = 8
 	defaultCtx   = 32768
 	prefillChunk = 2048
+	cacheLimit   = 4 << 30
 )
 
 // IsModelDir reports whether path is a directory MLX can serve: a
@@ -128,13 +129,23 @@ func Open(dir string, opts engine.Options) (*Engine, error) {
 		return nil, err
 	}
 
+	// MLX keeps freed buffers for reuse up to its whole memory limit. A
+	// server's batch and context sizes keep changing, so most of those
+	// buffers are of shapes it will not meet again: unchecked they grew past
+	// 75 GB beside a 1.7 GB model. A few gigabytes cover the reuse that
+	// matters, a decode step's intermediates.
+	mlx.SetCacheLimit(cacheLimit)
+
 	tmpl, _ := os.ReadFile(filepath.Join(dir, "chat_template.jinja"))
 	e := &Engine{
 		path: dir, model: model, tok: tok, opts: opts,
 		tpl:   chat.FromTemplate(string(tmpl), dir),
-		eos:   map[int32]bool{int32(model.Config.EOSTokenID): true},
+		eos:   map[int32]bool{},
 		slots: opts.Slots, ctx: opts.ContextSize,
 		jobs: make(chan *job, 1024), quit: make(chan struct{}), done: make(chan struct{}),
+	}
+	for _, id := range model.Config.EOS() {
+		e.eos[id] = true
 	}
 	for _, s := range []string{"<|im_end|>", "<|endoftext|>"} {
 		if id, ok := tok.ID(s); ok {
@@ -325,17 +336,19 @@ func (e *Engine) run() {
 				continue
 			}
 			t = time.Now()
-			r, err := batch.Add(c)
+			// Room for this burst: the rows in use, this one, and the
+			// replies queued behind it.
+			r, err := batch.Add(c, min(e.slots, active()+1+len(e.jobs)))
 			e.prof.add(&e.prof.join, t)
 			if err != nil {
 				e.finish(j, err)
 				continue
 			}
-			if r == len(rows) {
-				rows = append(rows, j)
-			} else {
-				rows[r] = j
+			// A batch that grew may have added free rows past r as well.
+			for len(rows) < batch.Len() {
+				rows = append(rows, nil)
 			}
+			rows[r] = j
 		}
 		if active() == 0 {
 			settle()
@@ -629,10 +642,12 @@ func (p *profile) tick(rows int) {
 	p.steps++
 	p.rowSteps += rows
 	if el := time.Since(p.since); el > 10*time.Second {
-		log.Printf("mlx profile %v: prefill %v, join %v, decode %v (%d steps, %.1f rows each, %.1f ms a step), leave %v",
+		mem := mlx.MemoryUse()
+		log.Printf("mlx profile %v: prefill %v, join %v, decode %v (%d steps, %.1f rows each, %.1f ms a step), leave %v; memory active %.1f GB, cache %.1f GB, peak %.1f GB",
 			el.Round(time.Second), p.prefill.Round(time.Millisecond), p.join.Round(time.Millisecond),
 			p.step.Round(time.Millisecond), p.steps, float64(p.rowSteps)/float64(max(1, p.steps)),
-			float64(p.step.Microseconds())/1000/float64(max(1, p.steps)), p.leave.Round(time.Millisecond))
+			float64(p.step.Microseconds())/1000/float64(max(1, p.steps)), p.leave.Round(time.Millisecond),
+			float64(mem.Active)/1e9, float64(mem.Cache)/1e9, float64(mem.Peak)/1e9)
 		*p = profile{on: true, since: time.Now()}
 	}
 }

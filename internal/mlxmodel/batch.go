@@ -20,7 +20,8 @@ import (
 // A row whose sequence ended is released, not removed: removing means
 // copying every other row's state, which at 64 rows is over a gigabyte per
 // departure. A released row keeps being computed, uselessly, until a newcomer
-// is written into it or Compact drops the free rows in one copy.
+// is written into it or Compact drops the free rows in one copy. The columns
+// a long sequence leaves behind are cut when the next sequence joins.
 type Qwen35Batch struct {
 	m           *Qwen35
 	conv, state []mlx.Array
@@ -126,8 +127,12 @@ func (b *Qwen35Batch) fill(r int, c *Qwen35Cache) {
 func roundUp(n int) int { return (n + kvStep - 1) / kvStep * kvStep }
 
 // Add puts a sequence that has read its prompt into c into the batch — into a
-// free row when there is one — and returns its row; c is consumed.
-func (b *Qwen35Batch) Add(c *Qwen35Cache) (row int, err error) {
+// free row when there is one — and returns its row; c is consumed. When the
+// batch has to grow it grows to room rows at once, the rest free for the
+// sequences the caller knows are coming: growing copies every row, so a
+// burst of newcomers should pay for it once, while a free row costs a step's
+// work for each step it stays empty.
+func (b *Qwen35Batch) Add(c *Qwen35Cache, room int) (row int, err error) {
 	defer mlx.Recover(&err)
 	scope := mlx.NewScope()
 	defer scope.Close()
@@ -145,6 +150,7 @@ func (b *Qwen35Batch) Add(c *Qwen35Cache) (row int, err error) {
 		return 0, nil
 	}
 
+	b.trim(b.idx - n)
 	b.makeRoom(n)
 	row = -1
 	for r, f := range b.free {
@@ -156,13 +162,16 @@ func (b *Qwen35Batch) Add(c *Qwen35Cache) (row int, err error) {
 	if row >= 0 {
 		b.fill(row, c)
 	} else {
-		row = b.appendRow(c)
+		row = b.appendRows(c, max(0, room-b.Len()-1))
 	}
 
+	// Our handles to the replaced arrays go before evaluating, so that MLX,
+	// seeing the graph as their only user, writes the updates into them in
+	// place instead of copying the whole batch for each newcomer.
 	fresh := b.Arrays()
-	mlx.Eval(fresh...)
 	scope.Escape(fresh...)
 	freeOld(old, fresh)
+	mlx.Eval(fresh...)
 	c.Free()
 	return row, nil
 }
@@ -207,8 +216,10 @@ func (b *Qwen35Batch) makeRoom(n int) {
 	b.idx += shift
 }
 
-// appendRow adds c as a new last row and returns its index.
-func (b *Qwen35Batch) appendRow(c *Qwen35Cache) int {
+// appendRows adds c as a new last row, then extra free rows, and returns c's
+// row. A free row attends to one column of its own, so it computes something
+// harmless rather than an empty softmax.
+func (b *Qwen35Batch) appendRows(c *Qwen35Cache, extra int) int {
 	n := c.Offset
 	mc := b.m.Config
 	Hkv, D := mc.NumKeyValueHeads, mc.HeadDim
@@ -218,24 +229,69 @@ func (b *Qwen35Batch) appendRow(c *Qwen35Cache) int {
 		}
 		for _, kv := range []struct{ buf, row *mlx.Array }{{&b.keys[i], &c.keys[i]}, {&b.vals[i], &c.vals[i]}} {
 			capacity := (*kv.buf).Shape()[2]
-			row := mlx.Zeros((*kv.buf).Dtype(), 1, Hkv, capacity, D)
+			row := mlx.Zeros((*kv.buf).Dtype(), 1+extra, Hkv, capacity, D)
 			row = mlx.SliceUpdate(row, mlx.Slice(*kv.row, []int{0, 0, 0, 0}, []int{1, Hkv, n, D}),
 				[]int{0, 0, b.idx - n, 0}, []int{1, Hkv, b.idx, D})
 			*kv.buf = mlx.Concatenate(0, *kv.buf, row)
 		}
 	}
 	for i := range b.conv {
-		if b.conv[i] != 0 {
-			b.conv[i] = mlx.Concatenate(0, b.conv[i], c.conv[i])
-			b.state[i] = mlx.Concatenate(0, b.state[i], c.state[i])
+		if b.conv[i] == 0 {
+			continue
+		}
+		for _, st := range []struct{ buf, row *mlx.Array }{{&b.conv[i], &c.conv[i]}, {&b.state[i], &c.state[i]}} {
+			parts := []mlx.Array{*st.buf, *st.row}
+			if extra > 0 {
+				sh := (*st.row).Shape()
+				sh[0] = extra
+				parts = append(parts, mlx.Zeros((*st.row).Dtype(), sh...))
+			}
+			*st.buf = mlx.Concatenate(0, parts...)
 		}
 	}
+	row := len(b.pad)
 	b.pad = append(b.pad, b.idx-n)
 	b.free = append(b.free, false)
-	return len(b.pad) - 1
+	for k := 0; k < extra; k++ {
+		b.pad = append(b.pad, max(0, b.idx-1))
+		b.free = append(b.free, true)
+	}
+	return row
 }
 
-// Remove drops the given rows, keeping the others in order.
+// trim cuts off the columns that every live row has as padding — left behind
+// by a long sequence that has since finished — but no more than the first
+// most of them: each step attends over all of them, for every row, until
+// they go. Fewer than kvStep are not worth copying the buffers for.
+func (b *Qwen35Batch) trim(most int) {
+	cut := most
+	for r, p := range b.pad {
+		if !b.free[r] {
+			cut = min(cut, p)
+		}
+	}
+	if cut < kvStep {
+		return
+	}
+	mc := b.m.Config
+	B, Hkv, D, n := len(b.pad), mc.NumKeyValueHeads, mc.HeadDim, b.idx-cut
+	for _, set := range [][]mlx.Array{b.keys, b.vals} {
+		for i, a := range set {
+			if a != 0 {
+				grown := mlx.Zeros(a.Dtype(), B, Hkv, roundUp(n+1), D)
+				set[i] = mlx.SliceUpdate(grown, mlx.Slice(a, []int{0, 0, cut, 0}, []int{B, Hkv, b.idx, D}),
+					[]int{0, 0, 0, 0}, []int{B, Hkv, n, D})
+			}
+		}
+	}
+	for r := range b.pad {
+		b.pad[r] = max(0, b.pad[r]-cut)
+	}
+	b.idx = n
+}
+
+// Remove drops the given rows, keeping the others in order, and trims the
+// columns no remaining row uses.
 func (b *Qwen35Batch) Remove(rows ...int) (err error) {
 	defer mlx.Recover(&err)
 	drop := map[int]bool{}
@@ -268,12 +324,14 @@ func (b *Qwen35Batch) Remove(rows ...int) (err error) {
 		}
 	}
 	b.pad, b.free = pad, free
+	b.trim(b.idx)
+
 	fresh := b.Arrays()
-	mlx.Eval(fresh...)
 	scope.Escape(fresh...)
 	for _, a := range old {
 		a.Free()
 	}
+	mlx.Eval(fresh...)
 	return nil
 }
 
@@ -313,7 +371,7 @@ func (b *Qwen35Batch) Step(tokens mlx.Array) mlx.Array {
 	mask := mlx.Reshape(mlx.Greater(mlx.Reshape(cols, 1, b.idx+1),
 		mlx.AddScalar(mlx.Reshape(mlx.FromInt32(pads, B), B, 1), -1)), B, 1, 1, b.idx+1)
 
-	h := mlx.Take(m.embed, tokens, 0)
+	h := m.embed.rows(tokens)
 	for i := range m.layers {
 		l := &m.layers[i]
 		x := mlx.RMSNorm(h, l.inNorm, c.RMSNormEps)
@@ -329,7 +387,7 @@ func (b *Qwen35Batch) Step(tokens mlx.Array) mlx.Array {
 		h = mlx.Add(h, linear(mlx.Multiply(mlx.SiLU(linear(x, l.gate)), linear(x, l.up)), l.down))
 	}
 	h = mlx.RMSNorm(h, m.norm, c.RMSNormEps)
-	logits := mlx.Reshape(linear(h, m.embed), B, c.VocabSize)
+	logits := mlx.Reshape(linear(h, m.head()), B, c.VocabSize)
 
 	b.idx++
 	scope.Keep(logits)

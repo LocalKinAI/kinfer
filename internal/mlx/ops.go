@@ -422,3 +422,45 @@ func SDPA(q, k, v Array, scale float32, mode string, mask Array) Array {
 	r := arrayNew()
 	return out(opSDPA(&r, q, k, v, scale, mode, mask, 0, false, gpu), r)
 }
+
+// optInt mirrors mlx_optional_int (8 bytes).
+type optInt struct {
+	Value int32
+	Has   uint8
+	_     [3]byte
+}
+
+var (
+	opQuantizedMatmul func(res *Array, x, w, scales, biases Array, transpose bool, group, bits optInt, mode string, s Stream) int32
+	opDequantize      func(res *Array, w, scales, biases Array, group, bits optInt, mode string, globalScale Array, dt optDtype, s Stream) int32
+)
+
+func bindQuant(lib uintptr) error {
+	for _, b := range []struct {
+		fn   any
+		name string
+	}{
+		{&opQuantizedMatmul, "mlx_quantized_matmul"}, {&opDequantize, "mlx_dequantize"},
+	} {
+		if _, err := purego.Dlsym(lib, b.name); err != nil {
+			return fmt.Errorf("mlx-c has no %s: %w", b.name, err)
+		}
+		purego.RegisterLibFunc(b.fn, lib, b.name)
+	}
+	return nil
+}
+
+// QuantizedMatmul is x @ dequantize(w).T for w quantized as MLX stores a
+// QuantizedLinear: packed weights, per-group scales and (affine) biases.
+func QuantizedMatmul(x, w, scales, biases Array, group, bits int, mode string) Array {
+	r := arrayNew()
+	return out(opQuantizedMatmul(&r, x, w, scales, biases, true,
+		optInt{Value: int32(group), Has: 1}, optInt{Value: int32(bits), Has: 1}, mode, gpu), r)
+}
+
+// Dequantize unpacks quantized w to the scales' dtype.
+func Dequantize(w, scales, biases Array, group, bits int, mode string) Array {
+	r := arrayNew()
+	return out(opDequantize(&r, w, scales, biases, optInt{Value: int32(group), Has: 1},
+		optInt{Value: int32(bits), Has: 1}, mode, 0, optDtype{}, gpu), r)
+}

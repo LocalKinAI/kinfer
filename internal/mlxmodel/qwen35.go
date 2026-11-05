@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/LocalKinAI/kinfer/internal/mlx"
 )
@@ -37,7 +38,58 @@ type Qwen35Config struct {
 		RopeTheta           float32 `json:"rope_theta"`
 		PartialRotaryFactor float32 `json:"partial_rotary_factor"`
 	} `json:"rope_parameters"`
-	EOSTokenID int `json:"eos_token_id"`
+	EOSTokenID json.RawMessage `json:"eos_token_id"`
+
+	// Quant is how the linear layers are quantized, from the top level of
+	// config.json; nil for an unquantized model.
+	Quant *Quantization `json:"-"`
+}
+
+// EOS is the configured end-of-sequence ids, given as one or as a list.
+func (c *Qwen35Config) EOS() []int32 {
+	var one int32
+	if json.Unmarshal(c.EOSTokenID, &one) == nil {
+		return []int32{one}
+	}
+	var many []int32
+	json.Unmarshal(c.EOSTokenID, &many)
+	return many
+}
+
+// Quantization is MLX's "quantization" entry: the defaults, and per-module
+// exceptions keyed by module path.
+type Quantization struct {
+	GroupSize int
+	Bits      int
+	Mode      string
+	Modules   map[string]Quantization
+}
+
+func (q *Quantization) UnmarshalJSON(b []byte) error {
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(b, &all); err != nil {
+		return err
+	}
+	q.GroupSize, q.Bits, q.Mode = 64, 4, "affine"
+	for k, v := range all {
+		switch k {
+		case "group_size":
+			json.Unmarshal(v, &q.GroupSize)
+		case "bits":
+			json.Unmarshal(v, &q.Bits)
+		case "mode":
+			json.Unmarshal(v, &q.Mode)
+		default:
+			var sub Quantization
+			if json.Unmarshal(v, &sub) == nil && v[0] == '{' {
+				if q.Modules == nil {
+					q.Modules = map[string]Quantization{}
+				}
+				q.Modules[k] = sub
+			}
+		}
+	}
+	return nil
 }
 
 // ReadQwen35Config reads dir/config.json, from text_config when the file is
@@ -48,8 +100,9 @@ func ReadQwen35Config(dir string) (*Qwen35Config, error) {
 		return nil, err
 	}
 	var outer struct {
-		ModelType  string          `json:"model_type"`
-		TextConfig json.RawMessage `json:"text_config"`
+		ModelType    string          `json:"model_type"`
+		TextConfig   json.RawMessage `json:"text_config"`
+		Quantization *Quantization   `json:"quantization"`
 	}
 	if err := json.Unmarshal(raw, &outer); err != nil {
 		return nil, err
@@ -66,6 +119,7 @@ func ReadQwen35Config(dir string) (*Qwen35Config, error) {
 	if err := json.Unmarshal(text, c); err != nil {
 		return nil, err
 	}
+	c.Quant = outer.Quantization
 	if c.NumExperts > 0 {
 		return nil, fmt.Errorf("Qwen3.5 with %d experts (qwen3_5_moe) is not written yet", c.NumExperts)
 	}
@@ -75,15 +129,56 @@ func ReadQwen35Config(dir string) (*Qwen35Config, error) {
 	return c, nil
 }
 
+// Linear is a weight matrix [out, in], plain or quantized the way MLX's
+// QuantizedLinear stores it: packed W, per-group Scales and, in affine mode,
+// Biases.
+type Linear struct {
+	W, Scales, Biases mlx.Array
+	Group, Bits       int
+	Mode              string
+}
+
+func (l Linear) quantized() bool { return l.Scales != 0 }
+
+func (l Linear) arrays() []mlx.Array {
+	r := []mlx.Array{l.W}
+	for _, a := range []mlx.Array{l.Scales, l.Biases} {
+		if a != 0 {
+			r = append(r, a)
+		}
+	}
+	return r
+}
+
+// linear is x @ w.T.
+func linear(x mlx.Array, w Linear) mlx.Array {
+	if w.quantized() {
+		return mlx.QuantizedMatmul(x, w.W, w.Scales, w.Biases, w.Group, w.Bits, w.Mode)
+	}
+	return mlx.Matmul(x, mlx.T(w.W))
+}
+
+// rows looks up rows of w, as an embedding: ids [B, L] → [B, L, in].
+func (l Linear) rows(ids mlx.Array) mlx.Array {
+	if !l.quantized() {
+		return mlx.Take(l.W, ids, 0)
+	}
+	var b mlx.Array
+	if l.Biases != 0 {
+		b = mlx.Take(l.Biases, ids, 0)
+	}
+	return mlx.Dequantize(mlx.Take(l.W, ids, 0), mlx.Take(l.Scales, ids, 0), b, l.Group, l.Bits, l.Mode)
+}
+
 type linearAttn struct {
-	inQKV, inZ, inB, inA, outProj mlx.Array
+	inQKV, inZ, inB, inA, outProj Linear
 	conv                          mlx.Array // [conv_dim, K, 1]
 	dtBias, aLog                  mlx.Array
 	norm                          mlx.Array
 }
 
 type fullAttn struct {
-	q, k, v, o   mlx.Array
+	q, k, v, o   Linear
 	qNorm, kNorm mlx.Array
 }
 
@@ -91,7 +186,7 @@ type qwen35Layer struct {
 	linear         *linearAttn // nil for a full-attention layer
 	full           *fullAttn
 	inNorm, inPost mlx.Array
-	gate, up, down mlx.Array
+	gate, up, down Linear
 }
 
 // Qwen35 is a loaded Qwen3.5 text model.
@@ -103,19 +198,29 @@ type Qwen35 struct {
 	// tested against.
 	OpsDeltaNet bool
 
-	embed  mlx.Array
+	embed  Linear
+	lmHead *Linear // nil when tied to embed
 	norm   mlx.Array
 	layers []qwen35Layer
 	all    []mlx.Array // every weight, for Free
 }
 
-// LoadQwen35 reads config.json and the safetensors files in dir.
+func (m *Qwen35) head() Linear {
+	if m.lmHead != nil {
+		return *m.lmHead
+	}
+	return m.embed
+}
+
+// LoadQwen35 reads config.json and the safetensors files in dir: a Hugging
+// Face release, or an MLX conversion of one (mlx_lm.convert), quantized or not.
 //
 // A Hugging Face release stores what mlx-lm's sanitize changes: conv1d
 // weights as [C, 1, K] where MLX's conv1d wants [C, K, 1], and the five
 // RMSNorm weights Qwen3.5 centres on zero (the layer norms, the final norm,
 // q_norm and k_norm) as offsets from 1. The DeltaNet's gated norm is stored
-// as is. Both fixes happen here, once.
+// as is. An MLX conversion has had both done already; as in mlx-lm, the
+// conv1d shape tells which kind of file this is.
 func LoadQwen35(dir string) (m *Qwen35, err error) {
 	defer mlx.Recover(&err)
 	c, err := ReadQwen35Config(dir)
@@ -146,56 +251,103 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 		}
 	}()
 
+	hfLayout := false
+	for k, v := range raw {
+		if strings.HasSuffix(k, "conv1d.weight") {
+			if s := v.Shape(); len(s) == 3 && s[2] != 1 {
+				hfLayout = true
+			}
+			break
+		}
+	}
+
 	m = &Qwen35{Config: c}
-	key := func(name string) string {
-		for _, prefix := range []string{"model.language_model.", "language_model.model.", "model."} {
+	prefixes := []string{"model.language_model.", "language_model.model.", "language_model.", "model.", ""}
+	key := func(name string) (string, bool) {
+		for _, prefix := range prefixes {
 			if _, ok := raw[prefix+name]; ok {
-				return prefix + name
+				return prefix + name, true
 			}
 		}
-		panic(&mlx.Error{Msg: "weight " + name + " missing"})
+		return "", false
 	}
-	get := func(name string) mlx.Array { return raw[key(name)] }
+	must := func(name string) string {
+		k, ok := key(name)
+		if !ok {
+			panic(&mlx.Error{Msg: "weight " + name + " missing"})
+		}
+		return k
+	}
 	keep := func(a mlx.Array) mlx.Array {
 		m.all = append(m.all, a)
 		return a
 	}
-	plain := func(name string) mlx.Array {
-		k := key(name)
+	take := func(k string) mlx.Array {
 		a := raw[k]
 		delete(raw, k)
 		return keep(a)
 	}
-	centred := func(name string) mlx.Array { return keep(mlx.AddScalar(get(name), 1)) }
+	plain := func(name string) mlx.Array { return take(must(name)) }
+	centred := func(name string) mlx.Array {
+		if !hfLayout {
+			return plain(name)
+		}
+		return keep(mlx.AddScalar(raw[must(name)], 1))
+	}
+	lin := func(module string) Linear {
+		wk := must(module + ".weight")
+		l := Linear{W: take(wk)}
+		base := strings.TrimSuffix(wk, ".weight")
+		if _, ok := raw[base+".scales"]; ok {
+			q := Quantization{GroupSize: 64, Bits: 4, Mode: "affine"}
+			if c.Quant != nil {
+				q = *c.Quant
+				if o, ok := c.Quant.Modules[base]; ok {
+					q = o
+				}
+			}
+			l.Scales, l.Group, l.Bits, l.Mode = take(base+".scales"), q.GroupSize, q.Bits, q.Mode
+			if _, ok := raw[base+".biases"]; ok {
+				l.Biases = take(base + ".biases")
+			}
+		}
+		return l
+	}
 
-	m.embed = plain("embed_tokens.weight")
+	m.embed = lin("embed_tokens")
+	if !c.TieWordEmbeddings {
+		if _, ok := key("lm_head.weight"); ok {
+			h := lin("lm_head")
+			m.lmHead = &h
+		}
+	}
 	m.norm = centred("norm.weight")
 	for i := 0; i < c.NumHiddenLayers; i++ {
 		p := fmt.Sprintf("layers.%d.", i)
 		l := qwen35Layer{
 			inNorm: centred(p + "input_layernorm.weight"),
 			inPost: centred(p + "post_attention_layernorm.weight"),
-			gate:   plain(p + "mlp.gate_proj.weight"),
-			up:     plain(p + "mlp.up_proj.weight"),
-			down:   plain(p + "mlp.down_proj.weight"),
+			gate:   lin(p + "mlp.gate_proj"),
+			up:     lin(p + "mlp.up_proj"),
+			down:   lin(p + "mlp.down_proj"),
 		}
 		if (i+1)%c.FullAttentionInterval != 0 {
 			a := p + "linear_attn."
-			conv := get(a + "conv1d.weight")
-			if s := conv.Shape(); len(s) == 3 && s[2] != 1 {
+			conv := raw[must(a+"conv1d.weight")]
+			if hfLayout {
 				conv = mlx.Swapaxes(conv, 1, 2)
 			}
 			l.linear = &linearAttn{
-				inQKV: plain(a + "in_proj_qkv.weight"), inZ: plain(a + "in_proj_z.weight"),
-				inB: plain(a + "in_proj_b.weight"), inA: plain(a + "in_proj_a.weight"),
-				outProj: plain(a + "out_proj.weight"), conv: keep(mlx.Contiguous(conv)),
+				inQKV: lin(a + "in_proj_qkv"), inZ: lin(a + "in_proj_z"),
+				inB: lin(a + "in_proj_b"), inA: lin(a + "in_proj_a"),
+				outProj: lin(a + "out_proj"), conv: keep(mlx.Contiguous(conv)),
 				dtBias: plain(a + "dt_bias"), aLog: plain(a + "A_log"), norm: plain(a + "norm.weight"),
 			}
 		} else {
 			a := p + "self_attn."
 			l.full = &fullAttn{
-				q: plain(a + "q_proj.weight"), k: plain(a + "k_proj.weight"),
-				v: plain(a + "v_proj.weight"), o: plain(a + "o_proj.weight"),
+				q: lin(a + "q_proj"), k: lin(a + "k_proj"),
+				v: lin(a + "v_proj"), o: lin(a + "o_proj"),
 				qNorm: centred(a + "q_norm.weight"), kNorm: centred(a + "k_norm.weight"),
 			}
 		}
@@ -255,8 +407,6 @@ func (c *Qwen35Cache) Free() {
 		keys: make([]mlx.Array, len(c.conv)), vals: make([]mlx.Array, len(c.conv))}
 }
 
-func linear(x, w mlx.Array) mlx.Array { return mlx.Matmul(x, mlx.T(w)) }
-
 // Forward runs tokens [B, L] through the model, advancing cache, and returns
 // the logits of the last position, [B, vocab], evaluated. When trace is
 // non-nil it is called with each layer's output.
@@ -288,7 +438,7 @@ func (m *Qwen35) Step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int
 	defer scope.Close()
 	old := cache.Arrays()
 
-	h := mlx.Take(m.embed, tokens, 0)
+	h := m.embed.rows(tokens)
 	for i := range m.layers {
 		l := &m.layers[i]
 		x := mlx.RMSNorm(h, l.inNorm, m.Config.RMSNormEps)
@@ -307,7 +457,7 @@ func (m *Qwen35) Step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int
 	}
 	h = mlx.Slice(h, []int{0, L - 1, 0}, []int{B, L, m.Config.HiddenSize})
 	h = mlx.RMSNorm(h, m.norm, m.Config.RMSNormEps)
-	logits := mlx.Reshape(linear(h, m.embed), B, m.Config.VocabSize)
+	logits := mlx.Reshape(linear(h, m.head()), B, m.Config.VocabSize)
 
 	cache.Offset += L
 	scope.Keep(logits)
