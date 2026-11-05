@@ -287,6 +287,15 @@ func Scalar(v float32) Array { a := arrayNewF32(v); track(a); return a }
 // Free releases a. Freeing an array a scope also holds is a double free.
 func (a Array) Free() { arrayFree(a) }
 
+// Ref is a second handle to a's array, owned by no scope: freeing either
+// leaves the other. While both are held MLX will not write an op's result
+// into the array in place, so neither handle ever sees the other's updates.
+func (a Array) Ref() Array {
+	r := arrayNew()
+	check(arraySetArray(&r, a))
+	return r
+}
+
 // Eval runs the graph that produces a.
 func (a Array) Eval() { check(arrayEval(a)) }
 

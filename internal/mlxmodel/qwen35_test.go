@@ -440,3 +440,70 @@ func TestQwen35BatchStepTime(t *testing.T) {
 			float64(B*steps)/el.Seconds())
 	}
 }
+
+// A clone and the cache it came from read on separately: what one writes the
+// other never sees, so both give exactly what a cache of their own would.
+func TestQwen35CacheClone(t *testing.T) {
+	lib, dir := os.Getenv("KINFER_MLX_LIB"), os.Getenv("KINFER_MLX_MODEL")
+	if lib == "" || dir == "" {
+		t.Skip("KINFER_MLX_LIB and KINFER_MLX_MODEL not both set")
+	}
+	if err := mlx.Open(lib); err != nil {
+		t.Fatal(err)
+	}
+	m, err := LoadQwen35(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	part := func(seed, n int) []int32 {
+		p := make([]int32, n)
+		for i := range p {
+			p[i] = int32(1000 + ((seed+1)*7919+i*104729)%50000)
+		}
+		return p
+	}
+	a, b, c, d := part(1, 300), part(2, 50), part(3, 50), part(4, 40)
+	// read feeds chunks into cache and returns the last chunk's logits.
+	read := func(cache *Qwen35Cache, chunks ...[]int32) []float32 {
+		var out []float32
+		for _, ch := range chunks {
+			lg, err := m.Forward([][]int32{ch}, cache, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = mlx.Astype(lg, mlx.Float32).Float32s()
+			lg.Free()
+		}
+		return out
+	}
+	same := func(what string, got, want []float32) {
+		worst := 0.0
+		for i := range want {
+			worst = math.Max(worst, math.Abs(float64(got[i]-want[i])))
+		}
+		if worst != 0 {
+			t.Errorf("%s: logits differ by up to %g", what, worst)
+		} else {
+			t.Logf("%s: logits identical", what)
+		}
+	}
+
+	orig := m.NewCache()
+	defer orig.Free()
+	read(orig, a)
+	clone := orig.Clone()
+	defer clone.Free()
+	read(orig, b)
+	gotC := read(clone, c) // writes the same positions orig just wrote
+	gotD := read(orig, d)  // reads them back
+
+	fresh := m.NewCache()
+	wantD := read(fresh, a, b, d)
+	fresh.Free()
+	fresh = m.NewCache()
+	wantC := read(fresh, a, c)
+	fresh.Free()
+	same("the cache, after its clone wrote over the same positions", gotD, wantD)
+	same("the clone", gotC, wantC)
+}

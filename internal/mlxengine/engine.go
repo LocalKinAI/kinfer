@@ -76,6 +76,9 @@ type Engine struct {
 	// time goes and logs it every ten seconds.
 	prof *profile
 
+	// pool keeps recently read prompts' caches; nil when -prefix is off.
+	pool *prefixPool
+
 	waiting, busy      atomic.Int32
 	promptTok, evalTok atomic.Int64
 	broken             atomic.Bool
@@ -99,6 +102,9 @@ type job struct {
 	deadline time.Time
 	rng      *rand.Rand
 	last     int32
+
+	// checkpoints are where the prompt is pooled as it is read.
+	checkpoints []checkpoint
 }
 
 // Open loads the model in dir.
@@ -158,10 +164,15 @@ func Open(dir string, opts engine.Options) (*Engine, error) {
 	if e.ctx <= 0 {
 		e.ctx = defaultCtx
 	}
+	prefix := opts.PrefixSlots
+	if prefix == 0 {
+		prefix = engine.DefaultPrefixSlots
+	}
+	e.pool = newPrefixPool(prefix)
 	e.prof = &profile{on: os.Getenv("KINFER_MLX_PROFILE") != "", since: time.Now()}
-	log.Printf("mlx: %s loaded in %v — %d layers, %d slots × %d tokens, template %s",
+	log.Printf("mlx: %s loaded in %v — %d layers, %d slots × %d tokens, %d prefix entries, template %s",
 		filepath.Base(dir), time.Since(start).Round(time.Millisecond), model.Config.NumHiddenLayers,
-		e.slots, e.ctx, e.tpl.Name)
+		e.slots, e.ctx, max(prefix, 0), e.tpl.Name)
 	go e.run()
 	return e, nil
 }
@@ -182,6 +193,9 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p engine.Gen
 	th := chat.Thinking{Off: p.NoThink, Effort: p.Effort}
 	prompt := e.tok.Encode(e.tpl.RenderWith(msgs, p.Tools, th), true)
 	j := &job{ctx: ctx, prompt: prompt, params: p, frags: make(chan string, 1<<16), done: make(chan struct{})}
+	if e.pool != nil {
+		j.checkpoints = e.checkpoints(msgs, p, th, prompt)
+	}
 	if p.Resume != "" {
 		text := p.Resume
 		if e.tpl.OpensThink(th) {
@@ -210,6 +224,42 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p engine.Gen
 	}
 	<-j.done
 	return b.String(), j.stats, j.err
+}
+
+// checkpoints are where prompt is pooled as it is read, as the GGUF engine
+// pools a model with recurrent state: at the end of the system prompt, which
+// another conversation of the same agent opens with, and at the end of the
+// conversation so far as its next turn renders it. The prompt itself ends in
+// the opening of a reply, which the next turn renders with what was said, so
+// the conversation is rendered again with an assistant turn appended, and the
+// two agree exactly as far as the next turn will. Each place is taken back to
+// just after a control token: an ordinary token at the edge is tokenized with
+// whatever follows it, and a later prompt has something else there.
+func (e *Engine) checkpoints(msgs []chat.Message, p engine.GenParams, th chat.Thinking, prompt []int32) []checkpoint {
+	agree := func(ms []chat.Message) int {
+		ext := e.tok.Encode(e.tpl.RenderWith(ms, p.Tools, th), true)
+		n := commonPrefix(prompt, ext)
+		for n > 0 && !e.tok.IsSpecial(prompt[n-1]) {
+			n--
+		}
+		if n < minPrefixMatch {
+			return 0
+		}
+		return n
+	}
+	var cps []checkpoint
+	if len(msgs) > 1 && msgs[0].Role == "system" {
+		// Rendered with a different first message, the system prompt is where
+		// the two part.
+		if pos := agree([]chat.Message{msgs[0], {Role: "user", Content: "x"}}); pos > 0 {
+			cps = append(cps, checkpoint{pos: pos, shared: true})
+		}
+	}
+	next := append(append([]chat.Message(nil), msgs...), chat.Message{Role: "assistant", Content: "x"})
+	if pos := agree(next); pos > 0 && (len(cps) == 0 || pos > cps[0].pos) {
+		cps = append(cps, checkpoint{pos: pos})
+	}
+	return cps
 }
 
 // CountTokens is how many tokens msgs render to.
@@ -251,6 +301,7 @@ func (e *Engine) run() {
 			}
 		}
 		batch.Free()
+		e.pool.free()
 		e.model.Free()
 	}()
 
@@ -460,18 +511,38 @@ func (e *Engine) prefill(j *job) *mlxmodel.Qwen35Cache {
 		return nil
 	}
 
-	c := e.model.NewCache()
+	// Begin where a pooled prompt this one goes on from ends, and pool this
+	// one at its checkpoints, each read up to exactly that point.
+	c, read := e.model.NewCache(), 0
+	if p := e.pool.match(j.prompt); p != nil {
+		c.Free()
+		c, read = p.cache.(*mlxmodel.Qwen35Cache).Clone(), len(p.tokens)
+	}
+	e.prof.prompt(read, len(j.prompt))
+	marks := j.checkpoints
+	for len(marks) > 0 && marks[0].pos <= read {
+		marks = marks[1:]
+	}
 	var logits mlx.Array
-	for i := 0; i < len(j.prompt); i += prefillChunk {
+	for read < len(j.prompt) {
+		end := min(read+prefillChunk, len(j.prompt))
+		if len(marks) > 0 && marks[0].pos < end {
+			end = marks[0].pos
+		}
 		if logits != 0 {
 			logits.Free()
 		}
 		var err error
-		logits, err = e.model.Forward([][]int32{j.prompt[i:min(i+prefillChunk, len(j.prompt))]}, c, nil)
+		logits, err = e.model.Forward([][]int32{j.prompt[read:end]}, c, nil)
 		if err != nil {
 			c.Free()
 			e.finish(j, err)
 			return nil
+		}
+		read = end
+		if len(marks) > 0 && read == marks[0].pos {
+			e.pool.put(j.prompt[:read], marks[0].shared, func() held { return c.Clone() })
+			marks = marks[1:]
 		}
 	}
 	e.promptTok.Add(int64(len(j.prompt)))
@@ -627,6 +698,14 @@ type profile struct {
 	since                      time.Time
 	prefill, join, step, leave time.Duration
 	steps, rowSteps            int
+	pooled, prompts            int // prompt tokens the pool supplied, of all
+}
+
+func (p *profile) prompt(pooled, all int) {
+	if p.on {
+		p.pooled += pooled
+		p.prompts += all
+	}
 }
 
 func (p *profile) add(d *time.Duration, t time.Time) {
@@ -643,8 +722,8 @@ func (p *profile) tick(rows int) {
 	p.rowSteps += rows
 	if el := time.Since(p.since); el > 10*time.Second {
 		mem := mlx.MemoryUse()
-		log.Printf("mlx profile %v: prefill %v, join %v, decode %v (%d steps, %.1f rows each, %.1f ms a step), leave %v; memory active %.1f GB, cache %.1f GB, peak %.1f GB",
-			el.Round(time.Second), p.prefill.Round(time.Millisecond), p.join.Round(time.Millisecond),
+		log.Printf("mlx profile %v: prefill %v (%d of %d prompt tokens from the pool), join %v, decode %v (%d steps, %.1f rows each, %.1f ms a step), leave %v; memory active %.1f GB, cache %.1f GB, peak %.1f GB",
+			el.Round(time.Second), p.prefill.Round(time.Millisecond), p.pooled, p.prompts, p.join.Round(time.Millisecond),
 			p.step.Round(time.Millisecond), p.steps, float64(p.rowSteps)/float64(max(1, p.steps)),
 			float64(p.step.Microseconds())/1000/float64(max(1, p.steps)), p.leave.Round(time.Millisecond),
 			float64(mem.Active)/1e9, float64(mem.Cache)/1e9, float64(mem.Peak)/1e9)

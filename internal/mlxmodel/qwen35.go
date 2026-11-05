@@ -402,6 +402,24 @@ func (c *Qwen35Cache) Arrays() []mlx.Array {
 	return r
 }
 
+// Clone is a second cache at the same point, sharing c's arrays rather than
+// copying them. Either can read on: what it writes are new arrays, and a
+// buffer the other still holds is copied before it is written to.
+func (c *Qwen35Cache) Clone() *Qwen35Cache {
+	d := &Qwen35Cache{Offset: c.Offset}
+	for _, p := range []struct{ dst, src *[]mlx.Array }{
+		{&d.conv, &c.conv}, {&d.state, &c.state}, {&d.keys, &c.keys}, {&d.vals, &c.vals},
+	} {
+		*p.dst = make([]mlx.Array, len(*p.src))
+		for i, a := range *p.src {
+			if a != 0 {
+				(*p.dst)[i] = a.Ref()
+			}
+		}
+	}
+	return d
+}
+
 // Free releases the cache's arrays.
 func (c *Qwen35Cache) Free() {
 	for _, a := range c.Arrays() {
