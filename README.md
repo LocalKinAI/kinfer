@@ -1,5 +1,11 @@
 # kinfer
 
+[![PyPI](https://img.shields.io/pypi/v/kinfer-ai)](https://pypi.org/project/kinfer-ai/)
+[![Downloads](https://static.pepy.tech/badge/kinfer-ai)](https://pepy.tech/project/kinfer-ai)
+[![Downloads a month](https://img.shields.io/pypi/dm/kinfer-ai)](https://pypistats.org/packages/kinfer-ai)
+[![GitHub downloads](https://img.shields.io/github/downloads/LocalKinAI/kinfer/total)](https://github.com/LocalKinAI/kinfer/releases)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 **A single-file local inference runtime for agent fleets.** No Docker, no
 service to install, no separate llama.cpp — one binary, one copy, it runs.
 
