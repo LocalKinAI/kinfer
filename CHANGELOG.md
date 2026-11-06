@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.4 — 2026-11-06
 
 ### Faster — a mixture of experts read from the SSD, on a MacBook Pro most
 
