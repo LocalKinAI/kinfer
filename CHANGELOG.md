@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 — 2026-11-05
 
 ### Added — MLX: a directory of safetensors served in Go, no Python
 
