@@ -382,7 +382,7 @@ func (b *Qwen35Batch) Step(tokens mlx.Array) mlx.Array {
 		}
 		h = mlx.Add(h, r)
 		x = mlx.RMSNorm(h, l.inPost, c.RMSNormEps)
-		h = mlx.Add(h, linear(mlx.Multiply(mlx.SiLU(linear(x, l.gate)), linear(x, l.up)), l.down))
+		h = mlx.Add(h, l.mlp(x))
 	}
 	h = mlx.RMSNorm(h, m.norm, c.RMSNormEps)
 	logits := mlx.Reshape(linear(h, m.head()), B, c.VocabSize)

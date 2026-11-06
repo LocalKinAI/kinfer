@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/LocalKinAI/kinfer/internal/llama"
 )
@@ -73,6 +74,37 @@ import (
 // company — even with the whole GPU's reading, whatever starts after it — which
 // on a shared machine is the thing that decides it.
 const thinHeadroom = 2 << 30 // 2 GiB
+
+// noRoom is the reading below which a load says its first pass may not find
+// the memory to run. It is a warning, not a refusal: the reading cannot tell
+// the two cases apart. On the MacBook Pro, Flash-Next with -host-experts 24
+// -moe-cache 8192 -batch 2048 read 0.0 GiB left and every reply died on Metal's
+// out-of-memory error; on the M3 Ultra, DeepSeek-V4.1 with -host-experts 32
+// -moe-cache 47542 read 0.0 GiB left too and decoded at 17-19 tok/s.
+const noRoom = 256 << 20
+
+// noRoomHint says what a load left of the GPU and which of its settings were
+// set by hand, and so are the operator's to give back: the warning at load,
+// and what a first pass that does run out of memory adds to its error.
+func noRoomHint(name string, free uint64, opts Options) string {
+	var hand []string
+	for _, f := range []struct {
+		flag string
+		v    int
+	}{
+		{"-slots", opts.Slots}, {"-ctx", opts.ContextSize}, {"-prefix", opts.PrefixSlots},
+		{"-batch", opts.Batch}, {"-host-experts", opts.HostExperts}, {"-moe-cache", opts.MoeCache},
+	} {
+		if f.v > 0 || f.flag == "-host-experts" && f.v < 0 {
+			hand = append(hand, fmt.Sprintf("%s %d", f.flag, f.v))
+		}
+	}
+	why := "if something else holds the GPU's memory, closing it or a smaller model makes room"
+	if len(hand) > 0 {
+		why = strings.Join(hand, " ") + " set by hand may leave it too little; without them kinfer places the model and sizes its context itself"
+	}
+	return fmt.Sprintf("%s loaded with %s of the GPU left, which its first pass may not fit in — %s", name, gib(free), why)
+}
 
 // freeScope is what a free figure counts, for the lines that print one.
 func freeScope() string {

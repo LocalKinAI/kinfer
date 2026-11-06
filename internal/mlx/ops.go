@@ -27,7 +27,7 @@ type optFloat struct {
 var (
 	opSigmoid, opExp, opLog, opNegative, opRsqrt, opSquare, opSqrt, opAbs, opCopy, opTransposeAll unaryFn
 
-	opSubtract, opMultiply, opDivide, opMaximum, opMinimum, opGreater, opLess, opEqual,
+	opSubtract, opMultiply, opDivide, opFloorDivide, opMaximum, opMinimum, opGreater, opLess, opEqual,
 	opLogaddexp, opPower binaryFn
 
 	opReshape       func(res *Array, a Array, shape *int32, n uintptr, s Stream) int32
@@ -93,6 +93,7 @@ func bindOps(lib uintptr) error {
 		{&opSqrt, "mlx_sqrt"}, {&opAbs, "mlx_abs"}, {&opCopy, "mlx_copy"},
 		{&opTransposeAll, "mlx_transpose"},
 		{&opSubtract, "mlx_subtract"}, {&opMultiply, "mlx_multiply"}, {&opDivide, "mlx_divide"},
+		{&opFloorDivide, "mlx_floor_divide"},
 		{&opMaximum, "mlx_maximum"}, {&opMinimum, "mlx_minimum"}, {&opGreater, "mlx_greater"},
 		{&opLess, "mlx_less"}, {&opEqual, "mlx_equal"}, {&opLogaddexp, "mlx_logaddexp"},
 		{&opPower, "mlx_power"},
@@ -155,6 +156,7 @@ func T(a Array) Array                  { return un(opTransposeAll, a) }
 func Subtract(a, b Array) Array        { return bin(opSubtract, a, b) }
 func Multiply(a, b Array) Array        { return bin(opMultiply, a, b) }
 func Divide(a, b Array) Array          { return bin(opDivide, a, b) }
+func FloorDivide(a, b Array) Array     { return bin(opFloorDivide, a, b) }
 func Maximum(a, b Array) Array         { return bin(opMaximum, a, b) }
 func Minimum(a, b Array) Array         { return bin(opMinimum, a, b) }
 func Greater(a, b Array) Array         { return bin(opGreater, a, b) }
@@ -433,6 +435,8 @@ type optInt struct {
 var (
 	opQuantizedMatmul func(res *Array, x, w, scales, biases Array, transpose bool, group, bits optInt, mode string, s Stream) int32
 	opDequantize      func(res *Array, w, scales, biases Array, group, bits optInt, mode string, globalScale Array, dt optDtype, s Stream) int32
+	opGatherQMM       func(res *Array, x, w, scales, biases, lhs, rhs Array, transpose bool, group, bits optInt, mode string, globalScale Array, sorted bool, s Stream) int32
+	opGatherMM        func(res *Array, a, b, lhs, rhs Array, sorted bool, s Stream) int32
 )
 
 func bindQuant(lib uintptr) error {
@@ -441,6 +445,7 @@ func bindQuant(lib uintptr) error {
 		name string
 	}{
 		{&opQuantizedMatmul, "mlx_quantized_matmul"}, {&opDequantize, "mlx_dequantize"},
+		{&opGatherQMM, "mlx_gather_qmm"}, {&opGatherMM, "mlx_gather_mm"},
 	} {
 		if _, err := purego.Dlsym(lib, b.name); err != nil {
 			return fmt.Errorf("mlx-c has no %s: %w", b.name, err)
@@ -456,6 +461,23 @@ func QuantizedMatmul(x, w, scales, biases Array, group, bits int, mode string) A
 	r := arrayNew()
 	return out(opQuantizedMatmul(&r, x, w, scales, biases, true,
 		optInt{Value: int32(group), Has: 1}, optInt{Value: int32(bits), Has: 1}, mode, gpu), r)
+}
+
+// GatherQMM is QuantizedMatmul with a stack of weights, w [E, out, in/…]: each
+// of x's matrices is multiplied by the weight rhs names for it, x [..., M, in]
+// broadcast against rhs [...] to [..., M, out]. sorted says rhs is in
+// ascending order, which lets MLX read each weight once for a run of rows.
+func GatherQMM(x, w, scales, biases, rhs Array, group, bits int, mode string, sorted bool) Array {
+	r := arrayNew()
+	return out(opGatherQMM(&r, x, w, scales, biases, 0, rhs, true,
+		optInt{Value: int32(group), Has: 1}, optInt{Value: int32(bits), Has: 1}, mode, 0, sorted, gpu), r)
+}
+
+// GatherMM is a @ b[rhs] for a stack of matrices b [E, K, N], as GatherQMM
+// for weights that are not quantized; b is not transposed.
+func GatherMM(a, b, rhs Array, sorted bool) Array {
+	r := arrayNew()
+	return out(opGatherMM(&r, a, b, 0, rhs, sorted, gpu), r)
 }
 
 // Dequantize unpacks quantized w to the scales' dtype.

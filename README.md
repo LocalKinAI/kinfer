@@ -9,7 +9,7 @@ $ kinfer list
 NAME                                                 SIZE  MODIFIED
 qwen2.5-0.5b-instruct-q4_k_m                     468.6 MB  just now
 
-$ kinfer run qwen "explain merkle trees in one sentence"
+$ kinfer run qwen2.5-0.5b-instruct-q4_k_m "explain merkle trees in one sentence"
 A Merkle tree is a data structure used in cryptography to store and
 retrieve data in a way that is resistant to attacks…
 
@@ -118,7 +118,7 @@ What each does, and how serve sizes itself: [docs/serving.md](docs/serving.md).
 ## MLX models
 
 A model can also be a directory of safetensors as Hugging Face publishes it,
-and kinfer serves it on Apple's MLX: Qwen3.5 dense, at bf16 or MLX 4-bit, such as
+and kinfer serves it on Apple's MLX: Qwen3.5 and Qwen3.8, at bf16 or MLX 4-bit, such as
 mlx-community's conversions, or NVFP4. `kinfer pull mlx-community/Qwen3.8-27B-4bit` fetches
 one into the store; from there it is listed, run and served like a GGUF, through
 the same four dialects. Ollama's own MLX models (`qwen3.8:27b-mlx`) are listed
@@ -129,9 +129,11 @@ once, the first time an MLX model loads, and need macOS 26.2.
 Where it stands against llama.cpp on the M3 Ultra: a small model at many replies
 at once is MLX's (Qwen3.5-0.8B at 64: 2,833 tok/s against 1,031, in half the
 memory); Qwen3.8-27B decodes alone at 36 tok/s against 31, but llama.cpp's MTP
-drafting reaches 51, and at 16 replies llama.cpp leads, 130 against 105. A mixture
-of experts, MTP, pictures and embeddings run only on llama.cpp so far. The
-numbers: [CHANGELOG.md](CHANGELOG.md).
+drafting reaches 51, and at 16 replies llama.cpp leads, 130 against 105. A model
+that keeps its MTP head drafts with it on MLX too: Ollama's qwen3.8:27b-mlx on a
+MacBook Pro (M5 Max) went from 30 tok/s to 38–75. Pictures and embeddings run only
+on llama.cpp so far, and the mixtures of experts of Qwen3.5's architecture load
+on MLX but have been checked only in parts. The numbers: [CHANGELOG.md](CHANGELOG.md).
 
 ## Models bigger than the machine
 
@@ -281,8 +283,8 @@ same tree (`go build -o kinlab ./cmd/kinlab`) and is not part of a release.
 - [x] **Bigger than one machine, at speed** — over Thunderbolt 5 with the GPUs
       kept warm a split decodes as fast as the box alone, and `kinfer run` borrows a
       worker it finds on the cable only for a model that does not fit here
-- [x] **MLX** — safetensors served on MLX from Go: Qwen3.5 dense, batched, with a
-      prefix pool; a small model's many replies at once 2.7 times llama.cpp's
+- [x] **MLX** — safetensors served on MLX from Go: Qwen3.5 and Qwen3.8, batched, with a
+      prefix pool and MTP drafting; a small model's many replies at once 2.7 times llama.cpp's
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,
       circuit breaking, per-agent model routing
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks

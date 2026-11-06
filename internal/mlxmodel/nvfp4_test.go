@@ -74,3 +74,54 @@ func TestNVFP4Linear(t *testing.T) {
 		}
 	}
 }
+
+// The kernel that also writes the state after each token gives, at each, the
+// state the plain kernel ends with after the tokens up to it: what Keep cuts a
+// pass back to.
+func TestGatedDeltaStepsMatchShorterPasses(t *testing.T) {
+	lib := os.Getenv("KINFER_MLX_LIB")
+	if lib == "" {
+		t.Skip("KINFER_MLX_LIB not set")
+	}
+	if err := mlx.Open(lib); err != nil {
+		t.Fatal(err)
+	}
+	const B, T, Hk, Hv, Dk, Dv = 1, 5, 2, 4, 64, 32
+	rng := rand.New(rand.NewSource(2))
+	random := func(scale float64, shape ...int) mlx.Array {
+		n := 1
+		for _, d := range shape {
+			n *= d
+		}
+		v := make([]float32, n)
+		for i := range v {
+			v[i] = float32(rng.NormFloat64() * scale)
+		}
+		return mlx.FromFloat32(v, shape...)
+	}
+	s := mlx.NewScope()
+	defer s.Close()
+	q, k := random(0.1, B, T, Hk, Dk), random(0.1, B, T, Hk, Dk)
+	v := random(1, B, T, Hv, Dv)
+	g := mlx.Sigmoid(random(1, B, T, Hv))
+	beta := mlx.Sigmoid(random(1, B, T, Hv))
+	state := random(0.1, B, Hv, Dv, Dk)
+
+	_, final, steps := gatedDeltaSteps(q, k, v, g, beta, state)
+	cut := func(a mlx.Array, n int) mlx.Array {
+		sh := a.Shape()
+		stop := append([]int(nil), sh...)
+		stop[1] = n
+		return mlx.Slice(a, make([]int, len(sh)), stop)
+	}
+	for n := 1; n <= T; n++ {
+		_, want := gatedDeltaFast(cut(q, n), cut(k, n), cut(v, n), cut(g, n), cut(beta, n), state, 0)
+		got := mlx.Reshape(mlx.Slice(steps, []int{0, n - 1, 0, 0, 0}, []int{B, n, Hv, Dv, Dk}), B, Hv, Dv, Dk)
+		if d := mlx.Max(mlx.Reshape(mlx.Abs(mlx.Subtract(got, want)), B*Hv*Dv*Dk), 0, false).Float32s()[0]; d > 1e-5 {
+			t.Errorf("after %d tokens the step state is %g from the plain kernel's", n, d)
+		}
+	}
+	if d := mlx.Max(mlx.Reshape(mlx.Abs(mlx.Subtract(final, mlx.Reshape(mlx.Slice(steps, []int{0, T - 1, 0, 0, 0}, []int{B, T, Hv, Dv, Dk}), B, Hv, Dv, Dk))), B*Hv*Dv*Dk), 0, false).Float32s()[0]; d > 0 {
+		t.Errorf("the final state is %g from the last step's", d)
+	}
+}

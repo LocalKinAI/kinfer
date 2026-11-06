@@ -82,6 +82,11 @@ type Engine struct {
 	waiting, busy      atomic.Int32
 	promptTok, evalTok atomic.Int64
 	broken             atomic.Bool
+
+	// drafts is how many tokens a reply writing alone drafts a step with
+	// the model's MTP head (solo); 0 when it has none or -draft is off.
+	drafts            int
+	drafted, accepted atomic.Int64
 }
 
 type job struct {
@@ -185,6 +190,20 @@ func Open(dir string, opts engine.Options) (*Engine, error) {
 	}
 	e.pool = newPrefixPool(prefix)
 	e.prof = &profile{on: os.Getenv("KINFER_MLX_PROFILE") != "", since: time.Now()}
+	if model.CanDraft() && opts.Draft >= 0 {
+		switch size := model.Bytes(); {
+		case opts.Draft > 0:
+			e.drafts = opts.Draft
+		case size < draftsFrom:
+			log.Printf("draft: off for a model of %.1f GB, whose steps are too quick for its MTP head's drafts to pay — -draft N drafts N tokens a step",
+				float64(size)/1e9)
+		default:
+			e.drafts = defaultDrafts
+		}
+		if e.drafts > 0 {
+			log.Printf("draft: a reply writing alone drafts up to %d tokens a step with the model's MTP head — -draft -1 turns it off", e.drafts)
+		}
+	}
 	log.Printf("mlx: %s loaded in %v — %d layers, %d slots × %d tokens, %d prefix entries, template %s",
 		filepath.Base(dir), time.Since(start).Round(time.Millisecond), model.Config.NumHiddenLayers,
 		e.slots, e.ctx, max(prefix, 0), e.tpl.Name)
@@ -287,7 +306,7 @@ func (e *Engine) Broken() bool                      { return e.broken.Load() }
 func (e *Engine) ToolFormat() tools.Format          { return e.tpl.ToolFormat() }
 func (e *Engine) PromptTokens() int64               { return e.promptTok.Load() }
 func (e *Engine) EvalTokens() int64                 { return e.evalTok.Load() }
-func (e *Engine) Drafts() (drafted, accepted int64) { return 0, 0 }
+func (e *Engine) Drafts() (drafted, accepted int64) { return e.drafted.Load(), e.accepted.Load() }
 func (e *Engine) Context() (perSlot, most int)      { return e.ctx, e.ctx }
 func (e *Engine) Path() string                      { return e.path }
 
@@ -396,10 +415,18 @@ func (e *Engine) run() {
 			// flight is finished first and the next one starts from the host.
 			settle()
 			t := time.Now()
-			c := e.prefill(j)
+			alone := e.drafts > 0 && active() == 0 && len(e.jobs) == 0
+			c := e.prefill(j, alone)
 			e.prof.add(&e.prof.prefill, t)
 			if c == nil {
 				continue
+			}
+			// A reply with the model to itself drafts; it joins the batch, and
+			// stops drafting, when another arrives.
+			if alone && c.HeadReady() {
+				if c = e.solo(j, c); c == nil {
+					continue
+				}
 			}
 			t = time.Now()
 			// Room for this burst: the rows in use, this one, and the
@@ -471,6 +498,152 @@ func (e *Engine) run() {
 	}
 }
 
+// defaultDrafts is how many tokens a step drafts when -draft does not say.
+// On Ollama's qwen3.8:27b-mlx on an M5 Max, one to four drafts gave 44, 55,
+// 60 and 59 tok/s on average over six replies against 30 without, three
+// the best of the slowest reply too.
+const defaultDrafts = 3
+
+// draftsFrom is the size of weights below which a model does not draft unless
+// -draft says so. A small model's step is quick beside its head's, which also
+// runs the output layer over the whole vocabulary for every draft: on the M3
+// Ultra, Qwen3.5-0.8B in bf16 (1.6 GB) wrote 221 tok/s alone without drafts
+// and 141 with three; qwen3.8:27b-mlx (18 GB) went from 30 to 38-75. Where
+// between the two drafting starts to pay is not measured; this is a guess.
+const draftsFrom = 4e9
+
+// solo writes j's reply while it has the model to itself, drafting with the
+// MTP head: each pass reads the token the reply is sure of with the drafts
+// after it, and the reply keeps as many drafts as the model agrees with,
+// then its own token where it stops agreeing. What the pass read past the
+// last token kept is taken back from the states it left (Keep). It returns
+// when the reply ends (nil) or another request arrives, with j's cache read
+// up to j.last, as a batch row's is.
+func (e *Engine) solo(j *job, c *mlxmodel.Qwen35Cache) *mlxmodel.Qwen35Cache {
+	fail := func(err error) *mlxmodel.Qwen35Cache {
+		c.Free()
+		e.finish(j, err)
+		return nil
+	}
+	drafts, err := e.model.Draft(c, j.last, e.draftsFor(j))
+	if err != nil {
+		return fail(err)
+	}
+	for {
+		if len(e.jobs) > 0 || e.closing() {
+			return c
+		}
+		mark := c.Mark()
+		logits, hidden, err := e.model.Verify(append([]int32{j.last}, drafts...), c)
+		if err != nil {
+			return fail(err)
+		}
+		toks, err := e.checkDrafts(logits, 0, drafts, j)
+		logits.Free()
+		if err != nil {
+			hidden.Free()
+			return fail(err)
+		}
+		e.drafted.Add(int64(len(drafts)))
+		kept, ended := 0, false
+		for i, tok := range toks {
+			if !e.accept(j, tok) {
+				ended = true
+				break
+			}
+			if i < len(drafts) && tok == drafts[i] {
+				kept++
+			}
+		}
+		e.accepted.Add(int64(kept))
+		if ended {
+			hidden.Free()
+			c.Free()
+			return nil
+		}
+		err = c.Keep(mark, kept, hidden)
+		hidden.Free()
+		if err != nil {
+			return fail(err)
+		}
+		if drafts, err = e.model.Draft(c, j.last, e.draftsFor(j)); err != nil {
+			return fail(err)
+		}
+	}
+}
+
+// checkDrafts reads the logits of a verified pass from index at on, where the
+// first draft's position is, and returns the reply's tokens there: each
+// sampled as the reply would sample it, up to and including the first that
+// differs from its draft, or one past the last draft when all hold.
+func (e *Engine) checkDrafts(logits mlx.Array, at int, drafts []int32, j *job) (toks []int32, err error) {
+	defer mlx.Recover(&err)
+	V := logits.Shape()[1]
+	n := len(drafts) + 1
+	rows := mlx.Slice(logits, []int{at, 0}, []int{at + n, V})
+	defer rows.Free()
+	// Greedy and without penalties, every row's token is its argmax, read
+	// at once; otherwise each is sampled with the history before it.
+	if j.params.Temperature <= 0 && !sampling.PenaltiesOn(j.params.Params) {
+		best := mlx.Astype(mlx.Argmax(rows, -1, false), mlx.Int32)
+		all := best.Int32s()
+		best.Free()
+		for i, t := range all {
+			toks = append(toks, t)
+			if i < len(drafts) && t != drafts[i] {
+				break
+			}
+		}
+		return toks, nil
+	}
+	// The tokens taken here are the reply's history for the rows after them,
+	// as they will be once the reply takes them, and only until then.
+	gen, distinct := len(j.gen), len(j.distinct)
+	defer func() {
+		for _, t := range j.distinct[distinct:] {
+			delete(j.seen, t)
+		}
+		j.gen, j.distinct = j.gen[:gen], j.distinct[:distinct]
+	}()
+	for i := 0; i < n; i++ {
+		row := mlx.Slice(rows, []int{i, 0}, []int{i + 1, V})
+		t, err := e.sample(row, []*job{j})
+		row.Free()
+		if err != nil {
+			return nil, err
+		}
+		toks = append(toks, t[0])
+		if i >= len(drafts) || t[0] != drafts[i] {
+			break
+		}
+		j.gen = append(j.gen, t[0])
+		if j.params.RepeatLastN < 0 && !j.seen[t[0]] {
+			if j.seen == nil {
+				j.seen = map[int32]bool{}
+			}
+			j.seen[t[0]] = true
+			j.distinct = append(j.distinct, t[0])
+		}
+	}
+	return toks, nil
+}
+
+// draftsFor is how many tokens j may draft this step: no more than it may
+// still write after the one it is sure of.
+func (e *Engine) draftsFor(j *job) int {
+	return max(0, min(e.drafts, j.maxGen-len(j.gen)-1))
+}
+
+// closing reports whether the engine is being closed.
+func (e *Engine) closing() bool {
+	select {
+	case <-e.quit:
+		return true
+	default:
+		return false
+	}
+}
+
 func readTokens(a mlx.Array) (toks []int32, err error) {
 	defer mlx.Recover(&err)
 	return a.Int32s(), nil
@@ -500,7 +673,7 @@ func (e *Engine) drain() {
 
 // prefill reads j's prompt into a fresh cache and takes its first token. It
 // returns the cache for the batch, or nil when the reply already ended.
-func (e *Engine) prefill(j *job) *mlxmodel.Qwen35Cache {
+func (e *Engine) prefill(j *job, drafting bool) *mlxmodel.Qwen35Cache {
 	if err := j.ctx.Err(); err != nil {
 		e.finish(j, err)
 		return nil
@@ -533,6 +706,10 @@ func (e *Engine) prefill(j *job) *mlxmodel.Qwen35Cache {
 		c.Free()
 		c, read = p.cache.(*mlxmodel.Qwen35Cache).Clone(), len(p.tokens)
 	}
+	// A reply that will draft has the head read its prompt too; one pooled
+	// without it does not draft (HeadReady), since the head would draft
+	// without the conversation's start.
+	c.Drafting = drafting
 	e.prof.prompt(read, len(j.prompt))
 	marks := j.checkpoints
 	for len(marks) > 0 && marks[0].pos <= read {

@@ -287,11 +287,8 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	eng, release, err := s.acquire(req.Model)
 	if err != nil {
-		kind := "not_found_error"
-		if acquireStatus(err) == http.StatusBadRequest {
-			kind = "invalid_request_error"
-		}
-		writeAnthropicError(w, acquireStatus(err), kind, err.Error())
+		status := acquireStatus(err)
+		writeAnthropicError(w, status, anthropicKind(status), err.Error())
 		return
 	}
 	defer release()
@@ -469,11 +466,8 @@ func (s *Server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 	}
 	eng, release, err := s.acquire(req.Model)
 	if err != nil {
-		kind := "not_found_error"
-		if acquireStatus(err) == http.StatusBadRequest {
-			kind = "invalid_request_error"
-		}
-		writeAnthropicError(w, acquireStatus(err), kind, err.Error())
+		status := acquireStatus(err)
+		writeAnthropicError(w, status, anthropicKind(status), err.Error())
 		return
 	}
 	defer release()
@@ -531,4 +525,16 @@ func writeAnthropicGenError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+}
+
+// anthropicKind is the error type Anthropic's API gives a status: a model that
+// would not load is the server's own failure, api_error.
+func anthropicKind(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusInternalServerError:
+		return "api_error"
+	}
+	return "not_found_error"
 }

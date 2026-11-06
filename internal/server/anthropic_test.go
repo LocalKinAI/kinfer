@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -330,5 +331,35 @@ func TestAnthropicCountTokens(t *testing.T) {
 		strings.NewReader(`{"model":"nope","messages":[{"role":"user","content":"hi"}]}`)))
 	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), `"not_found_error"`) {
 		t.Errorf("an unknown model: status %d, %s; want 404 in Anthropic's envelope", w.Code, w.Body.String())
+	}
+}
+
+// A model that is there but will not load — too big for the memory left — is
+// the server's failure, 500 in every dialect as Ollama answers it, and the
+// reason reaches the client; a name nothing answers to is still 404.
+func TestAModelThatWillNotLoadIsTheServersFailure(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return nil, errors.New("alpha.gguf does not fit: -moe-cache 20000 set by hand leave it no room")
+	}
+	for _, c := range []struct{ path, body string }{
+		{"/api/chat", `{"model":"alpha","stream":false,"messages":[{"role":"user","content":"hi"}]}`},
+		{"/v1/chat/completions", `{"model":"alpha","messages":[{"role":"user","content":"hi"}]}`},
+		{"/v1/messages", `{"model":"alpha","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`},
+		{"/v1/responses", `{"model":"alpha","input":"hi"}`},
+	} {
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", c.path, strings.NewReader(c.body)))
+		if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "does not fit") {
+			t.Errorf("%s: %d %s; want 500 with the reason", c.path, w.Code, w.Body.String())
+		}
+		if c.path == "/v1/messages" && !strings.Contains(w.Body.String(), `"api_error"`) {
+			t.Errorf("%s: %s; want Anthropic's api_error", c.path, w.Body.String())
+		}
+	}
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(`{"model":"nope","messages":[{"role":"user","content":"hi"}]}`)))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("an unknown model: %d, want 404", w.Code)
 	}
 }

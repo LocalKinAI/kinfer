@@ -368,7 +368,8 @@ func (s *Server) acquireOnce(name string) (generator, func(), error) {
 	s.mu.Lock()
 
 	if err != nil {
-		return nil, nil, err
+		log.Printf("loading %s failed: %v", path, err)
+		return nil, nil, &loadError{err}
 	}
 	l := &lease{eng: e, path: path, refs: 2} // one for the server, one for the caller
 	if sh, err := store.ReadShape(path); err == nil {
@@ -913,11 +914,25 @@ func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
 // errEmbeddingModel is an embedding model asked to write text.
 var errEmbeddingModel = errors.New("is an embedding model: it makes vectors (/api/embed, /v1/embeddings), not text")
 
+// loadError is a model that was found but could not be loaded: too big for
+// the memory left, a file llama.cpp cannot read. It is the server's failure,
+// not a name nothing answers to, and a client told 404 would look for another
+// model instead of at the server.
+type loadError struct{ err error }
+
+func (e *loadError) Error() string { return e.err.Error() }
+func (e *loadError) Unwrap() error { return e.err }
+
 // acquireStatus is the HTTP status a request failed with when its model could
-// not be had: a name nothing answers to, or a model that writes no text.
+// not be had: a name nothing answers to, a model that writes no text, or one
+// that would not load (500, as Ollama answers it).
 func acquireStatus(err error) int {
-	if errors.Is(err, errEmbeddingModel) {
+	var le *loadError
+	switch {
+	case errors.Is(err, errEmbeddingModel):
 		return http.StatusBadRequest
+	case errors.As(err, &le):
+		return http.StatusInternalServerError
 	}
 	return http.StatusNotFound
 }

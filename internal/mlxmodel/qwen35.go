@@ -17,7 +17,8 @@ import (
 
 // Qwen35Config is the text part of a Qwen3.5 config.json (model_type
 // qwen3_5, text_config qwen3_5_text): gated DeltaNet linear attention in three
-// of every four layers, full attention with an output gate in the fourth.
+// of every four layers, full attention with an output gate in the fourth. The
+// MoE models (qwen3_5_moe) have experts in place of each layer's MLP.
 type Qwen35Config struct {
 	HiddenSize            int     `json:"hidden_size"`
 	IntermediateSize      int     `json:"intermediate_size"`
@@ -35,6 +36,8 @@ type Qwen35Config struct {
 	LinearValueHeadDim    int     `json:"linear_value_head_dim"`
 	LinearConvKernelDim   int     `json:"linear_conv_kernel_dim"`
 	NumExperts            int     `json:"num_experts"`
+	NumExpertsPerTok      int     `json:"num_experts_per_tok"`
+	NormTopkProb          *bool   `json:"norm_topk_prob"`
 	RopeParameters        struct {
 		RopeTheta           float32 `json:"rope_theta"`
 		PartialRotaryFactor float32 `json:"partial_rotary_factor"`
@@ -95,7 +98,31 @@ func (q *Quantization) UnmarshalJSON(b []byte) error {
 
 // Serves reports whether a config.json's model_type is one this package
 // implements.
-func Serves(modelType string) bool { return modelType == "qwen3_5" || modelType == "qwen3_5_text" }
+func Serves(modelType string) bool {
+	switch modelType {
+	case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text":
+		return true
+	}
+	return false
+}
+
+// ExpertsReadable says whether an MoE model whose tensors have these names
+// keeps its experts as LoadQwen35 reads them, stacked as MLX's switch_mlp:
+// mlx_lm.convert's files and Ollama's do, Hugging Face's own do not. No names
+// is no answer, and no error.
+func ExpertsReadable(names []string) error {
+	others := false
+	for _, n := range names {
+		if strings.Contains(n, ".switch_mlp.") {
+			return nil
+		}
+		others = others || strings.Contains(n, ".experts.")
+	}
+	if others {
+		return fmt.Errorf("its experts are stored one by one or as gate_up_proj, as Hugging Face's own files keep them, which kinfer does not read; an MLX conversion of it (mlx_lm.convert, mlx-community's) keeps them stacked as switch_mlp, which it does")
+	}
+	return nil
+}
 
 // ReadQwen35Config reads dir/config.json, from text_config when the file is
 // a multimodal release's.
@@ -125,8 +152,8 @@ func ReadQwen35Config(dir string) (*Qwen35Config, error) {
 		return nil, err
 	}
 	c.Quant = outer.Quantization
-	if c.NumExperts > 0 {
-		return nil, fmt.Errorf("Qwen3.5 with %d experts (qwen3_5_moe) is not written yet", c.NumExperts)
+	if c.NumExperts > 0 && (c.NumExpertsPerTok <= 0 || c.NumExpertsPerTok > c.NumExperts) {
+		return nil, fmt.Errorf("%d experts with %d a token", c.NumExperts, c.NumExpertsPerTok)
 	}
 	if c.HeadDim == 0 {
 		c.HeadDim = c.HiddenSize / c.NumAttentionHeads
@@ -205,6 +232,19 @@ type qwen35Layer struct {
 	full           *fullAttn
 	inNorm, inPost mlx.Array
 	gate, up, down Linear
+	moe            *moeBlock // in place of gate, up and down in an MoE model
+}
+
+// moeBlock is an MoE model's MLP: for each token a router picks k of the
+// experts, whose SwiGLUs' outputs are summed by the router's weights for
+// them, and one more, the shared expert, every token goes through, its output
+// scaled by a sigmoid gate of its own.
+type moeBlock struct {
+	router, sharedGate Linear
+	gate, up, down     Linear // the experts', stacked: [experts, out, in]
+	sGate, sUp, sDown  Linear // the shared expert's
+	k, experts         int
+	normed             bool // the k weights scaled to sum to one
 }
 
 // Qwen35 is a loaded Qwen3.5 text model.
@@ -220,8 +260,25 @@ type Qwen35 struct {
 	lmHead *Linear // nil when tied to embed
 	norm   mlx.Array
 	layers []qwen35Layer
+	mtp    *mtpHead    // nil when the model has none
 	all    []mlx.Array // every weight, for Free
 }
+
+// mtpHead is a model's multi-token-prediction head, as Qwen3.5 ships it: the
+// embedding of a token and the model's hidden state at the position before it
+// — each RMS-normed, side by side — projected back to the hidden size, then
+// one full-attention decoder block with a cache of its own, a norm, and the
+// model's own output head. What comes out is the token after the next, which
+// the model then checks in one pass with the token it is sure of.
+type mtpHead struct {
+	fc                 Linear
+	enorm, hnorm, norm mlx.Array
+	block              qwen35Layer
+}
+
+// CanDraft reports whether the model carries an MTP head. mlx-lm's
+// conversions drop it; Hugging Face's releases and Ollama's keep it.
+func (m *Qwen35) CanDraft() bool { return m.mtp != nil }
 
 func (m *Qwen35) head() Linear {
 	if m.lmHead != nil {
@@ -369,12 +426,16 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 		// for the whole weight.
 		if s, ok := raw[wk+".scale"]; ok {
 			ws, ss := l.W.Shape(), s.Shape()
-			if l.W.Dtype() != mlx.Uint32 || s.Dtype() != mlx.Uint8 || len(ws) != 2 || len(ss) != 2 || ss[1]*16 != ws[1]*8 {
+			if n := len(ws); l.W.Dtype() != mlx.Uint32 || s.Dtype() != mlx.Uint8 || n < 2 || len(ss) != n || ss[n-1]*16 != ws[n-1]*8 {
 				panic(&mlx.Error{Msg: fmt.Sprintf("%s is %v %v with a %v %v scale, not NVFP4", wk, l.W.Dtype(), ws, s.Dtype(), ss)})
 			}
 			l.Scales, l.Group, l.Bits, l.Mode = take(wk+".scale"), 16, 4, "nvfp4"
 			if g, ok := raw[wk+".global_scale"]; ok {
-				l.Global = g.Float32s()[0]
+				v := g.Float32s()
+				if len(v) != 1 {
+					panic(&mlx.Error{Msg: fmt.Sprintf("%s has %d global scales; one for the whole weight is what is read", wk, len(v))})
+				}
+				l.Global = v[0]
 			}
 			return l
 		}
@@ -395,6 +456,26 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 		return l
 	}
 
+	// mlp reads a layer's MLP at p: a SwiGLU, or in an MoE model its experts,
+	// stacked as MLX's SwitchGLU keeps them (mlx_lm.convert's and Ollama's
+	// files; Hugging Face's own keep them otherwise).
+	mlp := func(p string) (l qwen35Layer) {
+		if _, ok := key(p + "switch_mlp.gate_proj.weight"); !ok {
+			if _, dense := key(p + "gate_proj.weight"); !dense && c.NumExperts > 0 {
+				panic(&mlx.Error{Msg: "the experts at " + p + " are not stacked as MLX's switch_mlp; an MLX conversion of the model (mlx_lm.convert) is"})
+			}
+			l.gate, l.up, l.down = lin(p+"gate_proj"), lin(p+"up_proj"), lin(p+"down_proj")
+			return l
+		}
+		l.moe = &moeBlock{
+			router: lin(p + "gate"), sharedGate: lin(p + "shared_expert_gate"),
+			gate: lin(p + "switch_mlp.gate_proj"), up: lin(p + "switch_mlp.up_proj"), down: lin(p + "switch_mlp.down_proj"),
+			sGate: lin(p + "shared_expert.gate_proj"), sUp: lin(p + "shared_expert.up_proj"), sDown: lin(p + "shared_expert.down_proj"),
+			k: c.NumExpertsPerTok, experts: c.NumExperts, normed: c.NormTopkProb == nil || *c.NormTopkProb,
+		}
+		return l
+	}
+
 	m.embed = lin("embed_tokens")
 	if !c.TieWordEmbeddings {
 		if _, ok := key("lm_head.weight"); ok {
@@ -405,13 +486,9 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 	m.norm = centred("norm.weight")
 	for i := 0; i < c.NumHiddenLayers; i++ {
 		p := fmt.Sprintf("layers.%d.", i)
-		l := qwen35Layer{
-			inNorm: centred(p + "input_layernorm.weight"),
-			inPost: centred(p + "post_attention_layernorm.weight"),
-			gate:   lin(p + "mlp.gate_proj"),
-			up:     lin(p + "mlp.up_proj"),
-			down:   lin(p + "mlp.down_proj"),
-		}
+		l := mlp(p + "mlp.")
+		l.inNorm = centred(p + "input_layernorm.weight")
+		l.inPost = centred(p + "post_attention_layernorm.weight")
 		if (i+1)%c.FullAttentionInterval != 0 {
 			a := p + "linear_attn."
 			conv := raw[must(a+"conv1d.weight")]
@@ -434,8 +511,33 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 		}
 		m.layers = append(m.layers, l)
 	}
+	if _, ok := key("mtp.fc.weight"); ok {
+		a := "mtp.layers.0.self_attn."
+		block := mlp("mtp.layers.0.mlp.")
+		block.inNorm = centred("mtp.layers.0.input_layernorm.weight")
+		block.inPost = centred("mtp.layers.0.post_attention_layernorm.weight")
+		block.full = &fullAttn{
+			q: lin(a + "q_proj"), k: lin(a + "k_proj"), v: lin(a + "v_proj"), o: lin(a + "o_proj"),
+			qNorm: centred(a + "q_norm.weight"), kNorm: centred(a + "k_norm.weight"),
+		}
+		m.mtp = &mtpHead{
+			fc:    lin("mtp.fc"),
+			enorm: centred("mtp.pre_fc_norm_embedding.weight"), hnorm: centred("mtp.pre_fc_norm_hidden.weight"),
+			norm:  centred("mtp.norm.weight"),
+			block: block,
+		}
+	}
 	mlx.Eval(m.all...)
 	return m, nil
+}
+
+// Bytes is the size of the weights as loaded.
+func (m *Qwen35) Bytes() int64 {
+	var n int64
+	for _, a := range m.all {
+		n += int64(a.Nbytes())
+	}
+	return n
 }
 
 // Free releases the weights.
@@ -454,6 +556,22 @@ type Qwen35Cache struct {
 	conv, state []mlx.Array // per layer, 0 where unused
 	keys, vals  []mlx.Array // [B, Hkv, capacity, D]
 	Offset      int
+
+	// Drafting, when true, has every pass also feed the MTP head, so it can
+	// propose the tokens after the next (Draft). The head keeps a key and
+	// value cache of its own, at headOffset, and headH is the model's normed
+	// hidden state at the last position read, which the next token is paired
+	// with; 0 before the first.
+	Drafting           bool
+	headKeys, headVals mlx.Array
+	headOffset         int
+	headH              mlx.Array
+
+	// steps and convIns are, after Verify, each DeltaNet layer's state after
+	// every token of the pass and the convolution inputs it read, from which
+	// Keep cuts the cache back to the last token the reply kept.
+	keepSteps      bool
+	steps, convIns []mlx.Array
 }
 
 const kvStep = 256
@@ -462,14 +580,14 @@ const kvStep = 256
 func (m *Qwen35) NewCache() *Qwen35Cache {
 	n := len(m.layers)
 	return &Qwen35Cache{conv: make([]mlx.Array, n), state: make([]mlx.Array, n),
-		keys: make([]mlx.Array, n), vals: make([]mlx.Array, n)}
+		keys: make([]mlx.Array, n), vals: make([]mlx.Array, n), steps: make([]mlx.Array, n), convIns: make([]mlx.Array, n)}
 }
 
 // Arrays are the cache's current arrays, to evaluate along with a Step's
 // logits.
 func (c *Qwen35Cache) Arrays() []mlx.Array {
 	var r []mlx.Array
-	for _, set := range [][]mlx.Array{c.conv, c.state, c.keys, c.vals} {
+	for _, set := range [][]mlx.Array{c.conv, c.state, c.keys, c.vals, c.steps, c.convIns, {c.headKeys, c.headVals, c.headH}} {
 		for _, a := range set {
 			if a != 0 {
 				r = append(r, a)
@@ -483,7 +601,8 @@ func (c *Qwen35Cache) Arrays() []mlx.Array {
 // copying them. Either can read on: what it writes are new arrays, and a
 // buffer the other still holds is copied before it is written to.
 func (c *Qwen35Cache) Clone() *Qwen35Cache {
-	d := &Qwen35Cache{Offset: c.Offset}
+	d := &Qwen35Cache{Offset: c.Offset, Drafting: c.Drafting, headOffset: c.headOffset,
+		steps: make([]mlx.Array, len(c.conv)), convIns: make([]mlx.Array, len(c.conv))}
 	for _, p := range []struct{ dst, src *[]mlx.Array }{
 		{&d.conv, &c.conv}, {&d.state, &c.state}, {&d.keys, &c.keys}, {&d.vals, &c.vals},
 	} {
@@ -492,6 +611,11 @@ func (c *Qwen35Cache) Clone() *Qwen35Cache {
 			if a != 0 {
 				(*p.dst)[i] = a.Ref()
 			}
+		}
+	}
+	for _, p := range []struct{ dst, src *mlx.Array }{{&d.headKeys, &c.headKeys}, {&d.headVals, &c.headVals}, {&d.headH, &c.headH}} {
+		if *p.src != 0 {
+			*p.dst = (*p.src).Ref()
 		}
 	}
 	return d
@@ -503,7 +627,8 @@ func (c *Qwen35Cache) Free() {
 		a.Free()
 	}
 	*c = Qwen35Cache{conv: make([]mlx.Array, len(c.conv)), state: make([]mlx.Array, len(c.conv)),
-		keys: make([]mlx.Array, len(c.conv)), vals: make([]mlx.Array, len(c.conv))}
+		keys: make([]mlx.Array, len(c.conv)), vals: make([]mlx.Array, len(c.conv)),
+		steps: make([]mlx.Array, len(c.conv)), convIns: make([]mlx.Array, len(c.conv)), Drafting: c.Drafting}
 }
 
 // Forward runs tokens [B, L] through the model, advancing cache, and returns
@@ -531,7 +656,8 @@ func (m *Qwen35) Forward(tokens [][]int32, cache *Qwen35Cache, trace func(layer 
 // recorded while the GPU still runs this one, which is how decoding keeps the
 // GPU busy. Failed ops panic with *mlx.Error.
 func (m *Qwen35) Step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int, h mlx.Array)) mlx.Array {
-	return m.step(tokens, cache, trace, false)
+	logits, _ := m.step(tokens, cache, trace, false)
+	return logits
 }
 
 // Logits reads tokens from the start and returns the logits at every
@@ -549,13 +675,31 @@ func (m *Qwen35) Logits(tokens []int32) (logits mlx.Array, err error) {
 func (m *Qwen35) ReadAll(tokens []int32, cache *Qwen35Cache) (logits mlx.Array, err error) {
 	defer mlx.Recover(&err)
 	ids := mlx.FromInt32(tokens, 1, len(tokens))
-	logits = m.step(ids, cache, nil, true)
+	logits, _ = m.step(ids, cache, nil, true)
 	ids.Free()
 	mlx.Eval(append([]mlx.Array{logits}, cache.Arrays()...)...)
 	return logits, nil
 }
 
-func (m *Qwen35) step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int, h mlx.Array), every bool) mlx.Array {
+// Verify reads tokens — the token the reply is sure of, and the drafts after
+// it — for one sequence and returns, evaluated, the logits after each,
+// [len(tokens), vocab], and the model's normed hidden state after each,
+// [len(tokens), hidden], from which the head drafts on (SettleHead).
+func (m *Qwen35) Verify(tokens []int32, cache *Qwen35Cache) (logits, hidden mlx.Array, err error) {
+	defer mlx.Recover(&err)
+	ids := mlx.FromInt32(tokens, 1, len(tokens))
+	cache.keepSteps = true
+	logits, hidden = m.step(ids, cache, nil, true)
+	cache.keepSteps = false
+	ids.Free()
+	mlx.Eval(append([]mlx.Array{logits, hidden}, cache.Arrays()...)...)
+	return logits, hidden, nil
+}
+
+// step records a pass and returns the logits — of every position when every,
+// of the last otherwise — and, when every, the normed hidden states they came
+// from, [B*L, hidden]; 0 otherwise.
+func (m *Qwen35) step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int, h mlx.Array), every bool) (mlx.Array, mlx.Array) {
 	s := tokens.Shape()
 	B, L := s[0], s[1]
 	scope := mlx.NewScope()
@@ -574,17 +718,32 @@ func (m *Qwen35) step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int
 		}
 		h = mlx.Add(h, r)
 		x = mlx.RMSNorm(h, l.inPost, m.Config.RMSNormEps)
-		h = mlx.Add(h, linear(mlx.Multiply(mlx.SiLU(linear(x, l.gate)), linear(x, l.up)), l.down))
+		h = mlx.Add(h, l.mlp(x))
 		if trace != nil {
 			trace(i, h)
 		}
 	}
-	rows := B * L
-	if !every {
-		h, rows = mlx.Slice(h, []int{0, L - 1, 0}, []int{B, L, m.Config.HiddenSize}), B
+	H, rows := m.Config.HiddenSize, B*L
+	if m.mtp != nil && cache.Drafting {
+		// The head reads every position, so every position is normed.
+		all := mlx.RMSNorm(h, m.norm, m.Config.RMSNormEps)
+		m.feedHead(tokens, all, cache)
+		h = all
+		if !every {
+			h, rows = mlx.Slice(all, []int{0, L - 1, 0}, []int{B, L, H}), B
+		}
+	} else {
+		if !every {
+			h, rows = mlx.Slice(h, []int{0, L - 1, 0}, []int{B, L, H}), B
+		}
+		h = mlx.RMSNorm(h, m.norm, m.Config.RMSNormEps)
 	}
-	h = mlx.RMSNorm(h, m.norm, m.Config.RMSNormEps)
 	logits := mlx.Reshape(linear(h, m.head()), rows, m.Config.VocabSize)
+	var hidden mlx.Array
+	if every {
+		hidden = mlx.Reshape(h, rows, H)
+		scope.Keep(hidden)
+	}
 
 	cache.Offset += L
 	scope.Keep(logits)
@@ -594,7 +753,193 @@ func (m *Qwen35) step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int
 	for _, a := range old {
 		a.Free()
 	}
-	return logits
+	return logits, hidden
+}
+
+// feedHead reads into the MTP head each token of a pass paired with the
+// model's normed hidden state at the position before it: the pass's own for
+// all but the first, which takes the last of the pass before — zeros at the
+// very start, as llama.cpp's draft context has it. The head is then where the
+// model is, and drafts from the last position's state.
+func (m *Qwen35) feedHead(tokens, all mlx.Array, cache *Qwen35Cache) {
+	s := all.Shape()
+	B, L, H := s[0], s[1], s[2]
+	before := cache.headH
+	if before == 0 {
+		before = mlx.Zeros(all.Dtype(), B, 1, H)
+	}
+	if L > 1 {
+		before = mlx.Concatenate(1, before, mlx.Slice(all, []int{0, 0, 0}, []int{B, L - 1, H}))
+	}
+	m.headRead(tokens, before, cache)
+	cache.headH = mlx.Contiguous(mlx.Slice(all, []int{0, L - 1, 0}, []int{B, L, H}))
+}
+
+// headRead is one pass of the MTP head over tokens [B, L] and the hidden
+// states paired with them, [B, L, hidden], at the head's own positions; it
+// returns the head's normed output, [B, L, hidden], from which both its
+// logits and its next draft's paired state come.
+func (m *Qwen35) headRead(tokens, before mlx.Array, cache *Qwen35Cache) mlx.Array {
+	t, eps := m.mtp, m.Config.RMSNormEps
+	e := m.embed.rows(tokens)
+	x := linear(mlx.Concatenate(-1, mlx.RMSNorm(e, t.enorm, eps), mlx.RMSNorm(before, t.hnorm, eps)), t.fc)
+	kv := &Qwen35Cache{keys: []mlx.Array{cache.headKeys}, vals: []mlx.Array{cache.headVals}, Offset: cache.headOffset}
+	x = mlx.Add(x, m.attention(t.block.full, mlx.RMSNorm(x, t.block.inNorm, eps), kv, 0))
+	cache.headKeys, cache.headVals = kv.keys[0], kv.vals[0]
+	y := mlx.RMSNorm(x, t.block.inPost, eps)
+	x = mlx.Add(x, t.block.mlp(y))
+	cache.headOffset += tokens.Shape()[1]
+	return mlx.RMSNorm(x, t.norm, eps)
+}
+
+// Draft proposes the n tokens after tok, each the head's most likely, for a
+// sequence the model has read up to the token before tok: the head pairs
+// tok with the model's state there, then each draft with its own output. The
+// cache is left as it was — the head's positions written while drafting are
+// written again by the pass that checks them.
+func (m *Qwen35) Draft(cache *Qwen35Cache, tok int32, n int) (drafts []int32, err error) {
+	defer mlx.Recover(&err)
+	if m.mtp == nil || !cache.Drafting || cache.headH == 0 || n <= 0 {
+		return nil, nil
+	}
+	scope := mlx.NewScope()
+	defer scope.Close()
+	keys, vals, off := cache.headKeys, cache.headVals, cache.headOffset
+	t, h := mlx.FromInt32([]int32{tok}, 1, 1), cache.headH
+	toks := make([]mlx.Array, n)
+	for i := range n {
+		h = m.headRead(t, h, cache)
+		t = mlx.Astype(mlx.Argmax(linear(h, m.head()), -1, false), mlx.Int32)
+		toks[i] = t
+	}
+	all := mlx.Concatenate(1, toks...)
+	drafts = all.Int32s()
+	// The buffers the drafts were written into belong to the scope; the
+	// cache keeps the ones it had, which were not written in place while
+	// these handles held them.
+	cache.headKeys, cache.headVals, cache.headOffset = keys, vals, off
+	return drafts, nil
+}
+
+// Mark is where a cache was before a pass that checks drafts.
+type Mark struct{ offset, headOffset int }
+
+// Mark marks where c is now.
+func (c *Qwen35Cache) Mark() Mark { return Mark{c.Offset, c.headOffset} }
+
+// Keep takes back what the Verify pass after mk read past its i-th token, the
+// last the reply kept. The DeltaNet layers get their state and convolution
+// inputs as they were after it, which the pass left for this; the attention
+// layers and the head go back to just after it, their buffers written again
+// from there; and the head drafts from the model's state after it, hidden's
+// i-th row. With every token kept there is nothing to take back.
+func (c *Qwen35Cache) Keep(mk Mark, i int, hidden mlx.Array) (err error) {
+	defer mlx.Recover(&err)
+	read := c.Offset - mk.offset
+	if i < read-1 {
+		scope := mlx.NewScope()
+		defer scope.Close()
+		for l, st := range c.steps {
+			if st == 0 {
+				continue
+			}
+			s := st.Shape()
+			c.state[l].Free()
+			c.state[l] = mlx.Contiguous(mlx.Reshape(mlx.Slice(st, []int{0, i, 0, 0, 0}, []int{s[0], i + 1, s[2], s[3], s[4]}), s[0], s[2], s[3], s[4]))
+			in := c.convIns[l].Shape()
+			K := in[1] - read + 1
+			c.conv[l].Free()
+			c.conv[l] = mlx.Contiguous(mlx.Slice(c.convIns[l], []int{0, i + 1, 0}, []int{in[0], i + K, in[2]}))
+		}
+		H := hidden.Shape()[1]
+		if c.headH != 0 {
+			c.headH.Free()
+		}
+		c.headH = mlx.Reshape(mlx.Contiguous(mlx.Slice(hidden, []int{i, 0}, []int{i + 1, H})), 1, 1, H)
+		kept := []mlx.Array{c.headH}
+		for l, st := range c.steps {
+			if st != 0 {
+				kept = append(kept, c.state[l], c.conv[l])
+			}
+		}
+		scope.Escape(kept...)
+		mlx.Eval(kept...)
+		c.Offset, c.headOffset = mk.offset+i+1, mk.headOffset+i+1
+	}
+	for l := range c.steps {
+		for _, a := range []*mlx.Array{&c.steps[l], &c.convIns[l]} {
+			if *a != 0 {
+				(*a).Free()
+				*a = 0
+			}
+		}
+	}
+	return nil
+}
+
+// HeadReady reports whether c's head has read everything the model has, so
+// that drafting from it is drafting from the whole conversation: false for a
+// cache whose prompt was read, or pooled, without it.
+func (c *Qwen35Cache) HeadReady() bool {
+	return c.Drafting && c.headH != 0 && c.headOffset == c.Offset
+}
+
+// mlp is the layer's feed-forward part, x [B, L, hidden].
+func (l *qwen35Layer) mlp(x mlx.Array) mlx.Array {
+	if l.moe != nil {
+		return l.moe.forward(x)
+	}
+	return swiGLU(x, l.gate, l.up, l.down)
+}
+
+func swiGLU(x mlx.Array, gate, up, down Linear) mlx.Array {
+	return linear(mlx.Multiply(mlx.SiLU(linear(x, gate)), linear(x, up)), down)
+}
+
+// sortAt is how many token-expert pairs a pass has before they are sorted by
+// expert, as mlx-lm's SwitchGLU sorts them, so that each expert's weights
+// are read once for all the rows that go through it.
+const sortAt = 64
+
+// forward is mlx-lm's Qwen3NextSparseMoeBlock: the router's softmax in
+// float32, the top k, and the SwitchGLU of those experts.
+func (e *moeBlock) forward(x mlx.Array) mlx.Array {
+	s := x.Shape()
+	B, L, D := s[0], s[1], s[2]
+	N, k := B*L, e.k
+	probs := mlx.Softmax(mlx.Astype(linear(x, e.router), mlx.Float32), -1)
+	inds := mlx.Slice(mlx.Argpartition(probs, e.experts-k, -1), []int{0, 0, e.experts - k}, []int{B, L, e.experts})
+	w := mlx.TakeAlongAxis(probs, inds, -1)
+	if e.normed {
+		w = mlx.Divide(w, mlx.Sum(w, -1, true))
+	}
+	var y mlx.Array
+	if N*k >= sortAt {
+		flat := mlx.Reshape(inds, N*k)
+		order := mlx.Argsort(flat, 0)
+		rows := mlx.FloorDivide(order, mlx.ScalarAs(float32(k), order.Dtype()))
+		y = e.glu(mlx.Take(mlx.Reshape(x, N, 1, D), rows, 0), mlx.Take(flat, order, 0), true) // [N*k, 1, D]
+		y = mlx.Reshape(mlx.Take(y, mlx.Argsort(order, 0), 0), B, L, k, D)
+	} else {
+		y = mlx.Squeeze(e.glu(mlx.ExpandDims(mlx.ExpandDims(x, 2), 2), inds, false), 3) // [B, L, k, 1, D] → [B, L, k, D]
+	}
+	y = mlx.Sum(mlx.Multiply(y, mlx.ExpandDims(mlx.Astype(w, y.Dtype()), 3)), 2, false)
+	shared := mlx.Multiply(mlx.Sigmoid(linear(x, e.sharedGate)), swiGLU(x, e.sGate, e.sUp, e.sDown))
+	return mlx.Add(y, shared)
+}
+
+// glu runs each of x's rows, [..., M, hidden], through the expert idx names
+// for it; sorted when idx is in ascending order.
+func (e *moeBlock) glu(x, idx mlx.Array, sorted bool) mlx.Array {
+	g, u := gather(x, e.gate, idx, sorted), gather(x, e.up, idx, sorted)
+	return gather(mlx.Multiply(mlx.SiLU(g), u), e.down, idx, sorted)
+}
+
+func gather(x mlx.Array, w Linear, idx mlx.Array, sorted bool) mlx.Array {
+	if w.quantized() {
+		return w.global(mlx.GatherQMM(x, w.W, w.Scales, w.Biases, idx, w.Group, w.Bits, w.Mode, sorted))
+	}
+	return mlx.GatherMM(x, mlx.Swapaxes(w.W, 1, 2), idx, sorted)
 }
 
 func (m *Qwen35) deltaNet(w *linearAttn, x mlx.Array, cache *Qwen35Cache, i int) mlx.Array {
@@ -639,9 +984,13 @@ func (m *Qwen35) deltaNet(w *linearAttn, x mlx.Array, cache *Qwen35Cache, i int)
 		state = mlx.Zeros(mlx.Float32, B, Hv, Dv, Dk)
 	}
 	var y mlx.Array
-	if Dk%32 == 0 && !m.OpsDeltaNet {
+	switch {
+	case cache.keepSteps:
+		y, state, cache.steps[i] = gatedDeltaSteps(q, k, v, g, beta, state)
+		cache.convIns[i] = convIn
+	case Dk%32 == 0 && !m.OpsDeltaNet:
 		y, state = gatedDeltaFast(q, k, v, g, beta, state, 0)
-	} else {
+	default:
 		y, state = gatedDelta(q, k, v, g, beta, state)
 	}
 	cache.state[i] = state

@@ -83,9 +83,21 @@ const gatedDeltaSource = `
         }
 `
 
+// stepsWrite has the kernel also write the state after each token, for a
+// pass that checks drafts: the reply may keep only the first few of them,
+// and the state after the last one kept is then at hand, where otherwise the
+// pass would have to be read again up to it.
+const stepsWrite = `
+            auto st = states + ((uint64_t(b_idx) * T + t) * Hv + hv_idx) * Dv * Dk + uint64_t(dv_idx) * Dk;
+            for (int i = 0; i < n_per_t; ++i) {
+              st[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
+            }
+`
+
 var (
 	gdOnce             sync.Once
 	gdKernel, gdMasked *mlx.Kernel
+	gdSteps            *mlx.Kernel
 )
 
 func gatedDeltaKernels() (*mlx.Kernel, *mlx.Kernel) {
@@ -95,8 +107,22 @@ func gatedDeltaKernels() (*mlx.Kernel, *mlx.Kernel) {
 		gdKernel = mlx.NewKernel("kinfer_gated_delta", in, out, replaceMask(gatedDeltaSource, "true"))
 		gdMasked = mlx.NewKernel("kinfer_gated_delta_mask", append(in, "mask"), out,
 			replaceMask(gatedDeltaSource, "mask[b_idx * T + t]"))
+		const after = "              y[dv_idx] = static_cast<InT>(out);\n            }\n"
+		src := replaceMask(gatedDeltaSource, "true")
+		i := indexOf(src, after)
+		gdSteps = mlx.NewKernel("kinfer_gated_delta_steps", in, append(out, "states"),
+			src[:i+len(after)]+stepsWrite+src[i+len(after):])
 	})
 	return gdKernel, gdMasked
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	panic("gated delta kernel source has changed: " + sub)
 }
 
 func replaceMask(src, cond string) string {
@@ -128,4 +154,21 @@ func gatedDeltaFast(q, k, v, g, beta, state, mask mlx.Array) (mlx.Array, mlx.Arr
 			{Name: "Hk", Int: Hk, IsInt: true}, {Name: "Hv", Int: Hv, IsInt: true}},
 		[3]int{32, Dv, B * Hv}, [3]int{32, 4, 1})
 	return res[0], res[1]
+}
+
+// gatedDeltaSteps is gatedDeltaFast for a pass that checks drafts, which
+// also returns the state after each token, [B, T, Hv, Dv, Dk].
+func gatedDeltaSteps(q, k, v, g, beta, state mlx.Array) (y, final, states mlx.Array) {
+	s, vs := q.Shape(), v.Shape()
+	B, T, Hk, Dk := s[0], s[1], s[2], s[3]
+	Hv, Dv := vs[2], vs[3]
+	gatedDeltaKernels()
+	res := gdSteps.Run([]mlx.Array{q, k, v, g, beta, state, mlx.Int(T)},
+		[]mlx.KernelOutput{{Shape: []int{B, T, Hv, Dv}, Dtype: q.Dtype()}, {Shape: state.Shape(), Dtype: state.Dtype()},
+			{Shape: []int{B, T, Hv, Dv, Dk}, Dtype: state.Dtype()}},
+		[]mlx.KernelTemplate{{Name: "InT", Dtype: q.Dtype()}, {Name: "StT", Dtype: state.Dtype()},
+			{Name: "Dk", Int: Dk, IsInt: true}, {Name: "Dv", Int: Dv, IsInt: true},
+			{Name: "Hk", Int: Hk, IsInt: true}, {Name: "Hv", Int: Hv, IsInt: true}},
+		[3]int{32, Dv, B * Hv}, [3]int{32, 4, 1})
+	return res[0], res[1], res[2]
 }

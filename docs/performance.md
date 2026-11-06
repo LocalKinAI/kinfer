@@ -167,38 +167,47 @@ Batching returns **3.4× more total throughput than Ollama at eight concurrent
 requests.** For one person typing at a model that is a bad trade. For a fleet it
 is the whole game, and neither runtime here is taking it.
 
-### How far it scales, and the one batch size to avoid
+### How far it scales, and the batch sizes to avoid
 
-Measured with `llama-batched-bench`, which puts no HTTP client in the way — a
-350-token prompt and 200 generated, on the M3 Ultra:
+Measured with `llama-batched-bench`, which puts no server in the way — a
+350-token prompt and 200 generated, with llama.cpp b11998, the libraries kinfer
+embeds (2026-11-05). Aggregate tok/s:
 
-| batch | aggregate tok/s | per stream | ms per step | vs 1 |
-|---|---|---|---|---|
-| 1 | 299.8 | 299.8 | 3.3 | 1.00× |
-| 4 | 883.6 | 220.9 | 4.5 | 2.95× |
-| **8** | **1336.9** | 167.1 | 6.0 | **4.46×** |
-| 12 | 1103.8 | 92.0 | **10.9** | 3.68× |
-| 16 | 1441.2 | 90.1 | 11.1 | 4.81× |
-| 24 | 2092.1 | 87.2 | 11.5 | 6.98× |
-| **32** | **2824.7** | 88.3 | 11.3 | **9.42×** |
-| 64 | 4293.1 | 67.1 | 14.9 | 14.32× |
-| 128 | 6483.0 | 50.6 | 19.7 | **21.63×** |
+| batch | M3 Ultra | M5 Max |
+|---|---:|---:|
+| 1 | 309 | 449 |
+| 4 | | 1,634 |
+| 8 | 2,329 | 3,133 |
+| 12 | 2,676 | 3,212 |
+| **16** | **3,494** | **4,269** |
+| 24 | | 2,464 |
+| 32 | 2,505 | 3,189 |
+| 48 | | 4,461 |
+| 64 | 4,439 | 5,498 |
+| 128 | 5,902 | 9,011 |
 
-Step time nearly doubles between 8 and 12 — 6.0 ms to 10.9 ms — then stays flat
-all the way to 32. Almost certainly Metal switching from a vector-matrix to a
-matrix-matrix kernel. It splits the curve into three regimes:
+Past sixteen sequences the step time jumps — on the M5 Max from 3.8 ms at 16 to
+9.7 ms at 24 — almost certainly Metal moving from a vector-matrix to a
+matrix-matrix kernel, and it takes until 48 to 64 sequences for the larger batch
+to pay for it. So the curve has three regimes:
 
-- **at or below 8** the step is cheap: 4.5× aggregate, 167 tok/s per stream
-- **12 to 16 is the worst place to be.** The step cost is paid and not yet
-  amortised, so twelve concurrent requests produce *less* total throughput than
-  eight
-- **20 and above** the step time stops growing while the batch keeps growing, so
-  throughput climbs nearly linearly: 9.4× at 32, 21.6× at 128
+- **up to 16** the step is cheap and throughput climbs with every request
+- **17 to about 48 is the place to avoid.** The step cost is paid and not yet
+  amortised, so 24 or 32 concurrent requests produce *less* total throughput
+  than 16
+- **64 and above** the larger batch has paid for the step, and throughput climbs
+  again: 128 gets 5,902 tok/s on the M3 Ultra, 46 per stream
 
-A slot count therefore comes from `{8, 32, 64, 128}` and never from 12–16 —
-which intuition gets backwards, since 16 looks like it must beat 8. Margins do
-fade past 32 (32→64 is +52%, 64→96 +32%, 96→128 +14%), but at 128 each stream
-still gets 50 tok/s, far above what an agent needs.
+A slot count therefore comes from `{8, 16, 64, 128}` and never from 17 to about
+48. With llama.cpp b11175 the jump came earlier, between 8 and 12 (on the M3
+Ultra 1,337 tok/s at 8, 1,104 at 12, 2,825 at 32, 6,483 at 128), and this page
+said never 12–16 until the libraries changed under it. A rule like this belongs
+to one build, and is measured again with every upgrade.
+
+The table is the machine's ceiling, not kinfer's throughput. kinfer itself, end
+to end through HTTP with 256-token replies at temperature 0, gets 96% of it for
+one request on the M3 Ultra, 69% at 8 and 44% at 128 (2,597 tok/s): the rest is
+each step's work outside the forward pass.
 
 That is Phase 2, and it is why per-stream speed is the smaller opportunity.
 
@@ -235,8 +244,8 @@ reaches **89% of what llama.cpp achieves on the same hardware**.
 
 The gain is the machine's to give, not the scheduler's. This M4 saturates early
 — 2.39× at a batch of eight, where the M3 Ultra reaches 4.46× there and 21.6× at
-128. Slot counts come from `{8, 32, 64, 128}`; see the table above for why never
-12–16.
+128 with the libraries of the time. Slot counts come from `{8, 16, 64, 128}`; see
+the table above for why never 17 to about 48.
 
 Two things the scheduler will not do. It never blocks on a client: a consumer
 that stops reading stalls only its own slot, because a blocked send would freeze

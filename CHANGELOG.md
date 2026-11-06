@@ -1,5 +1,125 @@
 # Changelog
 
+## Unreleased
+
+### Added — drafting with the MTP head, for MLX models that carry one
+
+An MLX Qwen3.5 or Qwen3.8 model whose weights keep the multi-token-prediction
+head (`mtp.*`: Ollama's NVFP4 models and the HF releases; mlx-community's
+conversions strip it) now drafts with it, as the GGUF engine does. The head
+reads each token beside the hidden state the model ends it with; while a reply
+writes alone it guesses the next three tokens, one pass of the model checks
+them all, and as many as the model would have written are kept. The linear
+attention layers cannot be cut back to a shorter pass, so the kernel that
+runs them also writes its state after each token of a checking pass, and a
+step that keeps k of n drafts takes the state after k.
+
+On Ollama's qwen3.8:27b-mlx on a MacBook Pro (M5 Max), six replies decoded at
+38–75 tok/s against 30 without, one to four drafts giving 44, 55, 60 and 59 on
+average; 724 of 1,051 drafts were kept. The replies are the model's replies:
+five of six were the same word for word, the sixth the same until a near tie
+141 characters in, as a pass of four tokens and four passes of one round
+differently. Prompts read at the same speed. Only a reply writing alone drafts:
+when a second request arrives the step goes back to one token a reply, and the
+one that was drafting goes on in the batch. `-draft -1` turns it off, `-draft N`
+drafts N.
+
+A model under 4 GB of weights does not draft unless `-draft N` says so: its
+step is quick beside the head's, which runs the output layer over the whole
+vocabulary for every draft. On the M3 Ultra, Qwen3.5-0.8B in bf16 wrote 221
+tok/s alone without drafts and 141 with three. Where between it and the 27B
+drafting starts to pay is not measured.
+
+### Faster — many requests at once, and prompts where memory is left
+
+- **Sampling shared out across the cores.** Each step's slots were sampled
+  one after another on one thread, and at 128 slots that was a third of a step:
+  8 ms of 24 on a MacBook Pro (Qwen2.5-0.5B, 152k-token vocabulary). A step
+  with eight slots or more now samples them all at once, one sampler per slot
+  as before, and harvests them in slot order. 128 at once went from 3,350 to
+  4,259 tok/s greedy and from 3,183 to 3,829 at temperature 0.7; 32 at once
+  from 1,959 to 2,250.
+- **A larger pass where the context leaves room.** The micro-batch is chosen
+  before the context exists, by Ollama's rule, which is cautious: on the M3
+  Ultra, Flash-Next's model and cache came to 71.9 GiB of the 77.7 free, so it
+  read prompts 512 tokens a pass, and the context then left 5.8 GiB. Where the
+  context leaves twice the 2 GiB headroom, a pass twice as large is tried, and
+  kept if the headroom is still there; the `batch:` line says so. On ornith-1.5:35b
+  an 11,000-token prompt read 13–18% faster in passes of 2048 than of 512. Not
+  with experts in host memory, whose pass is sized for them, nor across
+  machines, where the peers' buffers grow too.
+- `KINFER_DEBUG_SCHED` also prints llama.cpp's own counters each second,
+  among them how often a compute graph was reused.
+
+Measured while doing this, and left as it is: the KV cache the prefix pool needs
+is unified, and attention over a unified cache reads every conversation's
+cells. llama-batched-bench at 128 sequences gave 9,932 tok/s with a cache per
+sequence and 5,338 unified, 256 tokens in. Without the pool (`-prefix off`) each
+conversation gets a cache of its own, but llama.cpp then splits a step into as
+many passes as there are gaps between the conversations still writing, and a
+step took 47 ms instead of 22. For agents the difference is small: eight
+ornith-1.5:35b conversations with 7,800-token prompts each took 42.6 ms a step
+either way within 10%, the experts' weights being most of a step. And drafting
+with the MTP head costs about 5% of a prompt, which the head reads too
+(ornith-1.5:35b: 3.80 s against 3.63 for 11,000 tokens).
+
+### Fixed — settings given by hand that leave a model no room
+
+- **Said at load, and again in the error, why a first pass may run out of
+  memory.** On a MacBook Pro at the GPU's default limit, Flash-Next with
+  `-host-experts 24 -moe-cache 8192 -batch 2048` left 0.0 GiB, and its first
+  pass died on Metal's out-of-memory error with nothing saying why. A load
+  that leaves under 256 MiB now says so, and names the settings that were set
+  by hand: "… loaded with 0.0 GiB of the GPU left, which its first pass may not
+  fit in — -batch 2048 -host-experts 24 -moe-cache 8192 set by hand may leave it
+  too little; without them kinfer places the model and sizes its context
+  itself". If the pass does fail, the reply's error carries the same words. It
+  is not refused: the reading cannot tell a load that fails from one that runs.
+  `-host-experts 36 -moe-cache 20000` on the laptop read 0.0 GiB too and
+  answered, and so did DeepSeek-V4.1 with `-host-experts 32 -moe-cache 47542`
+  on the M3 Ultra, at 17–19 tok/s.
+- **A model that will not load is a 500, not a 404.** A load failure was
+  answered as if the name were unknown; a client told 404 looks for another
+  model instead of at the server. It is now 500 in every dialect, as Ollama
+  answers it (`api_error` in Anthropic's), with the reason; an unknown name is
+  still 404.
+- **`-host-experts` without `-moe-cache` says what it costs.** It gives the host
+  experts no GPU cache, so every token reads them from host memory:
+  DeepSeek-V4.1 with `-host-experts 32` decoded at 3.6 tok/s on the M3 Ultra,
+  and at 17–19 with `-moe-cache 47542`. The log now says so, and how to cache
+  them or have the model placed.
+- **A context squeezed small by a hand-set cache says so.** When `-moe-cache` or
+  `-host-experts` leaves a conversation less than 32,768 tokens, the log says
+  how many fit and that a longer prompt is refused.
+
+### Changed — the slot counts to use
+
+`-slots` said to use 8, 32, 64 or 128 and never 12–16. That was llama.cpp
+b11175's curve. With b11998, the libraries kinfer embeds, throughput climbs to
+16 and then falls: past sixteen sequences the step time more than doubles, and
+it takes 48 to 64 to pay for it. On an M3 Ultra 32 at once gave 2,505 tok/s
+against 3,494 at 16, on an M5 Max 24 gave 2,464 against 4,269
+(`llama-batched-bench`, Qwen2.5-0.5B). The advice is now 8, 16, 64 or 128,
+never 17–48, and docs/performance.md has both machines' curves.
+
+### Added — MLX MoE models of Qwen3.5's architecture, not yet checked whole
+
+`qwen3_5_moe` models load on MLX: each layer's experts as MLX's SwitchGLU
+keeps them, stacked (`switch_mlp`, as mlx_lm.convert and Ollama write them),
+the router's softmax in float32 and its top k scaled to sum to one, gathered
+matmuls for the experts (`gather_qmm` for quantized ones, NVFP4 among them),
+sorted by expert once a pass has 64 token-expert pairs, and the gated shared
+expert. Ollama's qwen3.5:35b-a3b-nvfp4 and ornith-1.5:122b-nvfp4 are such
+models. The block is tested against a reference written out in Go, expert by
+expert, both gathered as it comes and sorted, and `gather_qmm`'s binding
+against `quantized_matmul` of each expert alone; no MoE model has been served
+end to end yet. Hugging Face's own files keep the experts as `gate_up_proj`
+or one by one, which is not read: `kinfer can-run` and `kinfer pull` say so
+from the repo's index of tensors before anything is downloaded (Qwen/Qwen3.5-
+35B-A3B is refused, mlx-community/Qwen3.5-35B-A3B-4bit accepted), and the
+loader says an MLX conversion is needed. Qwen3.8-Flash-Next is another architecture (`qwen4_exp`) and stays
+on llama.cpp.
+
 ## v0.2.2 — 2026-11-05
 
 ### Added — Ollama's MLX models, NVFP4 among them, read where they lie

@@ -91,6 +91,10 @@ func cmdCanRun(args []string) error {
 		fmt.Printf("  architecture   unknown — no GGUF metadata and no config.json\n")
 
 	case archFrom == "config.json" && len(quants) == 0 && mlxmodel.Serves(arch):
+		if err := mlxExperts(ctx, repo, arch); err != nil {
+			fmt.Printf("  architecture   %-16s ✗ on MLX: %v\n", arch, err)
+			return nil
+		}
 		fmt.Printf("  architecture   %-16s ✓ kinfer serves it on MLX  (from config.json)\n", arch)
 
 	case archFrom == "config.json":

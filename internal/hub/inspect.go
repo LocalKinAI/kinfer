@@ -177,6 +177,38 @@ func ModelType(ctx context.Context, repo string) (string, error) {
 	return cfg.ModelType, nil
 }
 
+// TensorNames lists the tensors of a sharded safetensors repo, from its
+// model.safetensors.index.json; nil, and no error, for a repo without one.
+func TensorNames(ctx context.Context, repo string) ([]string, error) {
+	url := fmt.Sprintf("%s/%s/resolve/main/model.safetensors.index.json", endpoint(), repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("model.safetensors.index.json of %s: %s", repo, resp.Status)
+	}
+	var idx struct {
+		WeightMap map[string]string `json:"weight_map"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&idx); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(idx.WeightMap))
+	for n := range idx.WeightMap {
+		names = append(names, n)
+	}
+	return names, nil
+}
+
 // Architecture reads general.architecture out of a GGUF without downloading it.
 //
 // The metadata sits at the front of the file, so a few megabytes settle the

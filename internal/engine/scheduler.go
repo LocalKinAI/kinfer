@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -50,12 +52,14 @@ const minPrefixMatch = 128
 // matter how many conversations are waiting. Put eight of them in the same
 // forward pass and the weights are still read once — the GPU does eight times
 // the arithmetic on data it was going to fetch anyway. Measured on an M3 Ultra
-// with Qwen2.5-0.5B: 300 tok/s alone, 1337 at a batch of 8, 2825 at 32.
+// with Qwen2.5-0.5B: 309 tok/s alone, 2329 at a batch of 8, 3494 at 16
+// (llama-batched-bench, llama.cpp b11998).
 //
-// Which sizes are worth using is not obvious. Step time nearly doubles between
-// a batch of 8 and 12 and then stays flat to 32, so twelve concurrent requests
-// produce less total throughput than eight. See the table in docs/performance.md; slot
-// counts come from {8, 32, 64, 128} and never from 12-16.
+// Which sizes are worth using is not obvious. Past a batch of 16 the step time
+// more than doubles, and it takes 48 to 64 sequences to pay for it, so 24 or
+// 32 concurrent requests produce less total throughput than 16. See the table
+// in docs/performance.md; slot counts come from {8, 16, 64, 128} and never from
+// 17 to about 48.
 //
 // That paragraph is about a dense model and does not carry over to a
 // mixture-of-experts one. "The weights are read once" is the claim batching
@@ -148,6 +152,10 @@ type scheduler struct {
 	// onFatal is called when llama.cpp's backend fails unrecoverably, so the
 	// engine can be marked unusable and replaced rather than kept in service.
 	onFatal func()
+
+	// roomHint is set when the load left next to nothing of the GPU, and is
+	// added to a fatal failure's error: the likeliest reason for it.
+	roomHint string
 
 	// mtmd reads pictures, when the model has a projector. fatal is a failure
 	// that ended the context outside a step — reading pictures — which the
@@ -299,6 +307,11 @@ type slot struct {
 	// logitIdx is where this slot's logits landed in the batch just decoded,
 	// or -1 when it contributed no token whose output was requested.
 	logitIdx int32
+
+	// pre is the token sampled at logitIdx ahead of harvest, when presample
+	// sampled every slot of a step at once; hasPre says it is there.
+	pre    llama.Token
+	hasPre bool
 }
 
 // newScheduler takes over lctx, laid out as home: from here on the scheduler
@@ -417,6 +430,9 @@ func (s *scheduler) run() {
 			failed := err
 			if fatal {
 				failed = fmt.Errorf("%w: %w", ErrInterrupted, err)
+				if s.roomHint != "" {
+					failed = fmt.Errorf("%w; %s", failed, s.roomHint)
+				}
 			}
 			for _, sl := range s.slots {
 				if sl.job != nil {
@@ -732,6 +748,7 @@ func (s *scheduler) occupy(sl *slot, j *job, tokens []llama.Token, reused int, c
 		sl.out.WriteString("<think>")
 	}
 	sl.logitIdx = -1
+	sl.hasPre = false
 	sl.admitted = time.Now()
 	sl.evalStart = time.Time{}
 	sl.promptEval = 0
@@ -848,6 +865,8 @@ func (s *scheduler) step() error {
 				"per step %.2f ms: decode %.2f, gpu wait %.2f, sample %.2f, scheduler %.2f%s",
 				s.steps, float64(s.tokSum)/float64(s.steps), float64(s.activeSum)/float64(s.steps),
 				wall, ms(s.tDecode), ms(s.tWait), ms(s.tSample), wall-ms(s.tDecode)-ms(s.tWait)-ms(s.tSample), reuse)
+			llama.PerfPrint(s.lctx)
+			llama.PerfReset(s.lctx)
 			// Interval statistics, not cumulative: a mean diluted by an idle
 			// minute says nothing about what happens under load.
 			s.steps, s.tokSum, s.activeSum = 0, 0, 0
@@ -905,6 +924,7 @@ func (s *scheduler) step() error {
 	if s.draft != nil {
 		s.draft.catchUp(s.batch)
 	}
+	s.presample()
 
 	for _, sl := range s.slots {
 		if sl.job == nil {
@@ -923,6 +943,53 @@ func (s *scheduler) step() error {
 		}
 	}
 	return nil
+}
+
+// presampleMin is how many slots a step must sample before presample shares
+// the work out: under it, starting goroutines costs more than it saves.
+const presampleMin = 8
+
+// presample samples the first token of every slot with logits this step, on
+// as many threads as there are slots or processors. Sampling reads a row of
+// the vocabulary's logits and sorts through it — 152k of them for Qwen — and
+// done slot after slot it was a third of each step at 128 slots: 8 ms of 24
+// on the MacBook Pro. Each slot has a sampler of its own, and the logits are
+// only read once the main thread has synchronised and read the first of them,
+// which is when llama.cpp puts its output rows in order; harvest then takes
+// the tokens in slot order, as before, and samples a draft's further tokens
+// itself.
+func (s *scheduler) presample() {
+	var todo []*slot
+	for _, sl := range s.slots {
+		if sl.job != nil && sl.logitIdx >= 0 {
+			todo = append(todo, sl)
+		}
+	}
+	if len(todo) < presampleMin {
+		return
+	}
+	var t0 time.Time
+	if s.debug {
+		t0 = time.Now()
+	}
+	llama.Logits(s.lctx, todo[0].logitIdx, 1)
+	workers := min(len(todo), runtime.GOMAXPROCS(0))
+	var next atomic.Int32
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := int(next.Add(1)) - 1; i < len(todo); i = int(next.Add(1)) - 1 {
+				sl := todo[i]
+				sl.pre, sl.hasPre = sl.sampler.Sample(s.lctx, sl.logitIdx), true
+			}
+		}()
+	}
+	wg.Wait()
+	if s.debug {
+		s.tSample += time.Since(t0)
+	}
 }
 
 // harvesting reports whether the batch just decoded produced logits for any
@@ -1040,7 +1107,12 @@ func (s *scheduler) harvest(sl *slot, now time.Time) {
 			if s.debug {
 				t0 = time.Now()
 			}
-			tok := sl.sampler.Sample(s.lctx, idx+int32(i))
+			var tok llama.Token
+			if i == 0 && sl.hasPre {
+				tok, sl.hasPre = sl.pre, false
+			} else {
+				tok = sl.sampler.Sample(s.lctx, idx+int32(i))
+			}
 			if s.debug {
 				s.tSample += time.Since(t0)
 			}

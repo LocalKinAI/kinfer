@@ -122,6 +122,20 @@ func cmdPull(args []string) error {
 	return nil
 }
 
+// mlxExperts checks that an MoE repo keeps its experts as the MLX engine
+// reads them: caught before a pull, a layout it refuses costs a small JSON
+// file instead of the whole download.
+func mlxExperts(ctx context.Context, repo, arch string) error {
+	if !strings.Contains(arch, "moe") {
+		return nil
+	}
+	names, err := hub.TensorNames(ctx, repo)
+	if err != nil {
+		return err
+	}
+	return mlxmodel.ExpertsReadable(names)
+}
+
 // pullMLX fetches a model kinfer serves on MLX: the repo's safetensors and the
 // files that describe them, into a directory of the store named for the repo.
 func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, conns int) error {
@@ -133,8 +147,11 @@ func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, 
 		return err
 	}
 	if !mlxmodel.Serves(arch) {
-		return fmt.Errorf("%s is safetensors of model_type %q, which kinfer does not serve on MLX (Qwen3.5 dense, qwen3_5, it does); a GGUF of it may run on llama.cpp: kinfer can-run %s",
+		return fmt.Errorf("%s is safetensors of model_type %q, which kinfer does not serve on MLX (Qwen3.5 and Qwen3.8, qwen3_5 and qwen3_5_moe, it does); a GGUF of it may run on llama.cpp: kinfer can-run %s",
 			ref.Repo, arch, ref.Repo)
+	}
+	if err := mlxExperts(ctx, ref.Repo, arch); err != nil {
+		return fmt.Errorf("%s: %w", ref.Repo, err)
 	}
 	if err := mlxengine.Usable(); err != nil {
 		return err

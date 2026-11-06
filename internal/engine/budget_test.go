@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/LocalKinAI/kinfer/internal/llama"
@@ -112,4 +113,29 @@ func TestHeadroomIsThisProcessOnly(t *testing.T) {
 	// The point of the test: nothing in this type can represent the other
 	// process, which is why the code says so rather than pretending to warn
 	// about it.
+}
+
+// A model that does not fit is refused with the settings the operator gave,
+// so they know what to give back; with none given, the GPU's other users are
+// the ones to look at. The tight configurations above are not refused: they
+// leave room, if too little.
+func TestNoRoomSaysWhichSettingsWereGiven(t *testing.T) {
+	hint := noRoomHint("Flash-Next.gguf", 0, Options{Batch: 2048, HostExperts: 24, MoeCache: 8192, PrefixSlots: -1})
+	for _, want := range []string{"Flash-Next.gguf loaded with 0.0 GiB", "-batch 2048 -host-experts 24 -moe-cache 8192 set by hand"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("%q does not say %q", hint, want)
+		}
+	}
+	if strings.Contains(hint, "-prefix") {
+		t.Errorf("%q names -prefix, which was off, not a size", hint)
+	}
+	if hint := noRoomHint("m.gguf", 100<<20, Options{HostExperts: -1}); !strings.Contains(hint, "-host-experts -1 set by hand") {
+		t.Errorf("every layer's experts on the host is a setting too: %v", hint)
+	}
+	if hint := noRoomHint("m.gguf", 0, Options{}); !strings.Contains(hint, "something else holds the GPU's memory") {
+		t.Errorf("with nothing set by hand: %v", hint)
+	}
+	if left := uint64(budgetTotal - modelCost - ctxCost4Slot); left < noRoom {
+		t.Errorf("the 4-slot configuration, which ran before it died, leaves %d MiB and would now be refused", left>>20)
+	}
 }

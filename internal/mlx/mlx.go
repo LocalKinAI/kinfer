@@ -114,6 +114,7 @@ var (
 	arrayShape    func(Array) *int32
 	arrayDtype    func(Array) Dtype
 	arraySize     func(Array) uintptr
+	arrayNbytes   func(Array) uintptr
 	arrayDataF32  func(Array) *float32
 	arrayItemF32  func(res *float32, a Array) int32
 	arrayItemI32  func(res *int32, a Array) int32
@@ -164,6 +165,7 @@ func open(dir string) error {
 		{&arrayShape, "mlx_array_shape"},
 		{&arrayDtype, "mlx_array_dtype"},
 		{&arraySize, "mlx_array_size"},
+		{&arrayNbytes, "mlx_array_nbytes"},
 		{&arrayDataF32, "mlx_array_data_float32"},
 		{&arrayDataI32, "mlx_array_data_int32"},
 		{&arrayItemF32, "mlx_array_item_float32"},
@@ -318,6 +320,9 @@ func (a Array) Dtype() Dtype { return arrayDtype(a) }
 
 // Size is a's element count.
 func (a Array) Size() int { return int(arraySize(a)) }
+
+// Nbytes is the size of a's elements in bytes.
+func (a Array) Nbytes() int { return int(arrayNbytes(a)) }
 
 // Float32s evaluates a, which must be float32, and copies its elements out.
 func (a Array) Float32s() []float32 {

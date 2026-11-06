@@ -45,9 +45,10 @@ type Options struct {
 	// sequence in the KV cache. They are served by one forward pass per step,
 	// so aggregate throughput climbs far faster than per-stream speed falls.
 	//
-	// Pick from {8, 32, 64, 128}: step time roughly doubles between a batch of
-	// 8 and 12 and then stays flat to 32, so 12-16 costs more than 8 and
-	// returns less. See the table in docs/performance.md. 0 means 8, or fewer when the
+	// Pick from {8, 16, 64, 128}: past a batch of 16 the step time more than
+	// doubles, and the batch does not pay for it until 48 to 64, so 24 or 32
+	// returns less than 16 (llama.cpp b11998, on an M3 Ultra and an M5 Max).
+	// See the table in docs/performance.md. 0 means 8, or fewer when the
 	// memory left after the weights cannot give 8 a useful context.
 	Slots int
 
@@ -454,6 +455,13 @@ func Open(path string, opts Options) (*Engine, error) {
 			which = fmt.Sprintf("layers %d-%d's", firstHost, firstHost+hostExperts-1)
 		}
 		log.Printf("experts: %s routed experts stay in host memory, mapped from the file; a %d MiB GPU cache keeps the ones in use", which, moeCache)
+		// Placement always gives host experts a cache; only -host-experts on
+		// its own leaves none, and DeepSeek-V4.1 then decoded at 3.6 tok/s on
+		// the box where a 46 GiB cache made it 18.
+		if moeCache == 0 {
+			log.Printf("experts: no GPU cache was asked for, so every token reads those layers' experts from host memory; " +
+				"-moe-cache MiB caches the ones in use, and with neither -host-experts nor -moe-cache kinfer places the model itself")
+		}
 	}
 
 	model := llama.LoadModel(path, mp)
@@ -662,7 +670,57 @@ sizing:
 		draft.free()
 		llama.FreeContext(lctx)
 	}
+
+	// The micro-batch was chosen before the context existed, from what it was
+	// predicted to cost, and that rule is Ollama's and cautious: on the box,
+	// Flash-Next's model and cache came to 71.9 GiB of the 77.7 free, so it got
+	// passes of 512, and the context then left 5.8 GiB. Where the measurement
+	// leaves twice the headroom, a pass twice as large is tried, and kept if
+	// it still leaves the headroom; on ornith-1.5:35b an 11,000-token prompt
+	// read 13–18% faster in passes of 2048 than of 512. Not with experts on
+	// the host, whose pass is sized for them already, nor across machines,
+	// where the larger pass also grows the peers' buffers this one cannot see.
+	grownFrom := 0
+	for ubAuto && hostExperts == 0 && devs == nil && ub < ubatchLarge && bud.known && bud.afterCtx >= 2*thinHeadroom {
+		try := min(ub*2, ubatchLarge)
+		draft.free()
+		llama.FreeContext(lctx)
+		next, nextDraft := openLayout(model, layout{slots: slots, prefix: prefix, perSeq: perSeq, shared: shared, ubatch: try},
+			moeCache, shape.CacheQ8, shape.Draft)
+		left := bud.sample()
+		if next != 0 && left >= thinHeadroom {
+			grownFrom = cmp.Or(grownFrom, ub)
+			lctx, draft, ub, bud.afterCtx = next, nextDraft, try, left
+			continue
+		}
+		if next != 0 {
+			nextDraft.free()
+			llama.FreeContext(next)
+		}
+		if lctx, draft = openLayout(model, layout{slots: slots, prefix: prefix, perSeq: perSeq, shared: shared, ubatch: ub},
+			moeCache, shape.CacheQ8, shape.Draft); lctx == 0 {
+			llama.FreeProjector(mtmd)
+			llama.FreeModel(model)
+			return nil, fmt.Errorf("create context for %s", path)
+		}
+		bud.afterCtx = bud.sample()
+		break
+	}
 	bud.report(slots, prefix, perSeq, shared)
+
+	// With next to nothing left the first pass may not allocate, and a reload
+	// with the same settings fails the same way: say so now, and again in the
+	// error if it happens, with the settings that were the operator's to give
+	// back (see noRoom).
+	var roomHint string
+	if bud.known && bud.afterCtx < noRoom {
+		roomHint = noRoomHint(filepath.Base(path), bud.afterCtx, opts)
+		log.Printf("memory: %s", roomHint)
+	}
+	if ctxAuto && perSeq < floor && (opts.HostExperts != 0 || opts.MoeCache > 0) {
+		log.Printf("context: %d tokens a conversation is all that fits beside -host-experts/-moe-cache as given, "+
+			"and a longer prompt is refused; a smaller -moe-cache leaves more, and with neither flag kinfer places the model itself", perSeq)
+	}
 
 	tpl := chat.FromModel(model, path)
 	if opts.Template != "" {
@@ -737,6 +795,8 @@ sizing:
 			"— a smaller -moe-cache makes room, or -batch %d takes it from that", ubatchLarge, ubatchLarge, gib(thinHeadroom), ubatchLarge)
 	case hostExperts != 0:
 		how = "sized for experts in host memory, which every pass reads again"
+	case grownFrom != 0:
+		how = fmt.Sprintf("grown from the %d Ollama's rule gives, since the context left room", grownFrom)
 	case placed.Reserve != 0:
 		how = "the pass placement kept room for"
 	}
@@ -768,6 +828,7 @@ sizing:
 	e.sched.profile = profile
 	e.sched.mtmd = mtmd
 	e.sched.onFatal = func() { e.broken.Store(true) }
+	e.sched.roomHint = roomHint
 	return e, nil
 }
 

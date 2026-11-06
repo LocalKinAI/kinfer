@@ -177,6 +177,8 @@ var (
 	freeContext        func(c Context)
 	decode             func(c Context, b Batch) int32
 	synchronize        func(c Context)
+	perfContextPrint   func(c Context)
+	perfContextReset   func(c Context)
 	batchGetOne        func(tokens *Token, n int32) Batch
 	getLogitsIth       func(c Context, i int32) *float32
 	getMemory          func(c Context) Memory
@@ -284,6 +286,8 @@ func bind(dir string) error {
 		{&freeContext, "llama_free"},
 		{&decode, "llama_decode"},
 		{&synchronize, "llama_synchronize"},
+		{&perfContextPrint, "llama_perf_context_print"},
+		{&perfContextReset, "llama_perf_context_reset"},
 		{&batchGetOne, "llama_batch_get_one"},
 		{&getLogitsIth, "llama_get_logits_ith"},
 		{&getMemory, "llama_get_memory"},
@@ -548,6 +552,14 @@ func Decode(c Context, b Batch) error {
 // charged to whatever happens to read the logits rather than to the decode that
 // caused it.
 func Synchronize(c Context) { synchronize(c) }
+
+// PerfPrint has llama.cpp log its own counters for c since the last
+// PerfReset: prompt and generated tokens, and how often a compute graph was
+// reused or reallocated.
+func PerfPrint(c Context) { perfContextPrint(c) }
+
+// PerfReset starts llama.cpp's counters for c again.
+func PerfReset(c Context) { perfContextReset(c) }
 
 // Logits returns the logit row for position i (-1 means the last token). The
 // slice aliases llama.cpp's own buffer and is only valid until the next Decode.
