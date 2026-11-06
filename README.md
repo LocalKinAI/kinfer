@@ -306,6 +306,19 @@ same tree (`go build -o kinlab ./cmd/kinlab`) and is not part of a release.
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks
       vs Ollama
 
+## The LocalKin family
+
+kinfer is one of [LocalKin](https://www.localkin.app)'s open-source tools. `pip install localkin`
+installs it with its two siblings; each is also a package of its own.
+
+| Package | Command | What it does |
+|---|---|---|
+| [kinfer-ai](https://pypi.org/project/kinfer-ai/) | `kinfer` | local LLM serving for agent fleets: one binary, the Ollama, OpenAI and Anthropic APIs, models bigger than the machine (this project) |
+| [ollamadiffuser](https://pypi.org/project/ollamadiffuser/) | `ollamadiffuser` | local image and video generation with an Ollama-style CLI: Stable Diffusion, FLUX, Qwen-Image, LTX |
+| [localkin-service-audio](https://pypi.org/project/localkin-service-audio/) | `kin audio` | local speech: speech-to-text and text-to-speech, voice cloning, an MCP server for Claude |
+
+The rest of the tools, written in Go: [localkin.app](https://www.localkin.app).
+
 ## License
 
 Apache 2.0
