@@ -76,14 +76,16 @@ type problem struct {
 // tiers are kinfer eval's presets, from seconds to an hour. smoke reads the
 // subset's problems with both models and says how far their predictions
 // part, which tells an edit that changed nothing or broke the model from one
-// worth asking questions; quick asks those problems without thinking, the
-// presence penalty keeping a small model from going round in circles; full
-// asks every problem the weight-space-programming paper's way. A flag given
-// on the command line wins over its tier's.
+// worth asking questions; quick asks those problems the way full does, but
+// with a quarter of the room to think, so a model that cannot bring its
+// thinking to an end shows as replies cut off; full asks every problem the
+// weight-space-programming paper's way. A flag given on the command line
+// wins over its tier's.
 var tiers = map[string]map[string]string{
 	"smoke": {"subset": "100"},
-	"quick": {"subset": "100", "think": "false", "temp": "0.6", "top-p": "0.95", "top-k": "20",
-		"presence-penalty": "1.5", "max-tokens": "4096", "seed": "1"},
+	"ends":  {},
+	"quick": {"subset": "100", "think": "true", "temp": "0.6", "top-p": "0.95", "top-k": "20",
+		"presence-penalty": "1.5", "max-tokens": "8192", "seed": "1"},
 	"full": {"subset": "0", "think": "true", "temp": "0.6", "top-p": "0.95", "top-k": "20",
 		"presence-penalty": "1.5", "max-tokens": "32768", "seed": "1"},
 }
@@ -96,7 +98,9 @@ var tiers = map[string]map[string]string{
 func cmdEval(args []string) error {
 	fs := flag.NewFlagSet("eval", flag.ExitOnError)
 	compare := fs.Bool("compare", false, "compare two runs: kinfer eval -compare <a.jsonl> <b.jsonl>")
-	tier := fs.String("tier", "", "smoke (seconds: how far the predictions part), quick (minutes: 100 problems), or full (an hour: all, thinking)")
+	tier := fs.String("tier", "", "smoke (seconds: how far the predictions part), ends (a minute or two: how readily it ends the replies the base's full tier ran out on), quick (minutes: 100 problems, thinking up to 8192 tokens), or full (an hour: all of them, up to 32768)")
+	window := fs.Int("window", 8192, "with -tier ends, how many tokens of each reply are read")
+	traces := fs.Int("traces", 30, "with -tier ends, how many of the replies that ran out are read (0: all)")
 	against := fs.String("against", "", "the model to compare with (default: the base of an edit)")
 	out := fs.String("o", "", "results file (default ~/.kinfer/evals/<model>/<set>[-<tier>].jsonl); a run goes on from what is in it")
 	n := fs.Int("n", 64, "replies at once")
@@ -127,7 +131,7 @@ func cmdEval(args []string) error {
 	if *tier != "" {
 		preset, ok := tiers[*tier]
 		if !ok {
-			return fmt.Errorf("-tier %q: the tiers are smoke, quick and full", *tier)
+			return fmt.Errorf("-tier %q: the tiers are smoke, ends, quick and full", *tier)
 		}
 		given := map[string]bool{}
 		fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
@@ -167,11 +171,16 @@ func cmdEval(args []string) error {
 			other = rec.BaseDir
 		}
 	}
-	if *tier == "smoke" {
+	if *tier == "smoke" || *tier == "ends" {
 		if other == "" {
-			return fmt.Errorf("a smoke test compares two models; %s is no edit, so name the other with -against", fs.Arg(0))
+			return fmt.Errorf("the %s tier compares two models; %s is no edit, so name the other with -against", *tier, fs.Arg(0))
 		}
-		return smokeTest(path, other, probs, *suffix)
+		if *tier == "smoke" {
+			return smokeTest(path, other, probs, *suffix)
+		}
+		set := strings.TrimSuffix(filepath.Base(fs.Arg(1)), filepath.Ext(fs.Arg(1)))
+		full := filepath.Join(filepath.Dir(st.Root()), "evals", modelName(other), set+"-full.jsonl")
+		return endsTest(path, other, full, probs, *suffix, *window, *traces)
 	}
 
 	setPath, _ := filepath.Abs(fs.Arg(1))

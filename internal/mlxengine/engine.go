@@ -752,3 +752,40 @@ func (p *profile) tick(rows int) {
 		*p = profile{on: true, since: time.Now()}
 	}
 }
+
+// Reader renders and tokenizes conversations as an Engine for the model in a
+// directory does, without loading its weights: for reading text with the
+// model directly, as kinfer eval does to see how readily a model ends a reply
+// another wrote.
+type Reader struct {
+	Tok *tokenizer.Tokenizer
+	tpl *chat.Template
+}
+
+// NewReader reads the tokenizer and chat template of the model in dir.
+func NewReader(dir string) (*Reader, error) {
+	libDir, err := nativelib.Prepare()
+	if err != nil {
+		return nil, err
+	}
+	if err := llama.Bind(libDir); err != nil {
+		return nil, err
+	}
+	tok, err := tokenizer.Load(filepath.Join(dir, "tokenizer.json"))
+	if err != nil {
+		return nil, err
+	}
+	tmpl, _ := os.ReadFile(filepath.Join(dir, "chat_template.jinja"))
+	return &Reader{Tok: tok, tpl: chat.FromTemplate(string(tmpl), dir)}, nil
+}
+
+// Reply is msgs as the prompt the model reads and reply as the tokens it
+// wrote after it. A reply that opens with the <think> the prompt already
+// ends in, as an Engine's do, is read without it.
+func (r *Reader) Reply(msgs []chat.Message, think bool, reply string) (prompt, written []int32) {
+	th := chat.Thinking{Off: !think}
+	if r.tpl.OpensThink(th) {
+		reply = strings.TrimPrefix(reply, "<think>")
+	}
+	return r.Tok.Encode(r.tpl.RenderWith(msgs, nil, th), true), r.Tok.Encode(reply, true)
+}

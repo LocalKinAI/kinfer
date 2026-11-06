@@ -510,13 +510,20 @@ func (m *Qwen35) Step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int
 // position, [len(tokens), vocab], evaluated: what the model predicts after
 // each token, for comparing two models' predictions on the same text.
 func (m *Qwen35) Logits(tokens []int32) (logits mlx.Array, err error) {
-	defer mlx.Recover(&err)
 	c := m.NewCache()
 	defer c.Free()
+	return m.ReadAll(tokens, c)
+}
+
+// ReadAll is Forward for one sequence, returning the logits at every
+// position, [len(tokens), vocab], evaluated: a long text is read a chunk at a
+// time with the same cache.
+func (m *Qwen35) ReadAll(tokens []int32, cache *Qwen35Cache) (logits mlx.Array, err error) {
+	defer mlx.Recover(&err)
 	ids := mlx.FromInt32(tokens, 1, len(tokens))
-	logits = m.step(ids, c, nil, true)
+	logits = m.step(ids, cache, nil, true)
 	ids.Free()
-	mlx.Eval(logits)
+	mlx.Eval(append([]mlx.Array{logits}, cache.Arrays()...)...)
 	return logits, nil
 }
 

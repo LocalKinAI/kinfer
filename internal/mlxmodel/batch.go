@@ -367,9 +367,7 @@ func (b *Qwen35Batch) Step(tokens mlx.Array) mlx.Array {
 	for r, p := range b.pad {
 		pads[r] = int32(p)
 	}
-	cols := mlx.Arange(0, float64(b.idx+1), 1, mlx.Int32)
-	mask := mlx.Reshape(mlx.Greater(mlx.Reshape(cols, 1, b.idx+1),
-		mlx.AddScalar(mlx.Reshape(mlx.FromInt32(pads, B), B, 1), -1)), B, 1, 1, b.idx+1)
+	starts := mlx.FromInt32(pads, B)
 
 	h := m.embed.rows(tokens)
 	for i := range m.layers {
@@ -380,7 +378,7 @@ func (b *Qwen35Batch) Step(tokens mlx.Array) mlx.Array {
 			one := &Qwen35Cache{conv: b.conv, state: b.state}
 			r = m.deltaNet(l.linear, x, one, i)
 		} else {
-			r = b.attention(l.full, x, i, offsets, mask)
+			r = b.attention(l.full, x, i, offsets, starts)
 		}
 		h = mlx.Add(h, r)
 		x = mlx.RMSNorm(h, l.inPost, c.RMSNormEps)
@@ -398,7 +396,9 @@ func (b *Qwen35Batch) Step(tokens mlx.Array) mlx.Array {
 	return logits
 }
 
-func (b *Qwen35Batch) attention(w *fullAttn, x mlx.Array, i int, offsets, mask mlx.Array) mlx.Array {
+// attention is a full-attention layer's step. Each row reads only its own
+// columns (decodeAttention), not the batch's whole width.
+func (b *Qwen35Batch) attention(w *fullAttn, x mlx.Array, i int, offsets, starts mlx.Array) mlx.Array {
 	c := b.m.Config
 	B := x.Shape()[0]
 	H, Hkv, D := c.NumAttentionHeads, c.NumKeyValueHeads, c.HeadDim
@@ -418,10 +418,17 @@ func (b *Qwen35Batch) attention(w *fullAttn, x mlx.Array, i int, offsets, mask m
 	end := b.idx + 1
 	b.keys[i] = mlx.SliceUpdate(b.keys[i], k, []int{0, 0, b.idx, 0}, []int{B, Hkv, end, D})
 	b.vals[i] = mlx.SliceUpdate(b.vals[i], v, []int{0, 0, b.idx, 0}, []int{B, Hkv, end, D})
-	keys := mlx.Slice(b.keys[i], []int{0, 0, 0, 0}, []int{B, Hkv, end, D})
-	vals := mlx.Slice(b.vals[i], []int{0, 0, 0, 0}, []int{B, Hkv, end, D})
-
-	o := mlx.SDPA(q, keys, vals, float32(1/math.Sqrt(float64(D))), "", mask)
-	o = mlx.Reshape(mlx.Transpose(o, 0, 2, 1, 3), B, 1, H*D)
+	scale := float32(1 / math.Sqrt(float64(D)))
+	var o mlx.Array
+	if D%32 == 0 && raggedDecode {
+		o = mlx.Reshape(decodeAttention(q, b.keys[i], b.vals[i], starts, end, scale), B, 1, H*D)
+	} else {
+		cols := mlx.Arange(0, float64(end), 1, mlx.Int32)
+		mask := mlx.Reshape(mlx.Greater(mlx.Reshape(cols, 1, end), mlx.AddScalar(mlx.Reshape(starts, B, 1), -1)), B, 1, 1, end)
+		keys := mlx.Slice(b.keys[i], []int{0, 0, 0, 0}, []int{B, Hkv, end, D})
+		vals := mlx.Slice(b.vals[i], []int{0, 0, 0, 0}, []int{B, Hkv, end, D})
+		o = mlx.SDPA(q, keys, vals, scale, "", mask)
+		o = mlx.Reshape(mlx.Transpose(o, 0, 2, 1, 3), B, 1, H*D)
+	}
 	return linear(mlx.Multiply(o, mlx.Sigmoid(gate)), w.o)
 }
