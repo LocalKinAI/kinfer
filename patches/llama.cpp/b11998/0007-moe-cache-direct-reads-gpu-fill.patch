@@ -1,0 +1,486 @@
+diff -ruN a/ggml/src/ggml-metal/ggml-metal-context.h b/ggml/src/ggml-metal/ggml-metal-context.h
+--- a/ggml/src/ggml-metal/ggml-metal-context.h	2026-11-06 09:59:15
++++ b/ggml/src/ggml-metal/ggml-metal-context.h	2026-11-06 09:59:15
+@@ -19,6 +19,12 @@
+ 
+ void ggml_metal_synchronize(ggml_metal_t ctx);
+ 
++// the GPU's time on command buffers so far, and how many, when GGML_METAL_GPU_TIME is set
++void ggml_metal_gpu_time(uint64_t * ns, uint64_t * n);
++
++// keep the GPU busy for about us microseconds with a small kernel queued behind the graphs so far
++void ggml_metal_fill(ggml_metal_t ctx, int us);
++
+ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+diff -ruN a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+--- a/ggml/src/ggml-metal/ggml-metal-context.m	2026-11-06 09:59:15
++++ b/ggml/src/ggml-metal/ggml-metal-context.m	2026-11-06 09:59:15
+@@ -12,6 +12,13 @@
+ 
+ #import <Metal/Metal.h>
+ 
++#include <stdatomic.h>
++#include <stdlib.h>
++
++// gaps between graphs filled by ggml_metal_fill, and the GPU's time on them
++static _Atomic uint64_t g_fill_n;
++static _Atomic uint64_t g_fill_ns;
++
+ #undef MIN
+ #undef MAX
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+@@ -208,6 +215,10 @@
+ 
+ void ggml_metal_free(ggml_metal_t ctx) {
+     GGML_LOG_INFO("%s: deallocating\n", __func__);
++    if (atomic_load(&g_fill_n) > 0) {
++        GGML_LOG_INFO("%s: filled %llu gaps between graphs, %.1f ms of the GPU\n", __func__,
++            (unsigned long long) atomic_load(&g_fill_n), atomic_load(&g_fill_ns)/1e6);
++    }
+ 
+     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+         if (ctx->cmd_bufs[i].obj) {
+@@ -506,6 +517,98 @@
+     }
+ }
+ 
++// with GGML_METAL_GPU_TIME set, the time the GPU spent on each command buffer, from its own clock, summed
++static _Atomic uint64_t g_gpu_time_ns;
++static _Atomic uint64_t g_gpu_time_n;
++
++static bool ggml_metal_gpu_time_on(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * v = getenv("GGML_METAL_GPU_TIME");
++        on = v != NULL && v[0] != '\0' && v[0] != '0';
++    }
++    return on;
++}
++
++static void ggml_metal_gpu_time_watch(id<MTLCommandBuffer> cmd_buf) {
++    if (!ggml_metal_gpu_time_on()) {
++        return;
++    }
++    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++        const double t = cb.GPUEndTime - cb.GPUStartTime;
++        if (t > 0) {
++            atomic_fetch_add(&g_gpu_time_ns, (uint64_t) (t*1e9));
++        }
++        atomic_fetch_add(&g_gpu_time_n, 1);
++    }];
++}
++
++void ggml_metal_gpu_time(uint64_t * ns, uint64_t * n) {
++    *ns = atomic_load(&g_gpu_time_ns);
++    *n  = atomic_load(&g_gpu_time_n);
++}
++
++// a GPU that sits idle between two graphs while the host works runs the next one slower, its clock let down: keep
++// it busy with one small kernel for about us microseconds, on the queue the graphs use, so the kernel runs after
++// the graph before and ahead of the next one instead of beside them
++static const char * ggml_metal_fill_src =
++    "#include <metal_stdlib>\n"
++    "using namespace metal;\n"
++    "kernel void kernel_fill(device uint * out [[buffer(0)]], constant uint & n [[buffer(1)]], uint tid [[thread_position_in_grid]]) {\n"
++    "    uint x = tid;\n"
++    "    for (uint i = 0; i < n; ++i) { x = x*1664525u + 1013904223u; }\n"
++    "    out[tid] = x;\n"
++    "}\n";
++
++static id<MTLComputePipelineState> g_fill_pipeline;
++static id<MTLBuffer>               g_fill_out;
++static _Atomic double              g_fill_per_us = 300.0; // loop iterations a microsecond, learnt as it runs
++
++void ggml_metal_fill(ggml_metal_t ctx, int us) {
++    if (us <= 0) {
++        return;
++    }
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
++        NSError * error = nil;
++        id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:ggml_metal_fill_src] options:nil error:&error];
++        if (lib == nil) {
++            GGML_LOG_WARN("%s: cannot compile the fill kernel: %s\n", __func__, [[error localizedDescription] UTF8String]);
++            return;
++        }
++        id<MTLFunction> fn = [lib newFunctionWithName:@"kernel_fill"];
++        g_fill_pipeline = [device newComputePipelineStateWithFunction:fn error:&error];
++        [fn release];
++        [lib release];
++        g_fill_out = [device newBufferWithLength:32*sizeof(uint32_t) options:MTLResourceStorageModePrivate];
++    });
++    if (g_fill_pipeline == nil) {
++        return;
++    }
++    const double per_us = atomic_load(&g_fill_per_us);
++    const uint32_t n = (uint32_t) MAX(64.0, MIN(16777216.0, per_us*us));
++    @autoreleasepool {
++        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
++        id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
++        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
++        [encoder setComputePipelineState:g_fill_pipeline];
++        [encoder setBuffer:g_fill_out offset:0 atIndex:0];
++        [encoder setBytes:&n length:sizeof(n) atIndex:1];
++        [encoder dispatchThreads:MTLSizeMake(32, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
++        [encoder endEncoding];
++        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++            const double t = (cb.GPUEndTime - cb.GPUStartTime)*1e6;
++            if (t > 1.0) {
++                atomic_store(&g_fill_per_us, 0.8*atomic_load(&g_fill_per_us) + 0.2*(n/t));
++                atomic_fetch_add(&g_fill_ns, (uint64_t) (t*1e3));
++            }
++            atomic_fetch_add(&g_fill_n, 1);
++        }];
++        [cmd_buf commit];
++    }
++}
++
+ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+     if (ctx->has_error) {
+         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
+@@ -607,6 +710,7 @@
+             }
+             ctx->cmd_bufs[n_cb].obj  = cmd_buf;
+             ctx->cmd_bufs[n_cb].done = ctx->done_next++;
++            ggml_metal_gpu_time_watch(cmd_buf);
+ 
+             [cmd_buf enqueue];
+ 
+@@ -628,6 +732,7 @@
+             }
+             ctx->cmd_bufs[cb_idx].obj  = cmd_buf;
+             ctx->cmd_bufs[cb_idx].done = 0;
++            ggml_metal_gpu_time_watch(cmd_buf);
+ 
+             // always enqueue the first two command buffers
+             // enqueue all of the command buffers if we don't need to abort
+diff -ruN a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+--- a/ggml/src/ggml-metal/ggml-metal.cpp	2026-11-06 09:59:15
++++ b/ggml/src/ggml-metal/ggml-metal.cpp	2026-11-06 09:59:15
+@@ -949,7 +949,27 @@
+     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
+ }
+ 
++// whether a buffer is Metal memory the GPU shares with the host, whose tensors' data the host can write in place
++static bool ggml_backend_metal_buffer_is_shared(ggml_backend_buffer_t buffer) {
++    return buffer != nullptr && buffer->iface.set_tensor == ggml_backend_metal_buffer_shared_set_tensor;
++}
++
++static void ggml_backend_metal_fill(ggml_backend_t backend, int us) {
++    if (backend != nullptr && ggml_backend_is_metal(backend)) {
++        ggml_metal_fill((ggml_metal_t) backend->context, us);
++    }
++}
++
+ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_metal_fill") == 0) {
++        return (void *)ggml_backend_metal_fill;
++    }
++    if (strcmp(name, "ggml_backend_metal_buffer_is_shared") == 0) {
++        return (void *)ggml_backend_metal_buffer_is_shared;
++    }
++    if (strcmp(name, "ggml_backend_metal_gpu_time") == 0) {
++        return (void *)ggml_metal_gpu_time;
++    }
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_metal_get_features;
+     }
+diff -ruN a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+--- a/src/llama-moe-cache.cpp	2026-11-06 09:59:15
++++ b/src/llama-moe-cache.cpp	2026-11-06 09:59:15
+@@ -653,6 +653,8 @@
+         std::vector<ggml_tensor *> ref;   // expert tensors of the first layer
+         std::vector<int32_t> layers;
+         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
++        bool direct = false;              // the banks are memory the host shares: misses are read straight into their slots
++        void (*fill)(ggml_backend_t, int) = nullptr; // keeps the GPU busy while the misses are read (LLAMA_MOE_FILL)
+         size_t host_bytes = 0;
+         int32_t n_slots = 0;
+         moe_cache_slru slru;
+@@ -721,6 +723,26 @@
+     std::mutex ahead_mutex;                        // ahead_set and st_read.read_ahead
+     stats_read st_read;
+ 
++
++    // with LLAMA_MOE_TIMING set, where generation's time goes around each cached layer, and per layer how the cache
++    // and the read-ahead did; only ubatches of one token count, so the experts of consecutive tokens can be compared
++    struct timing {
++        using clock = std::chrono::steady_clock;
++        bool    init = false;
++        bool    on   = false;
++        void (*gpu_time)(uint64_t *, uint64_t *) = nullptr; // Metal's, with GGML_METAL_GPU_TIME set
++        clock::time_point prev_end; // the end of the previous callback
++        int32_t  prev_il  = -1;     // its layer, -1 when it was not a token's
++        uint64_t gpu_prev = 0;
++        size_t   n_tokens = 0;
++        size_t   n_layers = 0;
++        size_t   n_gaps   = 0;      // layers after the first of a token
++        double   between = 0, sync = 0, plan = 0, read = 0, upload = 0, map = 0, ahead = 0, gpu = 0; // ms
++        std::atomic<uint64_t> guess_ns{0}, guess_wait_ns{0}, guess_n{0}; // the read-ahead's router on the host, and its start after the callback
++        std::vector<size_t> hits, misses, misses_ahead, same, compared;   // [n_layer]
++        std::vector<std::vector<int32_t>> last; // [n_layer] the experts the previous token selected
++    } tm;
++
+     // misses are read into host memory and uploaded from there, consecutive experts going to consecutive slots together
+     struct upload {
+         size_t  ip;     // expert tensor
+@@ -915,6 +937,20 @@
+                 d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
+             }
+         }
++        // on Apple's unified memory the banks are shared with the host, and a miss read into its slot need not be read
++        // into host memory first and copied in: a third of the time a layer spends on its misses went to that copy
++        for (group & g : groups) {
++            if (no_alloc || g.n_slots == 0 || getenv("LLAMA_MOE_STAGE") != nullptr) {
++                continue;
++            }
++            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[g.id].backend));
++            auto is_shared = (bool (*)(ggml_backend_buffer_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_buffer_is_shared");
++            g.direct = is_shared != nullptr;
++            for (const ggml_tensor * bank : g.banks) {
++                g.direct = g.direct && bank->data != nullptr && is_shared(bank->buffer);
++            }
++            g.fill = (void (*)(ggml_backend_t, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_fill");
++        }
+         buf_host = llama_memory_bufs::alloc_buf(ctx_host.get(), buft_host, no_alloc, "MoE cache slot maps");
+         if (!no_alloc) {
+             ggml_backend_buffer_clear(buf_host.get(), 0xff); // all slots are -1
+@@ -1107,6 +1143,21 @@
+ 
+         GGML_ASSERT(backend == devices[g.id].backend);
+ 
++        if (!tm.init) {
++            tm.init = true;
++            const char * v = getenv("LLAMA_MOE_TIMING");
++            tm.on = v != nullptr && v[0] != '\0' && v[0] != '0';
++            if (tm.on) {
++                const size_t n = layers.size();
++                tm.hits.assign(n, 0); tm.misses.assign(n, 0); tm.misses_ahead.assign(n, 0);
++                tm.same.assign(n, 0); tm.compared.assign(n, 0); tm.last.assign(n, {});
++                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
++                tm.gpu_time = (void (*)(uint64_t *, uint64_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_gpu_time");
++            }
++        }
++        const auto now = [&]() { return tm.on ? timing::clock::now() : timing::clock::time_point(); };
++        const auto t0 = now();
++
+         // the get_rows that looks up the slots of the selected experts
+         const int n_nodes = ggml_graph_n_nodes(graph);
+         const ggml_tensor * lookup = nullptr;
+@@ -1132,6 +1183,7 @@
+         // wait for the split that selects them, then read them: from a buffer the GPU shares with the host this is a
+         // copy from memory, where an asynchronous read would queue a copy on the GPU behind the split and wait for it too
+         ggml_backend_synchronize(backend);
++        const auto t1 = now();
+         ids.resize(ggml_nelements(sel));
+         ggml_backend_tensor_get(sel, ids.data(), 0, ggml_nbytes(sel));
+ 
+@@ -1156,6 +1208,23 @@
+             }
+         }
+ 
++        const auto t2 = now();
++        double read_ms = 0.0, upload_ms = 0.0;
++
++        // the GPU waits for these reads, and a GPU left idle that long lets its clock down and runs the next layer slower:
++        // keep it busy for most of the time they should take. On the MacBook Pro (M5 Max), DeepSeek-V4.1 with every
++        // layer's experts on the host spent 0.96 ms a layer on the GPU without this and 0.65 with it, the token 14% sooner;
++        // 0.5 of the time did as well as 0.7, and a fill at every layer, misses or not, no better (LLAMA_MOE_FILL=share,
++        // 0 to turn it off)
++        static const double fill_share = [] { const char * v = getenv("LLAMA_MOE_FILL"); return v ? atof(v) : 0.7; }();
++        if (fill_share > 0.0 && g.fill != nullptr && !fills.empty()) {
++            size_t miss_bytes = 0;
++            for (const ggml_tensor * w : l.experts) {
++                miss_bytes += fills.size()*w->nb[2];
++            }
++            g.fill(backend, (int) (fill_share*miss_bytes/12e3)); // at 12 GB/s, in microseconds
++        }
++
+         // read the missing experts into host memory with all threads, from the model file when they are mapped from it,
+         // and upload them from there, in rounds of up to 128 MiB; the backend is idle, synchronized to read the selection
+         uploads.clear();
+@@ -1172,6 +1241,24 @@
+         }
+         constexpr size_t round = 128u*1024*1024;
+         size_t bytes = 0;
++        if (g.direct && !uploads.empty()) {
++            // the backend is idle, so its slots can be written while it waits
++            reads.clear();
++            reads_direct.clear();
++            for (const upload & u : uploads) {
++                const ggml_tensor * w = l.experts[u.ip];
++                const size_t expert_size = w->nb[2];
++                uint8_t * dst = (uint8_t *) g.banks[u.ip]->data + (size_t) u.slot*expert_size;
++                (u.ahead ? reads : reads_direct).push_back({ (const uint8_t *) w->data + u.expert*expert_size, u.n*expert_size, dst });
++                bytes += u.n*expert_size;
++            }
++            const auto t_read = std::chrono::steady_clock::now();
++            reader.read_now(reads, reads_direct);
++            const double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_read).count();
++            st_read.wait_ms += waited;
++            read_ms += waited;
++            uploads.clear();
++        }
+         for (size_t u0 = 0; u0 < uploads.size(); ) {
+             size_t used = 0;
+             size_t u1   = u0;
+@@ -1192,13 +1279,19 @@
+             }
+             const auto t_read = std::chrono::steady_clock::now();
+             reader.read_now(reads, reads_direct);
+-            st_read.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_read).count();
++            const auto t_read_end = std::chrono::steady_clock::now();
++            const double waited = std::chrono::duration<double, std::milli>(t_read_end - t_read).count();
++            st_read.wait_ms += waited;
++            read_ms += waited;
+             for (size_t k = u0; k < u1; ++k) {
+                 const upload & u = uploads[k];
+                 const size_t expert_size = l.experts[u.ip]->nb[2];
+                 ggml_backend_tensor_set(g.banks[u.ip], base + u.at, u.slot*expert_size, u.n*expert_size);
+                 bytes += u.n*expert_size;
+             }
++            if (tm.on) {
++                upload_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_read_end).count();
++            }
+             u0 = u1;
+         }
+         st_read.n_uploads++;
+@@ -1208,18 +1301,74 @@
+         st.misses += fills.size();
+         st.bytes  += bytes;
+ 
++        const auto t3 = now();
+         // the backend is idle until the split this map is an input of: write it now, again a copy from memory where the
+         // GPU shares it, instead of a copy queued on the GPU ahead of the split
+         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
++        const auto t4 = now();
+ 
+         read_ahead(il, sel);
+ 
++        if (tm.on) {
++            time_layer(il, n_hit, t0, t1, t2, t3, t4, now(), read_ms, upload_ms);
++        }
+         return true;
+     }
+ 
++    void time_layer(int32_t il, size_t n_hit, timing::clock::time_point t0, timing::clock::time_point t1, timing::clock::time_point t2,
++            timing::clock::time_point t3, timing::clock::time_point t4, timing::clock::time_point t5, double read_ms, double upload_ms) {
++        const auto ms = [](timing::clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
++        if ((int64_t) ids.size() != n_expert_used) {
++            tm.prev_il = -1; // a batch of more than one token
++            return;
++        }
++        uint64_t gpu_ns = 0, gpu_n = 0;
++        if (tm.gpu_time) {
++            tm.gpu_time(&gpu_ns, &gpu_n);
++        }
++        if (tm.prev_il >= 0 && il > tm.prev_il) {
++            // the stretch since the previous layer of the same token: the scheduler encoding the split in between,
++            // then waiting for the GPU to finish it
++            tm.between += ms(t0 - tm.prev_end);
++            tm.gpu     += (gpu_ns - tm.gpu_prev)/1e6;
++            tm.n_gaps++;
++        } else {
++            tm.n_tokens++;
++        }
++        tm.gpu_prev = gpu_ns;
++        tm.sync   += ms(t1 - t0);
++        tm.plan   += ms(t2 - t1);
++        tm.read   += read_ms;
++        tm.upload += upload_ms;
++        tm.map    += ms(t4 - t3);
++        tm.ahead  += ms(t5 - t4);
++        tm.n_layers++;
++
++        tm.hits[il]   += n_hit;
++        tm.misses[il] += fills.size();
++        for (uint8_t a : fill_ahead) {
++            tm.misses_ahead[il] += a;
++        }
++        std::vector<int32_t> & last = tm.last[il];
++        if (!last.empty()) {
++            for (int32_t id : ids) {
++                tm.same[il] += std::find(last.begin(), last.end(), id) != last.end();
++            }
++            tm.compared[il] += ids.size();
++        }
++        last.assign(ids.begin(), ids.end());
++
++        tm.prev_il  = il;
++        tm.prev_end = t5;
++    }
++
+     // guess the experts the next cached layer selects by applying its router to the input of this layer's router,
+     // and read the ones it does not cache while the device computes the layers in between
+     void read_ahead(int32_t il, const ggml_tensor * sel) {
++        static const bool off = [] { const char * v = getenv("LLAMA_MOE_AHEAD"); return v != nullptr && v[0] == '0'; }();
++        if (off) {
++            return;
++        }
+         const int32_t il_next = next_cached[il];
+         if (il_next < 0 || routers[il_next].w.empty() || routers[il].gate_inp == nullptr) {
+             return;
+@@ -1244,8 +1393,15 @@
+         }
+         std::vector<int32_t> slots_next(slots, slots + n_expert_model);
+ 
+-        reader.ahead([this, il_next, n_tokens, xs = std::move(xs), slots_next = std::move(slots_next)] {
++        const auto queued = std::chrono::steady_clock::now();
++        reader.ahead([this, il_next, n_tokens, queued, xs = std::move(xs), slots_next = std::move(slots_next)] {
++            const auto t0 = std::chrono::steady_clock::now();
+             guess(il_next, xs, n_tokens, slots_next);
++            if (tm.on) {
++                tm.guess_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t0 - queued).count();
++                tm.guess_ns      += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++                tm.guess_n++;
++            }
+         });
+     }
+ 
+@@ -1505,6 +1661,43 @@
+         if (st_read.n_uploads > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: reading misses: %.1f ms waited over %zu uploads; %zu of %zu misses had been read ahead (%.1f%%), %zu experts read ahead\n",
+                 st_read.wait_ms, st_read.n_uploads, st_read.misses_ahead, misses, misses > 0 ? 100.0*st_read.misses_ahead/misses : 0.0, st_read.read_ahead);
++        }
++        if (tm.on && tm.n_tokens > 0 && tm.n_layers > 0) {
++            const double nl = (double) tm.n_layers, ng = (double) std::max<size_t>(tm.n_gaps, 1);
++            LLAMA_LOG_INFO("llama_moe_cache: timing, generation: %zu tokens, %.1f cached layers each; ms a layer: between layers %.3f "
++                "(of it the GPU busy %.3f%s), waiting for the GPU %.3f, selection and plan %.3f, reading misses %.3f, uploading them %.3f, "
++                "slot map %.3f, starting the read-ahead %.3f\n",
++                tm.n_tokens, nl/tm.n_tokens, tm.between/ng, tm.gpu/ng, tm.gpu_time ? "" : ", no GPU clock", tm.sync/nl, tm.plan/nl,
++                tm.read/nl, tm.upload/nl, tm.map/nl, tm.ahead/nl);
++            LLAMA_LOG_INFO("llama_moe_cache: timing, generation: ms a token over its cached layers: between layers %.2f, waiting for the GPU %.2f, "
++                "selection and plan %.2f, reading misses %.2f, uploading %.2f, slot map %.2f, read-ahead %.2f; the GPU busy %.2f of it\n",
++                tm.between/tm.n_tokens, tm.sync/tm.n_tokens, tm.plan/tm.n_tokens, tm.read/tm.n_tokens, tm.upload/tm.n_tokens,
++                tm.map/tm.n_tokens, tm.ahead/tm.n_tokens, tm.gpu/tm.n_tokens);
++            if (tm.guess_n > 0) {
++                LLAMA_LOG_INFO("llama_moe_cache: timing, read-ahead: %llu guesses, each started %.3f ms after its callback and took %.3f ms "
++                    "(the router on the host and queueing the reads)\n", (unsigned long long) tm.guess_n.load(),
++                    tm.guess_wait_ns/1e6/tm.guess_n, tm.guess_ns/1e6/tm.guess_n);
++            }
++            std::string line;
++            int n_line = 0;
++            for (size_t il = 0; il < tm.hits.size(); ++il) {
++                const size_t n = tm.hits[il] + tm.misses[il];
++                if (n == 0) {
++                    continue;
++                }
++                char buf[96];
++                snprintf(buf, sizeof(buf), " %zu:%.0f/%.0f/%.0f", il, 100.0*tm.hits[il]/n,
++                    tm.misses[il] ? 100.0*tm.misses_ahead[il]/tm.misses[il] : 0.0,
++                    tm.compared[il] ? 100.0*tm.same[il]/tm.compared[il] : 0.0);
++                line += buf;
++                if (++n_line % 10 == 0) {
++                    LLAMA_LOG_INFO("llama_moe_cache: per layer, hit%%/misses read ahead%%/same as the previous token%%:%s\n", line.c_str());
++                    line.clear();
++                }
++            }
++            if (!line.empty()) {
++                LLAMA_LOG_INFO("llama_moe_cache: per layer, hit%%/misses read ahead%%/same as the previous token%%:%s\n", line.c_str());
++            }
+         }
+     }
+ };

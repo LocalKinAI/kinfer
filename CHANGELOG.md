@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Faster — a mixture of experts read from the SSD, on a MacBook Pro most
+
+DeepSeek-V4.1 on a MacBook Pro (M5 Max, the GPU at 40 GiB), every layer's
+experts in host memory and read from the SSD as the cache misses them, generated
+14.5–18.7 tok/s instead of 11.5–16.6, the replies the same word for word. On the
+M3 Ultra, whose larger cache misses less, 3% more. Two changes to kinfer's patch
+of llama.cpp (0007; the libraries are now k7):
+
+- **A miss is read straight into its slot.** On a Mac the cache is memory the GPU
+  shares with the host, and the misses were read into host memory, then copied
+  into it: 5 ms of the laptop's 78 a token, now gone.
+- **The GPU is kept busy while a layer's misses are read.** V4.1's misses keep
+  the GPU waiting most of a millisecond, forty times a token, and a GPU left idle
+  that long lets its clock down: the layer after ran 0.96 ms by the GPU's own
+  clock, against 0.65 with a small kernel queued on the graphs' own queue for
+  most of the reads' expected time. A token came 14% sooner. Flash-Next, whose
+  misses take 0.2 ms, decodes the same either way (32.7 and 32.8 tok/s on the
+  laptop). `LLAMA_MOE_FILL=0` turns it off.
+- `LLAMA_MOE_TIMING=1`, with `GGML_METAL_GPU_TIME=1`, logs when the model
+  unloads where generation spent its time at each cached layer — the GPU, the
+  reads, the gaps — and per layer the hit rate, the share of misses read ahead
+  and the experts the previous token also chose. That is how the two were found.
+
+Measured while doing this, and left as it is: reading the guessed experts into
+slots of their own while the GPU computes raised the hits from 83% to 92% but
+slowed the GPU beside the writes by 12 ms a token, 30% slower in all; guessing
+more or fewer experts a layer, or keeping the read-ahead to fewer threads, moved
+nothing beyond the laptop's run-to-run drift, the SSD already reading at about
+14 GB/s; and a cache holding the experts the usage profile counts most would hit
+73% of the laptop's selections where the cache that follows the conversation
+hits 83%. The numbers and the rest: docs/big-models.md, "DeepSeek-V4.1 on the
+laptop, and the GPU that idles".
+
 ## v0.2.3 — 2026-11-06
 
 ### Added — drafting with the MTP head, for MLX models that carry one

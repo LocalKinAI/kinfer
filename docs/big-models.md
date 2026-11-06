@@ -298,6 +298,68 @@ instead (`-peers`) decodes at 25.6 tok/s and reads a prompt at 254, slower than
 the SSD; over Thunderbolt 5 with both GPUs kept warm it decodes at 43.6 and reads
 the prompt at 1,274 (see [Over Thunderbolt 5](#over-thunderbolt-5-and-the-gpu-that-waits)).
 
+### DeepSeek-V4.1 on the laptop, and the GPU that idles
+
+DeepSeek-V4.1 is the harder case: 128.7 GiB, every layer's experts in host
+memory on the MacBook Pro (the GPU at 40 GiB), a 23 GiB cache holding 17.5% of
+them, and each expert 8.7 MiB, so a miss is a read the GPU waits for. With
+`LLAMA_MOE_TIMING=1` and `GGML_METAL_GPU_TIME=1` the libraries log, when the
+model unloads, where generation spent its time at each cached layer, the GPU's
+part from its own clock, and per layer the hit rate, the share of misses read
+ahead and the experts the previous token also chose. Over 1,027 tokens of
+v0.2.3:
+
+| a token, 40 cached layers | ms |
+|---|---:|
+| the GPU computing | 40.1 |
+| reading the misses (83% of the experts hit) | 23.7 |
+| between layers, the GPU idle | 8.7 |
+| copying the misses into the cache | 5.4 |
+| looking up the cache, the slot map, starting the read-ahead | 0.2 |
+
+The reads ran at about 14 GB/s, what the SSD gives sixteen threads, so they
+cannot go faster, only be fewer. Two things changed (patch 0007):
+
+- **A miss is read straight into its slot.** On a Mac the cache is memory the
+  GPU shares, so the read needs no stop in host memory: the copy's 5 ms went,
+  the reads took 2.7 ms longer, and a token came 7% sooner.
+- **The GPU is kept busy while a layer's misses are read.** The GPU ran a layer
+  in 0.97 ms when it had waited 0.84 ms for the reads before it, 1.10 when it
+  waited 1.10, 1.29 when it waited 1.38: an idle GPU lets its clock down, and
+  V4.1's misses keep it idle most of a millisecond forty times a token. A small
+  kernel queued on the graphs' own queue for 0.7 of the reads' expected time
+  (at 12 GB/s) keeps it up, and runs after the layer before and ahead of the
+  next one rather than beside them, as the keep-warm kernel on a queue of its
+  own does (see above). The GPU's part went from 37.6 ms a token to 25.5, the
+  token from 71 ms to 62. 0.5 of the time does as well, a fill at every layer
+  no better. `LLAMA_MOE_FILL=0` turns it off.
+
+| | decode, four 256-token replies | |
+|---|---|---|
+| MacBook Pro, v0.2.3 | 12.0 / 16.6 / 11.5 / 11.5 tok/s | |
+| MacBook Pro, k7 | 15.0 / 18.7 / 14.8 / 14.5 tok/s | the same replies |
+| M3 Ultra, v0.2.3 | 15.5 / 17.5 / 15.4 / 14.8 tok/s | 92% hits, 31 layers on the host |
+| M3 Ultra, k7 | 16.5 / 18.0 / 15.2 / 15.5 tok/s | the same replies |
+
+Flash-Next, whose misses keep the GPU waiting 0.2 ms a layer, decodes the same
+with the fill or without (32.7, 32.8 tok/s on the laptop); on the M3 Ultra the
+fill is worth 2% to V4.1.
+
+What was tried and left out, all with the same replies:
+
+- Reading the guessed experts into slots of their own while the GPU computes,
+  instead of into the page cache: the hits went from 83% to 92%, but the reads
+  rarely finished in the millisecond there is, and the GPU computing beside them
+  ran 12 ms a token slower. 30% slower in all.
+- Guessing three, four, eight or ten experts a layer instead of six, or keeping
+  the read-ahead to four, eight or twelve of the sixteen threads: within the
+  laptop's few percent from run to run. Fewer guesses miss more, more read more.
+- Two or three GiB more of cache, out of the 4 GiB the placement leaves: 1.5 to
+  2 points more hits, about 3% sooner, the laptop already in swap.
+- A cache holding fixed the experts the usage profile counts most, which is
+  what the box's profile copied to the laptop would give: 73% of the laptop's
+  selections against the 83% of a cache that follows the conversation.
+
 ### Placed by itself
 
 None of those flags is needed any more. A mixture of experts the GPU cannot

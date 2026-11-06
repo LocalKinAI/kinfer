@@ -16,7 +16,12 @@
 # and waits less: Metal marks the end of each graph with an event the host
 # watches for instead of waiting to be woken, the experts a layer selects and
 # its slot map are copied in memory the GPU shares rather than by the GPU, and
-# a miss nobody read ahead comes from the SSD past the page cache. For a model
+# a miss nobody read ahead comes from the SSD past the page cache. Where the cache
+# is memory the GPU shares, a miss is read straight into its slot, with no copy
+# through host memory, and while a layer's misses are read the GPU runs a small
+# kernel on the queue the graphs use, so it does not let its clock down and run
+# the next layer slower (LLAMA_MOE_FILL; LLAMA_MOE_TIMING and GGML_METAL_GPU_TIME
+# say where a token's time goes). For a model
 # split across machines, Metal can keep the GPU's clock up between graphs,
 # while it waits for the other machine's layers
 # (ggml_backend_metal_set_warm), and RPC connections probe a silent peer, so a
@@ -27,7 +32,7 @@
 # given the memory its machine's other apps hold. Metal compiles the kernels at
 # the language version a current SDK gets, also for a kinfer built without cgo,
 # which would otherwise get Metal 2.4 and lose the bfloat kernels. The libraries
-# land in internal/nativelib/libs/darwin_arm64_${VERSION}k6, which replaces the
+# land in internal/nativelib/libs/darwin_arm64_${VERSION}k7, which replaces the
 # release set the way one release replaces another (see fetch-libs.sh).
 #
 # Needs cmake, ninja and Xcode's command line tools; about two minutes on an M4.
@@ -36,7 +41,7 @@
 set -euo pipefail
 
 VERSION=b11998 # the release the patches are made against
-LEVEL=k6       # bumped when the patches change, so a cached copy is not reused
+LEVEL=k7       # bumped when the patches change, so a cached copy is not reused
 SRC=""
 for arg in "$@"; do
   case "$arg" in
