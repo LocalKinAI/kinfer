@@ -345,6 +345,11 @@ Flash-Next, whose misses keep the GPU waiting 0.2 ms a layer, decodes the same
 with the fill or without (32.7, 32.8 tok/s on the laptop); on the M3 Ultra the
 fill is worth 2% to V4.1.
 
+With the MacBook Pro lending its GPU over Thunderbolt 5 (`serve -peers`, placed
+by itself: layers 0–9 on the laptop, the experts of layers 25–39 in the Mac
+Studio's host memory behind an 18 GiB cache), V4.1 decodes at 19.5–22.3 tok/s and
+reads a 3,614-token prompt at 238.
+
 What was tried and left out, all with the same replies:
 
 - Reading the guessed experts into slots of their own while the GPU computes,
