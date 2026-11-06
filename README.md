@@ -1,7 +1,7 @@
 # kinfer
 
 [![PyPI](https://img.shields.io/pypi/v/kinfer-ai)](https://pypi.org/project/kinfer-ai/)
-[![Downloads](https://static.pepy.tech/badge/kinfer-ai)](https://pepy.tech/project/kinfer-ai)
+[![Downloads](https://img.shields.io/pepy/dt/kinfer-ai)](https://pepy.tech/project/kinfer-ai)
 [![Downloads a month](https://img.shields.io/pypi/dm/kinfer-ai)](https://pypistats.org/packages/kinfer-ai)
 [![GitHub downloads](https://img.shields.io/github/downloads/LocalKinAI/kinfer/total)](https://github.com/LocalKinAI/kinfer/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
