@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.2 — 2026-11-05
 
 ### Added — Ollama's MLX models, NVFP4 among them, read where they lie
 
