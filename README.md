@@ -88,6 +88,16 @@ about one of them, after kinfer is in place; `kinfer version` says whether it is
 and `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1` before `brew install` skips the
 check that raised it.
 
+Or with pip, into whatever Python environment you work in (`kinfer` on PyPI is
+another project, so the package is `kinfer-ai`; the command is still `kinfer`):
+
+```bash
+pip install kinfer-ai
+```
+
+The wheel holds the same release binary, for macOS 26 on Apple Silicon, and
+`pip install -U kinfer-ai` upgrades it.
+
 ## Commands
 
 ```bash
