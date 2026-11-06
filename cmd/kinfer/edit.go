@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ type editRecord struct {
 	Made    time.Time `json:"made"`
 	From    string    `json:"from,omitempty"`    // the model whose differing tensors were taken
 	Overlay string    `json:"overlay,omitempty"` // the file the tensors came from
+	Ops     []string  `json:"ops,omitempty"`     // the operations, in the order applied
 	Note    string    `json:"note,omitempty"`
 	Tensors []string  `json:"tensors"`
 }
@@ -37,11 +39,23 @@ func cmdEdit(args []string) error {
 	from := fs.String("from", "", "take the tensors that differ from this model (another copy of the base's architecture)")
 	overlay := fs.String("overlay", "", "take the tensors in this .safetensors file, written by anything (a Python script, say)")
 	note := fs.String("note", "", "a line saying what the edit is, kept in its edit.json")
+	mix := fs.String("mix", "", "MODEL=ALPHA: the base plus alpha times (that model minus the base); applied first")
+	var scale, zeroNeuron, zeroHead listFlag
+	fs.Var(&scale, "scale", "PATTERN=FACTOR: multiply the tensors whose names match; may be given again")
+	fs.Var(&zeroNeuron, "zero-neuron", "LAYER:I,J,K-M: zero those neurons of the layer's MLP (down_proj columns); may be given again")
+	fs.Var(&zeroHead, "zero-head", "LAYER:H,H: zero those heads of the layer's attention (output projection columns); may be given again")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 2 || (*from == "") == (*overlay == "") {
-		return fmt.Errorf("usage: kinfer edit (-from <model> | -overlay <file.safetensors>) [-note text] <base> <new-name>")
+	ops := *mix != "" || len(scale)+len(zeroNeuron)+len(zeroHead) > 0
+	modes := 0
+	for _, on := range []bool{*from != "", *overlay != "", ops} {
+		if on {
+			modes++
+		}
+	}
+	if fs.NArg() != 2 || modes != 1 {
+		return fmt.Errorf("usage: kinfer edit (-from <model> | -overlay <file> | -mix/-scale/-zero-neuron/-zero-head ...) [-note text] <base> <new-name>")
 	}
 	st, err := store.Open()
 	if err != nil {
@@ -116,6 +130,53 @@ func cmdEdit(args []string) error {
 		}
 		if len(changed) == 0 {
 			return fmt.Errorf("%s and %s have the same weights", *from, fs.Arg(0))
+		}
+	case ops:
+		cfg, err := mlxmodel.ReadQwen35Config(baseDir)
+		if err != nil {
+			return err
+		}
+		e := newEditOps(base, cfg)
+		if *mix != "" {
+			m, a, ok := strings.Cut(*mix, "=")
+			alpha, perr := strconv.ParseFloat(a, 64)
+			if !ok || perr != nil {
+				return fmt.Errorf("-mix %q: want MODEL=ALPHA", *mix)
+			}
+			otherDir, err := st.Resolve(m)
+			if err != nil {
+				return err
+			}
+			other, err := openWeights(otherDir)
+			if err != nil {
+				return err
+			}
+			defer other.close()
+			if err := e.mix(other, alpha); err != nil {
+				return err
+			}
+			rec.Ops = append(rec.Ops, "-mix "+otherDir+"="+a)
+		}
+		for _, op := range []struct {
+			flag  string
+			specs []string
+			apply func(string) error
+		}{{"-scale", scale, e.scale}, {"-zero-neuron", zeroNeuron, e.zeroNeurons}, {"-zero-head", zeroHead, e.zeroHead}} {
+			for _, spec := range op.specs {
+				if err := op.apply(spec); err != nil {
+					return err
+				}
+				rec.Ops = append(rec.Ops, op.flag+" "+spec)
+			}
+		}
+		if changed, err = e.changed(); err != nil {
+			return err
+		}
+		if len(changed) == 0 {
+			return fmt.Errorf("those operations leave %s as it was", fs.Arg(0))
+		}
+		for _, t := range changed {
+			size += int64(len(t.Data))
 		}
 	default:
 		ov, err := safetensors.Open(*overlay)

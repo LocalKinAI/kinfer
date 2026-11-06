@@ -14,7 +14,8 @@ import (
 //
 // The stages and their order are llama.cpp's chain as internal/sampling
 // builds it, so a model samples the same way on either backend: the repeat
-// penalty over the row's last RepeatLastN generated tokens, top-k, top-p over
+// and presence penalties over the row's last RepeatLastN generated tokens
+// (history holds just those, or for -1 every distinct one), top-k, top-p over
 // the probabilities at temperature 1, then temperature, then a draw. Rows
 // that share their parameters are sampled together.
 func sampleRows(logits mlx.Array, params []sampling.Params, history [][]int32, rngs []*rand.Rand) []int32 {
@@ -72,8 +73,9 @@ func sampleGraph(logits mlx.Array, params []sampling.Params, history [][]int32, 
 	return mlx.Take(mlx.Concatenate(0, picks...), mlx.FromInt32(inv, B), 0)
 }
 
-// penalize applies llama.cpp's repeat penalty: a recently generated token's
-// logit is divided by the penalty when positive and multiplied when negative.
+// penalize applies llama.cpp's penalties: a recently generated token's logit
+// is divided by the repeat penalty when positive and multiplied when
+// negative, then lowered by the presence penalty.
 func penalize(lg mlx.Array, params []sampling.Params, history [][]int32) mlx.Array {
 	B := len(params)
 	n := 0
@@ -87,6 +89,7 @@ func penalize(lg mlx.Array, params []sampling.Params, history [][]int32) mlx.Arr
 	}
 	idx := make([]int32, B*n)
 	pen := make([]float32, B)
+	pres := make([]float32, B)
 	for r, p := range params {
 		h := history[r]
 		k := 0
@@ -95,7 +98,10 @@ func penalize(lg mlx.Array, params []sampling.Params, history [][]int32) mlx.Arr
 		}
 		pen[r] = 1
 		if k > 0 {
-			pen[r] = p.RepeatPenalty
+			if p.RepeatPenalty > 0 {
+				pen[r] = p.RepeatPenalty
+			}
+			pres[r] = p.PresencePenalty
 		}
 		recent := h[len(h)-k:]
 		for j := 0; j < n; j++ {
@@ -110,12 +116,11 @@ func penalize(lg mlx.Array, params []sampling.Params, history [][]int32) mlx.Arr
 	p := mlx.FromFloat32(pen, B, 1)
 	got := mlx.TakeAlongAxis(lg, ids, 1)
 	adj := mlx.Where(mlx.Greater(got, mlx.Scalar(0)), mlx.Divide(got, p), mlx.Multiply(got, p))
+	adj = mlx.Subtract(adj, mlx.FromFloat32(pres, B, 1))
 	return mlx.PutAlongAxis(lg, ids, adj, 1)
 }
 
-func on(p sampling.Params) bool {
-	return p.RepeatPenalty != 1 && p.RepeatPenalty > 0 && p.RepeatLastN != 0
-}
+func on(p sampling.Params) bool { return sampling.PenaltiesOn(p) }
 
 // lastN is how much history the penalty reads: RepeatLastN, or all of it for
 // -1 (llama.cpp's "the whole context").

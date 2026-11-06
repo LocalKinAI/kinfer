@@ -503,6 +503,24 @@ func (m *Qwen35) Forward(tokens [][]int32, cache *Qwen35Cache, trace func(layer 
 // recorded while the GPU still runs this one, which is how decoding keeps the
 // GPU busy. Failed ops panic with *mlx.Error.
 func (m *Qwen35) Step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int, h mlx.Array)) mlx.Array {
+	return m.step(tokens, cache, trace, false)
+}
+
+// Logits reads tokens from the start and returns the logits at every
+// position, [len(tokens), vocab], evaluated: what the model predicts after
+// each token, for comparing two models' predictions on the same text.
+func (m *Qwen35) Logits(tokens []int32) (logits mlx.Array, err error) {
+	defer mlx.Recover(&err)
+	c := m.NewCache()
+	defer c.Free()
+	ids := mlx.FromInt32(tokens, 1, len(tokens))
+	logits = m.step(ids, c, nil, true)
+	ids.Free()
+	mlx.Eval(logits)
+	return logits, nil
+}
+
+func (m *Qwen35) step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int, h mlx.Array), every bool) mlx.Array {
 	s := tokens.Shape()
 	B, L := s[0], s[1]
 	scope := mlx.NewScope()
@@ -526,9 +544,12 @@ func (m *Qwen35) Step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int
 			trace(i, h)
 		}
 	}
-	h = mlx.Slice(h, []int{0, L - 1, 0}, []int{B, L, m.Config.HiddenSize})
+	rows := B * L
+	if !every {
+		h, rows = mlx.Slice(h, []int{0, L - 1, 0}, []int{B, L, m.Config.HiddenSize}), B
+	}
 	h = mlx.RMSNorm(h, m.norm, m.Config.RMSNormEps)
-	logits := mlx.Reshape(linear(h, m.head()), B, m.Config.VocabSize)
+	logits := mlx.Reshape(linear(h, m.head()), rows, m.Config.VocabSize)
 
 	cache.Offset += L
 	scope.Keep(logits)

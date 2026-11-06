@@ -105,6 +105,21 @@ type job struct {
 
 	// checkpoints are where the prompt is pooled as it is read.
 	checkpoints []checkpoint
+
+	// distinct is every token the reply has used, each once, for penalties
+	// over the whole reply: they ask only whether a token was seen, and the
+	// whole reply runs to tens of thousands of tokens a step.
+	distinct []int32
+	seen     map[int32]bool
+}
+
+// history is what the penalties read: the reply so far, or for a window of
+// the whole reply its distinct tokens.
+func (j *job) history() []int32 {
+	if j.params.RepeatLastN < 0 {
+		return j.distinct
+	}
+	return j.gen
 }
 
 // Open loads the model in dir.
@@ -598,7 +613,7 @@ func (e *Engine) step(b *mlxmodel.Qwen35Batch, rows []*job, in mlx.Array) (next 
 		if j == nil {
 			j = model
 		}
-		params[r], hist[r], rngs[r] = j.params.Params, j.gen, j.rng
+		params[r], hist[r], rngs[r] = j.params.Params, j.history(), j.rng
 	}
 	next = sampleGraph(logits, params, hist, rngs)
 	s.Keep(next)
@@ -614,7 +629,7 @@ func (e *Engine) sample(logits mlx.Array, rows []*job) (toks []int32, err error)
 	hist := make([][]int32, len(rows))
 	rngs := make([]*rand.Rand, len(rows))
 	for r, j := range rows {
-		params[r], hist[r], rngs[r] = j.params.Params, j.gen, j.rng
+		params[r], hist[r], rngs[r] = j.params.Params, j.history(), j.rng
 	}
 	return sampleRows(logits, params, hist, rngs), nil
 }
@@ -632,6 +647,13 @@ func (e *Engine) accept(j *job, tok int32) bool {
 	}
 	j.gen = append(j.gen, tok)
 	j.last = tok
+	if j.params.RepeatLastN < 0 && !j.seen[tok] {
+		if j.seen == nil {
+			j.seen = map[int32]bool{}
+		}
+		j.seen[tok] = true
+		j.distinct = append(j.distinct, tok)
+	}
 	e.evalTok.Add(1)
 	j.out = append(j.out, e.tok.Bytes([]int32{tok})...)
 

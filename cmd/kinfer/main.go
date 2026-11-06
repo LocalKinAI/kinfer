@@ -39,7 +39,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer uninstall             stop it and remove the service
   kinfer fit                   what this machine can actually run
   kinfer can-run <hf-repo>     whether a model on Hugging Face will run here
-  kinfer edit -from <model> <base> <name>   an edited model: the base's files, and the tensors that differ
+  kinfer edit <op> <base> <name>  an edited model: -from, -mix, -scale, -zero-neuron, -zero-head; the base is left as it is
   kinfer eval <model> <set>    run a set of problems many at once and grade the replies
   kinfer eval -compare <a> <b> two runs side by side: what each got right, and whether it is chance
   kinfer version               this build, and the llama.cpp inside it

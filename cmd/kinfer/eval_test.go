@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"testing"
 
 	"github.com/LocalKinAI/kinfer/internal/safetensors"
@@ -117,5 +120,46 @@ func TestEditFromKeepsOnlyWhatDiffers(t *testing.T) {
 	}
 	if err := cmdEdit([]string{"-from", "base", "base", "same"}); err == nil {
 		t.Error("an edit that changes nothing was made")
+	}
+}
+
+// A subset is the same every time, whatever order the set lists its problems
+// in, and shares itself among the levels while each has problems left.
+func TestPickSubset(t *testing.T) {
+	var probs []problem
+	for i := 0; i < 50; i++ {
+		lv := float64(1 + i%5)
+		if i >= 45 {
+			lv = 6 // a level of only five
+		}
+		probs = append(probs, problem{id: fmt.Sprintf("p%d", i), level: lv})
+	}
+	a := pickSubset(probs, 30)
+	rev := append([]problem(nil), probs...)
+	slices.Reverse(rev)
+	b := pickSubset(rev, 30)
+	ids := func(ps []problem) []string {
+		var out []string
+		for _, p := range ps {
+			out = append(out, p.id)
+		}
+		sort.Strings(out)
+		return out
+	}
+	if !slices.Equal(ids(a), ids(b)) {
+		t.Errorf("the subset depends on the set's order: %v vs %v", ids(a), ids(b))
+	}
+	per := map[any]int{}
+	for _, p := range a {
+		per[p.level]++
+	}
+	// Six levels share 30: five each.
+	for lv, k := range per {
+		if k != 5 {
+			t.Errorf("level %v has %d of the subset, want 5: %v", lv, k, per)
+		}
+	}
+	if got := pickSubset(probs, 100); len(got) != len(probs) {
+		t.Errorf("a subset larger than the set is %d problems", len(got))
 	}
 }

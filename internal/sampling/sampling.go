@@ -39,8 +39,14 @@ type Params struct {
 	// that natural repetition ("the … the") still survives.
 	RepeatPenalty float32
 
-	// RepeatLastN is how many recent tokens the penalty considers.
+	// RepeatLastN is how many recent tokens the penalties consider; -1 is
+	// every token of the reply.
 	RepeatLastN int
+
+	// PresencePenalty is subtracted from the logit of every token seen in
+	// those, however often: vLLM's and OpenAI's presence_penalty, which keeps a
+	// small model from going round in the same few lines. Zero disables.
+	PresencePenalty float32
 
 	// Seed makes a run reproducible. Zero picks a random seed.
 	Seed int64
@@ -58,6 +64,11 @@ func DefaultParams() Params {
 	}
 }
 
+// PenaltiesOn reports whether p asks for a repeat or presence penalty.
+func PenaltiesOn(p Params) bool {
+	return p.RepeatLastN != 0 && (p.RepeatPenalty != 1 && p.RepeatPenalty > 0 || p.PresencePenalty != 0)
+}
+
 // Sampler draws tokens and remembers what it has drawn, so the repetition
 // penalty has history to work with.
 //
@@ -73,11 +84,20 @@ func New(p Params) *Sampler {
 	chain := llama.NewSamplerChain()
 
 	// Penalties first, so later stages see the adjusted logits.
-	if p.RepeatPenalty != 1 && p.RepeatPenalty > 0 && p.RepeatLastN != 0 {
+	if PenaltiesOn(p) {
+		// llama.cpp takes a negative window for none; -1 means the whole reply.
+		lastN := int32(p.RepeatLastN)
+		if lastN < 0 {
+			lastN = 1 << 16
+		}
+		repeat := p.RepeatPenalty
+		if repeat <= 0 {
+			repeat = 1
+		}
 		llama.SamplerChainAdd(chain, llama.SamplerPenalties(
-			int32(p.RepeatLastN), p.RepeatPenalty,
+			lastN, repeat,
 			0, // frequency penalty: off, as it is in Ollama's defaults
-			0, // presence penalty: likewise
+			p.PresencePenalty,
 		))
 	}
 

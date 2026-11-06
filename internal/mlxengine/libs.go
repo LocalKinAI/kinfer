@@ -52,6 +52,11 @@ func LibDir() string {
 	return filepath.Join(home, ".kinfer", "mlx", mlxLibs.Version)
 }
 
+// Libraries returns the directory of the MLX libraries, fetching them first
+// if this machine has never had them, for a caller that uses MLX without an
+// Engine.
+func Libraries() (string, error) { return ensureLibs() }
+
 // ensureLibs returns the library directory, fetching the libraries first if
 // this machine has never had them.
 func ensureLibs() (string, error) {
