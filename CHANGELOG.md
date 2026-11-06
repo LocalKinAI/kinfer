@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.3 — 2026-11-06
 
 ### Added — drafting with the MTP head, for MLX models that carry one
 
