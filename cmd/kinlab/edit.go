@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ type editRecord struct {
 func cmdEdit(args []string) error {
 	fs := flag.NewFlagSet("edit", flag.ExitOnError)
 	from := fs.String("from", "", "take the tensors that differ from this model (another copy of the base's architecture)")
+	only := fs.String("only", "", "with -from or -mix, take only the tensors whose names match this pattern")
 	overlay := fs.String("overlay", "", "take the tensors in this .safetensors file, written by anything (a Python script, say)")
 	note := fs.String("note", "", "a line saying what the edit is, kept in its edit.json")
 	mix := fs.String("mix", "", "MODEL=ALPHA: the base plus alpha times (that model minus the base); applied first")
@@ -55,7 +57,7 @@ func cmdEdit(args []string) error {
 		}
 	}
 	if fs.NArg() != 2 || modes != 1 {
-		return fmt.Errorf("usage: kinfer edit (-from <model> | -overlay <file> | -mix/-scale/-zero-neuron/-zero-head ...) [-note text] <base> <new-name>")
+		return fmt.Errorf("usage: kinlab edit (-from <model> | -overlay <file> | -mix/-scale/-zero-neuron/-zero-head ...) [-note text] <base> <new-name>")
 	}
 	st, err := store.Open()
 	if err != nil {
@@ -66,7 +68,7 @@ func cmdEdit(args []string) error {
 		return err
 	}
 	if !mlxengine.IsModelDir(baseDir) {
-		return fmt.Errorf("%s is no directory of safetensors; kinfer edits the models it serves on MLX", fs.Arg(0))
+		return fmt.Errorf("%s is no directory of safetensors; kinlab edits the models kinfer serves on MLX", fs.Arg(0))
 	}
 	if _, err := os.Stat(filepath.Join(baseDir, mlxmodel.EditFile)); err == nil {
 		return fmt.Errorf("%s is itself an edit; edit the model it was made from", fs.Arg(0))
@@ -87,6 +89,18 @@ func cmdEdit(args []string) error {
 	defer base.close()
 
 	rec := editRecord{Base: filepath.Base(baseDir), BaseDir: baseDir, Made: time.Now().UTC(), Note: *note}
+	take := func(string) bool { return true }
+	if *only != "" {
+		if *from == "" && *mix == "" {
+			return fmt.Errorf("-only goes with -from or -mix")
+		}
+		re, err := regexp.Compile(*only)
+		if err != nil {
+			return fmt.Errorf("-only: %w", err)
+		}
+		take = re.MatchString
+		rec.Ops = append(rec.Ops, "-only "+*only)
+	}
 	var changed []safetensors.Tensor
 	var size int64
 	switch {
@@ -108,7 +122,7 @@ func cmdEdit(args []string) error {
 		}
 		for _, n := range base.names() {
 			oi, ok := other.info(n)
-			if !ok {
+			if !ok || !take(n) {
 				continue // a tensor the other copy leaves out, as the base has it
 			}
 			bi, _ := base.info(n)
@@ -152,7 +166,7 @@ func cmdEdit(args []string) error {
 				return err
 			}
 			defer other.close()
-			if err := e.mix(other, alpha); err != nil {
+			if err := e.mix(other, alpha, take); err != nil {
 				return err
 			}
 			rec.Ops = append(rec.Ops, "-mix "+otherDir+"="+a)
@@ -253,13 +267,18 @@ type weights struct {
 	where map[string]*safetensors.File
 }
 
+// openWeights reads a model's tensors: an edited model's are its base's
+// with its edit's in their place, as MLX loads them.
 func openWeights(dir string) (*weights, error) {
 	paths, _ := filepath.Glob(filepath.Join(dir, "*.safetensors"))
 	w := &weights{where: map[string]*safetensors.File{}}
-	for _, p := range paths {
+	for i, p := range paths {
 		if filepath.Base(p) == mlxmodel.EditFile {
-			continue
+			paths = append(append(paths[:i:i], paths[i+1:]...), p)
+			break
 		}
+	}
+	for _, p := range paths {
 		f, err := safetensors.Open(p)
 		if err != nil {
 			w.close()

@@ -188,8 +188,11 @@ func (e *editOps) zeroColumns(name string, groups []int, width, count int) error
 // alpha·(other − base), tensor by tensor where the two differ. 1 is the
 // other's tensors exactly, 0.5 halfway, and past 1 further along the same
 // way.
-func (e *editOps) mix(other *weights, alpha float64) error {
+func (e *editOps) mix(other *weights, alpha float64, take func(string) bool) error {
 	for _, n := range other.names() {
+		if !take(n) {
+			continue
+		}
 		bi, ok := e.base.info(n)
 		oi := other.where[n].Tensors[n]
 		if !ok || bi.Dtype != oi.Dtype || !slices.Equal(bi.Shape, oi.Shape) {
@@ -255,7 +258,7 @@ func elemSize(dtype string) (int, error) {
 	case "F32":
 		return 4, nil
 	}
-	return 0, fmt.Errorf("a %s tensor: kinfer edit changes BF16, F16 and F32 weights, not quantized ones; edit the full-precision model", dtype)
+	return 0, fmt.Errorf("a %s tensor: kinlab edit changes BF16, F16 and F32 weights, not quantized ones; edit the full-precision model", dtype)
 }
 
 // floats decodes a BF16 or F32 tensor.
@@ -274,7 +277,7 @@ func floats(b []byte, dtype string) ([]float32, error) {
 		}
 		return v, nil
 	}
-	return nil, fmt.Errorf("arithmetic on %s weights: kinfer edit computes on BF16 and F32", dtype)
+	return nil, fmt.Errorf("arithmetic on %s weights: kinlab edit computes on BF16 and F32", dtype)
 }
 
 // fromFloats encodes v as dtype, rounding to the nearest BF16, ties to even.

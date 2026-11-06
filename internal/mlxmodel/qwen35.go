@@ -221,7 +221,7 @@ func (m *Qwen35) head() Linear {
 // Face release, or an MLX conversion of one (mlx_lm.convert), quantized or not.
 //
 // EditFile is an edited model's weights that differ from its base's, beside
-// the base's own files (see kinfer edit): loaded last, each of its tensors
+// the base's own files (see kinlab edit): loaded last, each of its tensors
 // takes the place of the base's of the same name.
 const EditFile = "edit.safetensors"
 

@@ -755,7 +755,7 @@ func (p *profile) tick(rows int) {
 
 // Reader renders and tokenizes conversations as an Engine for the model in a
 // directory does, without loading its weights: for reading text with the
-// model directly, as kinfer eval does to see how readily a model ends a reply
+// model directly, as kinlab eval does to see how readily a model ends a reply
 // another wrote.
 type Reader struct {
 	Tok *tokenizer.Tokenizer

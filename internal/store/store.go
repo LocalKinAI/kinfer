@@ -58,7 +58,7 @@ type Model struct {
 	// Format is "gguf", or "safetensors" for a directory.
 	Format string
 
-	// EditOf names the model an edited one was made from (kinfer edit), or
+	// EditOf names the model an edited one was made from (kinlab edit), or
 	// is empty.
 	EditOf string
 

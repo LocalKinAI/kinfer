@@ -73,7 +73,7 @@ type problem struct {
 	level                     any
 }
 
-// tiers are kinfer eval's presets, from seconds to an hour. smoke reads the
+// tiers are kinlab eval's presets, from seconds to an hour. smoke reads the
 // subset's problems with both models and says how far their predictions
 // part, which tells an edit that changed nothing or broke the model from one
 // worth asking questions; quick asks those problems the way full does, but
@@ -97,7 +97,7 @@ var tiers = map[string]map[string]string{
 // the two side by side.
 func cmdEval(args []string) error {
 	fs := flag.NewFlagSet("eval", flag.ExitOnError)
-	compare := fs.Bool("compare", false, "compare two runs: kinfer eval -compare <a.jsonl> <b.jsonl>")
+	compare := fs.Bool("compare", false, "compare two runs: kinlab eval -compare <a.jsonl> <b.jsonl>")
 	tier := fs.String("tier", "", "smoke (seconds: how far the predictions part), ends (a minute or two: how readily it ends the replies the base's full tier ran out on), quick (minutes: 100 problems, thinking up to 8192 tokens), or full (an hour: all of them, up to 32768)")
 	window := fs.Int("window", 8192, "with -tier ends, how many tokens of each reply are read")
 	traces := fs.Int("traces", 30, "with -tier ends, how many of the replies that ran out are read (0: all)")
@@ -121,12 +121,12 @@ func cmdEval(args []string) error {
 	}
 	if *compare {
 		if fs.NArg() != 2 {
-			return fmt.Errorf("usage: kinfer eval -compare <a.jsonl> <b.jsonl>")
+			return fmt.Errorf("usage: kinlab eval -compare <a.jsonl> <b.jsonl>")
 		}
 		return compareRuns(fs.Arg(0), fs.Arg(1))
 	}
 	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: kinfer eval [-tier smoke|quick|full] [flags] <model> <set.jsonl>   (problems with \"problem\" and \"answer\")")
+		return fmt.Errorf("usage: kinlab eval [-tier smoke|quick|full] [flags] <model> <set.jsonl>   (problems with \"problem\" and \"answer\")")
 	}
 	if *tier != "" {
 		preset, ok := tiers[*tier]
@@ -331,7 +331,7 @@ func runEval(path string, probs []problem, settings evalRun, out string, n int) 
 	params := engine.GenParams{
 		Params: sampling.Params{Temperature: float32(run.Temp), TopP: float32(run.TopP), TopK: run.TopK, Seed: run.Seed,
 			RepeatPenalty: float32(run.Repeat), RepeatLastN: run.LastN, PresencePenalty: float32(run.Presence)},
-		MaxTokens: run.MaxTokens, NoThink: !run.Think,
+		MaxTokens: run.MaxTokens, NoThink: !run.Think, Think: run.Think,
 	}
 	if params.TopP == 0 {
 		params.TopP = 1

@@ -1,6 +1,6 @@
 // Package safetensors reads and writes the safetensors format in plain Go: an
 // 8-byte little-endian header length, a JSON header naming each tensor's
-// dtype, shape and byte range, then the bytes. It is for kinfer edit, which
+// dtype, shape and byte range, then the bytes. It is for kinlab edit, which
 // compares and rewrites weights without a GPU; models are loaded by MLX.
 package safetensors
 

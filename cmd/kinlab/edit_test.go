@@ -92,6 +92,37 @@ func TestEditOperations(t *testing.T) {
 		}
 	}
 
+	// -only takes the other model's tensors that match, and leaves the rest.
+	tinyModel(t, st, "two", []float32{3, 2, 1, 8, 5, 2})
+	two := filepath.Join(st.Root(), "two", "model.safetensors")
+	tf, _ := safetensors.Open(two)
+	var all []safetensors.Tensor
+	for _, n := range tf.Names() {
+		b, _ := tf.Read(n)
+		info := tf.Tensors[n]
+		if n == p+"3.self_attn.o_proj.weight" {
+			b = bf16(8, 7, 6, 5, 4, 3, 2, 1)
+		}
+		all = append(all, safetensors.Tensor{Name: n, Dtype: info.Dtype, Shape: info.Shape, Data: b})
+	}
+	tf.Close()
+	safetensors.Write(two, all, nil)
+	if err := cmdEdit([]string{"-from", "two", "-only", `layers\.3\.`, "base", "only3"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEdit(t, st, "only3"); len(got) != 1 || !slices.Equal(got[p+"3.self_attn.o_proj.weight"], []float32{8, 7, 6, 5, 4, 3, 2, 1}) {
+		t.Errorf("-only took %v", got)
+	}
+
+	// An edit read as the other model is its base with its edit in place:
+	// halfway to "halfway" is a quarter of the way to other.
+	if err := cmdEdit([]string{"-mix", "halfway=0.5", "base", "quarter"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEdit(t, st, "quarter")[p+"0.mlp.down_proj.weight"]; !slices.Equal(got, []float32{1.5, 2, 2.5, 5, 5, 5}) {
+		t.Errorf("halfway to an edit took %v", got)
+	}
+
 	// All the way to the other model is the other model, byte for byte.
 	if err := cmdEdit([]string{"-from", "other", "base", "from"}); err != nil {
 		t.Fatal(err)
