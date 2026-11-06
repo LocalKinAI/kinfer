@@ -205,7 +205,7 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p engine.Gen
 			return "", engine.Stats{}, errors.New("pictures are not supported by the MLX backend yet")
 		}
 	}
-	th := chat.Thinking{Off: p.NoThink, Effort: p.Effort}
+	th := chat.Thinking{Off: p.NoThink, On: p.Think, Effort: p.Effort}
 	prompt := e.tok.Encode(e.tpl.RenderWith(msgs, p.Tools, th), true)
 	j := &job{ctx: ctx, prompt: prompt, params: p, frags: make(chan string, 1<<16), done: make(chan struct{})}
 	if e.pool != nil {
@@ -279,7 +279,7 @@ func (e *Engine) checkpoints(msgs []chat.Message, p engine.GenParams, th chat.Th
 
 // CountTokens is how many tokens msgs render to.
 func (e *Engine) CountTokens(msgs []chat.Message, p engine.GenParams) (int, error) {
-	th := chat.Thinking{Off: p.NoThink, Effort: p.Effort}
+	th := chat.Thinking{Off: p.NoThink, On: p.Think, Effort: p.Effort}
 	return len(e.tok.Encode(e.tpl.RenderWith(msgs, p.Tools, th), true)), nil
 }
 
@@ -783,7 +783,7 @@ func NewReader(dir string) (*Reader, error) {
 // wrote after it. A reply that opens with the <think> the prompt already
 // ends in, as an Engine's do, is read without it.
 func (r *Reader) Reply(msgs []chat.Message, think bool, reply string) (prompt, written []int32) {
-	th := chat.Thinking{Off: !think}
+	th := chat.Thinking{Off: !think, On: think}
 	if r.tpl.OpensThink(th) {
 		reply = strings.TrimPrefix(reply, "<think>")
 	}

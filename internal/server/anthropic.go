@@ -301,6 +301,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		params.Tools = anthropicTools(req.Tools)
 	}
 	params.NoThink = req.Thinking != nil && req.Thinking.Type == "disabled"
+	params.Think = req.Thinking != nil && req.Thinking.Type != "" && req.Thinking.Type != "disabled"
 	if req.Temperature != nil {
 		params.Temperature = float32(*req.Temperature)
 	}
@@ -482,6 +483,7 @@ func (s *Server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 		params.Tools = anthropicTools(req.Tools)
 	}
 	params.NoThink = req.Thinking != nil && req.Thinking.Type == "disabled"
+	params.Think = req.Thinking != nil && req.Thinking.Type != "" && req.Thinking.Type != "disabled"
 	n, err := eng.CountTokens(msgs, params)
 	if err != nil {
 		status, kind := http.StatusInternalServerError, "api_error"

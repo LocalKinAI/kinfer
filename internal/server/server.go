@@ -440,6 +440,11 @@ func thinkOff(raw json.RawMessage) bool {
 	return json.Unmarshal(raw, &s) == nil && s == "false"
 }
 
+// thinkOn reports a caller that asked for thinking in so many words: true,
+// or a level. Saying nothing leaves it to the model's default; see
+// chat.Thinking.
+func thinkOn(raw json.RawMessage) bool { return len(raw) > 0 && wantThinking(raw) }
+
 // wantThinking reports whether a reasoning model's working out goes back to the
 // caller, in its own field — message.thinking here, reasoning and
 // reasoning_content in the OpenAI dialect — never mixed into the reply.
@@ -615,6 +620,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	params := applyOllamaOptions(engine.DefaultGenParams(), req.Options)
 	params.Tools = req.Tools
 	params.NoThink = thinkOff(req.Think)
+	params.Think = thinkOn(req.Think)
 	params.Effort = thinkLevel(req.Think)
 
 	if len(req.Tools) > 0 && eng.ToolFormat() == tools.None {
@@ -981,13 +987,14 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	params := engine.DefaultGenParams()
 	params.Tools = req.Tools
 	params.NoThink = thinkOff(req.Think)
+	params.Think = thinkOn(req.Think)
 	params.Effort = thinkLevel(req.Think)
 	switch req.ReasoningEffort {
 	case "":
 	case "none":
-		params.NoThink = true
+		params.NoThink, params.Think = true, false
 	default:
-		params.Effort = req.ReasoningEffort
+		params.Effort, params.Think = req.ReasoningEffort, true
 	}
 	if req.Temperature != nil {
 		params.Temperature = float32(*req.Temperature)

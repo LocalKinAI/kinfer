@@ -226,6 +226,65 @@ func TestNoThinkSuffixComesFromTheTemplate(t *testing.T) {
 	}
 }
 
+// Qwen's templates open the think block in the prompt, '<think>\n', and the
+// model thinks on from there. kinfer adds the opener when the caller asks to
+// think, or says nothing to a template that thinks by default, as Ollama
+// does; a reply rendered so starts inside the block.
+func TestThinkFollowsTheTemplate(t *testing.T) {
+	for _, tmpl := range []string{
+		// Qwen3.8: thinks unless told not to.
+		`{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}{%- else %}{{- '<think>\n' }}{%- endif %}`,
+		// Qwen3.5: thinks only when told to.
+		`{%- if enable_thinking is defined and enable_thinking is true %}{{- '<think>\n' }}{%- else %}{{- '<think>\n\n</think>\n\n' }}{%- endif %}`,
+	} {
+		if got := thinkOnSuffix(tmpl); got != "<think>\n" {
+			t.Errorf("thinkOnSuffix = %q for %s", got, tmpl)
+		}
+	}
+	if got := thinkOnSuffix(`{{ '<think>\n\n</think>\n\n' }} enable_thinking`); got != "" {
+		t.Errorf("an empty think block alone was read as an opener: %q", got)
+	}
+
+	msgs := []Message{{Role: "user", Content: "u"}}
+	const open, closed = "<think>\n", "<think>\n\n</think>\n\n"
+	for _, c := range []struct {
+		template string
+		th       Thinking
+		suffix   string
+	}{
+		// Qwen3.8 thinks unless told not to.
+		{"qwen3.8", Thinking{}, open},
+		{"qwen3.8", Thinking{On: true}, open},
+		{"qwen3.8", Thinking{Off: true}, closed},
+		// Qwen3.5 thinks only when told to.
+		{"qwen3.5", Thinking{}, closed},
+		{"qwen3.5", Thinking{On: true}, open},
+		{"qwen3.5", Thinking{Off: true}, closed},
+	} {
+		tp := &Template{Name: "gguf", render: chatml.render, noThink: closed, thinkOn: open,
+			thinksByDefault: c.template == "qwen3.8"}
+		plain := tp.Render(msgs, nil)
+		if got := tp.RenderWith(msgs, nil, c.th); got != plain+c.suffix {
+			t.Errorf("%s %+v rendered %q, want %q", c.template, c.th, got, plain+c.suffix)
+		}
+		if got, want := tp.OpensThink(c.th), c.suffix == open; got != want {
+			t.Errorf("%s %+v: OpensThink = %v, want %v", c.template, c.th, got, want)
+		}
+	}
+	// The tails of the two templates, as the GGUFs carry them; Qwen3.8's asks
+	// about enable_thinking earlier for its thinking instructions too.
+	qwen38 := `{%- if enable_thinking is undefined or enable_thinking is true %} instructions {%- endif %}
+{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}
+    {%- else %}{{- '<think>\n' }}{%- endif %}{%- endif %}`
+	qwen35 := `{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is true %}{{- '<think>\n' }}
+    {%- else %}{{- '<think>\n\n</think>\n\n' }}{%- endif %}{%- endif %}`
+	if !thinksByDefault(qwen38) || thinksByDefault(qwen35) {
+		t.Errorf("thinksByDefault: Qwen3.8 %v (want true), Qwen3.5 %v (want false)", thinksByDefault(qwen38), thinksByDefault(qwen35))
+	}
+}
+
 // RenderNoThink must change nothing for a model without the switch, and for
 // one with it must end the prompt inside a closed, empty think block — so the
 // model's first token is the answer, not the start of its reasoning.

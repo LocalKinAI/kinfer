@@ -20,6 +20,7 @@ package chat
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/LocalKinAI/kinfer/internal/llama"
@@ -47,8 +48,14 @@ type Message struct {
 // Thinking is how a reply should reason: not at all, or with an effort level
 // ("low", "high", "max", or a number from 1 to 100) for the models that take
 // one. The zero value is a reasoning model's default.
+//
+// On is thinking the caller asked for in so many words, as Off is asking for
+// none. A caller that says neither gets the model's own default, as Ollama
+// gives it: a template whose prompt opens the think block — Qwen's, ending in
+// '<think>\n' — thinks unless its default is not to (see thinkOnSuffix).
 type Thinking struct {
 	Off    bool
+	On     bool
 	Effort string
 }
 
@@ -98,6 +105,12 @@ type Template struct {
 	// opensThink says the prompt itself opens the think block when thinking
 	// is on, so the reply begins inside it with no <think> of its own.
 	opensThink bool
+
+	// thinkOn is what the prompt ends with when the model thinks, for a
+	// template that opens the think block itself, and thinksByDefault says
+	// it does so when nobody said (see thinkOnSuffix).
+	thinkOn         string
+	thinksByDefault bool
 }
 
 // RenderWith renders the conversation for a reply that reasons as th says.
@@ -108,13 +121,21 @@ func (t *Template) RenderWith(msgs []Message, ts []tools.Tool, th Thinking) stri
 	if th.Off {
 		return t.RenderNoThink(msgs, ts)
 	}
+	if t.thinkOn != "" {
+		if th.On || t.thinksByDefault {
+			return t.Render(msgs, ts) + t.thinkOn
+		}
+		return t.RenderNoThink(msgs, ts)
+	}
 	return t.Render(msgs, ts)
 }
 
 // OpensThink reports that a reply rendered with th starts inside a think
 // block the prompt opened. Whatever reads the reply must then treat it as
 // thinking until </think>, though no <think> ever arrives.
-func (t *Template) OpensThink(th Thinking) bool { return t.opensThink && !th.Off }
+func (t *Template) OpensThink(th Thinking) bool {
+	return !th.Off && (t.opensThink || t.thinkOn != "" && (th.On || t.thinksByDefault))
+}
 
 // Render builds the prompt, ending in the assistant's opening so the model
 // continues as the assistant rather than inventing another user turn.
@@ -155,6 +176,34 @@ func noThinkSuffix(tmpl string) string {
 	}
 	return ""
 }
+
+// thinkOnSuffix reads how the template has a model think: Qwen's end their
+// prompt in '<think>\n', and the model thinks on from there with no <think>
+// of its own. llama_chat_apply_template runs no Jinja and leaves the opener
+// out, and without it Qwen3.8-27B answered with no thinking even when asked
+// to think. Qwen3.8's open it unless told enable_thinking is false; Qwen3.5's
+// only when told it is true (thinkOptIn), and otherwise close an empty block.
+func thinkOnSuffix(tmpl string) string {
+	if strings.Contains(tmpl, "enable_thinking") &&
+		(strings.Contains(tmpl, `'<think>\n'`) || strings.Contains(tmpl, `"<think>\n"`)) {
+		return "<think>\n"
+	}
+	return ""
+}
+
+// thinksByDefault reads the template's default where it opens the think
+// block, after its last add_generation_prompt: Qwen3.5's open it only when
+// enable_thinking is defined and true. Earlier, Qwen3.8's ask "enable_thinking
+// is undefined or enable_thinking is true" for their thinking instructions,
+// which says nothing about the opener.
+func thinksByDefault(tmpl string) bool {
+	if i := strings.LastIndex(tmpl, "add_generation_prompt"); i >= 0 {
+		tmpl = tmpl[i:]
+	}
+	return !thinkOptIn.MatchString(tmpl)
+}
+
+var thinkOptIn = regexp.MustCompile(`enable_thinking\s+is\s+defined\s+and\s+enable_thinking\s+is\s+true`)
 
 // fold rewrites a conversation into plain {role, content} turns.
 //
@@ -335,9 +384,11 @@ func FromTemplate(tmpl, path string) *Template {
 	}
 
 	return &Template{
-		Name:    "gguf",
-		toolFmt: tools.Detect(tmpl),
-		noThink: noThinkSuffix(tmpl),
+		Name:            "gguf",
+		toolFmt:         tools.Detect(tmpl),
+		noThink:         noThinkSuffix(tmpl),
+		thinkOn:         thinkOnSuffix(tmpl),
+		thinksByDefault: thinksByDefault(tmpl),
 		// No stop strings. Generation ends on an end-of-generation token, which
 		// llama_vocab_is_eog reports for whatever terminator this model uses —
 		// a surer signal than matching text, and the only one available when

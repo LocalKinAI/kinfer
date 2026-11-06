@@ -174,6 +174,12 @@ type GenParams struct {
 	// second it takes, which with a token budget leaves nothing for the reply.
 	NoThink bool
 
+	// Think is thinking the caller asked for in so many words (think:true, a
+	// reasoning effort, Anthropic's thinking enabled). With neither it nor
+	// NoThink the model thinks as its template does by default, as in Ollama;
+	// see chat.Thinking.
+	Think bool
+
 	// Effort is how hard a reasoning model that takes a budget should think:
 	// "low", "high", "max", or a number from 1 to 100. Empty is the model's
 	// default. Templates without such a budget ignore it.
@@ -188,7 +194,7 @@ type GenParams struct {
 
 // thinking is the reasoning a job asked for, in the form templates take.
 func (p GenParams) thinking() chat.Thinking {
-	return chat.Thinking{Off: p.NoThink, Effort: p.Effort}
+	return chat.Thinking{Off: p.NoThink, On: p.Think, Effort: p.Effort}
 }
 
 // Stats are the token counts and timings for one reply.

@@ -313,6 +313,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		params.Tools = responsesTools(req.Tools)
 	}
 	params.NoThink = req.Reasoning != nil && req.Reasoning.Effort == "none"
+	params.Think = req.Reasoning != nil && req.Reasoning.Effort != "" && req.Reasoning.Effort != "none"
 	if req.Temperature != nil {
 		params.Temperature = float32(*req.Temperature)
 	}
