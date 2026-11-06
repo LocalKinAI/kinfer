@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.1 — 2026-11-05
 
 ### Fixed — two models named but for case were one name
 
