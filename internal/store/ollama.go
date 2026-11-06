@@ -1,9 +1,13 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -71,36 +75,11 @@ func readOllamaManifest(root, manifests, path string) (Model, bool) {
 			MediaType string `json:"mediaType"`
 			Digest    string `json:"digest"`
 			Size      int64  `json:"size"`
+			Name      string `json:"name"`
 		} `json:"layers"`
 	}
 	if json.Unmarshal(raw, &mf) != nil {
 		return Model{}, false
-	}
-
-	// The weights are the layer Ollama calls the model. A cloud entry has none,
-	// which is exactly how it is told apart.
-	var blob, projector string
-	var size int64
-	for _, l := range mf.Layers {
-		path := filepath.Join(root, "blobs", strings.ReplaceAll(l.Digest, ":", "-"))
-		switch {
-		case strings.HasSuffix(l.MediaType, ".image.model") && blob == "":
-			blob, size = path, l.Size
-		case strings.HasSuffix(l.MediaType, ".image.projector"):
-			// A vision model's projector, the mmproj another runtime reads.
-			if _, err := os.Stat(path); err == nil {
-				projector = path
-			}
-		}
-	}
-	// No weights layer is a cloud entry; a zero-byte one is a broken manifest.
-	// Neither is anything kinfer can load.
-	if blob == "" || size == 0 {
-		return Model{}, false
-	}
-	info, err := os.Stat(blob)
-	if err != nil {
-		return Model{}, false // manifest without its blob
 	}
 
 	// manifests/<registry>/<namespace>/<name>/<tag> is Ollama's own name for it,
@@ -118,6 +97,47 @@ func readOllamaManifest(root, manifests, path string) (Model, bool) {
 		name = ns[0] + "/" + name
 	}
 
+	// The weights are the layer Ollama calls the model. A cloud entry has none,
+	// which is exactly how it is told apart — unless it is an MLX model, whose
+	// weights are a layer for each tensor.
+	var blob, projector string
+	var size, tensorBytes int64
+	var tensors, files []namedBlob
+	for _, l := range mf.Layers {
+		path := filepath.Join(root, "blobs", strings.ReplaceAll(l.Digest, ":", "-"))
+		switch {
+		case strings.HasSuffix(l.MediaType, ".image.model") && blob == "":
+			blob, size = path, l.Size
+		case strings.HasSuffix(l.MediaType, ".image.projector"):
+			// A vision model's projector, the mmproj another runtime reads.
+			if _, err := os.Stat(path); err == nil {
+				projector = path
+			}
+		case strings.HasSuffix(l.MediaType, ".image.tensor"):
+			tensors = append(tensors, namedBlob{l.Name, path})
+			tensorBytes += l.Size
+		case strings.HasSuffix(l.MediaType, ".image.json"):
+			files = append(files, namedBlob{l.Name, path})
+		}
+	}
+	if blob == "" && len(tensors) > 0 {
+		dir, err := ollamaMLXDir(name, raw, tensors, files)
+		info, statErr := os.Stat(path)
+		if err != nil || statErr != nil {
+			return Model{}, false
+		}
+		return Model{Name: name, Path: dir, Format: "safetensors", Size: tensorBytes, Modified: info.ModTime(), Source: FromOllama}, true
+	}
+	// No weights layer is a cloud entry; a zero-byte one is a broken manifest.
+	// Neither is anything kinfer can load.
+	if blob == "" || size == 0 {
+		return Model{}, false
+	}
+	info, err := os.Stat(blob)
+	if err != nil {
+		return Model{}, false // manifest without its blob
+	}
+
 	return Model{
 		Name:      name,
 		Path:      blob,
@@ -127,6 +147,113 @@ func readOllamaManifest(root, manifests, path string) (Model, bool) {
 		Source:    FromOllama,
 		Projector: projector,
 	}, true
+}
+
+// namedBlob is a layer of an Ollama manifest that has a name of its own.
+type namedBlob struct{ name, path string }
+
+// OllamaMLXRoot is where kinfer keeps a directory for each of Ollama's MLX
+// models; "" when the machine has no cache directory.
+func OllamaMLXRoot() string {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(cache, "kinfer", "ollama-mlx")
+}
+
+// ollamaMLXDir returns a directory the MLX engine can read for one of
+// Ollama's MLX models, making it first if the manifest is new.
+//
+// Since 0.40 Ollama keeps an MLX model as no single file: its manifest names a
+// blob for each tensor — a safetensors file holding the tensor and, for a
+// quantized weight, its scales — and blobs for config.json, tokenizer.json and
+// the rest by their names. The directory is symbolic links to those blobs
+// under the names they stand for, and the chat template, which Ollama keeps
+// in tokenizer_config.json, written out as chat_template.jinja. Nothing is
+// copied and nothing of Ollama's is touched. A stamp of the manifest says
+// whether the directory is still its own.
+func ollamaMLXDir(name string, manifest []byte, tensors, files []namedBlob) (string, error) {
+	root := OllamaMLXRoot()
+	if root == "" {
+		return "", fmt.Errorf("no cache directory for %s", name)
+	}
+	dir := filepath.Join(root, strings.NewReplacer(":", "_", "/", "_").Replace(name))
+	sum := sha256.Sum256(manifest)
+	stamp := hex.EncodeToString(sum[:])
+	if b, err := os.ReadFile(filepath.Join(dir, ".manifest")); err == nil && string(b) == stamp {
+		return dir, nil
+	}
+
+	tmp := fmt.Sprintf("%s.%d", dir, os.Getpid())
+	os.RemoveAll(tmp)
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+	link := func(file, target string) error {
+		if file == "" || strings.ContainsAny(file, `/\`) || strings.HasPrefix(file, ".") {
+			return fmt.Errorf("%s has a layer named %q", name, file)
+		}
+		return os.Symlink(target, filepath.Join(tmp, file))
+	}
+	for _, t := range tensors {
+		if err := link(t.name+".safetensors", t.path); err != nil {
+			return "", err
+		}
+	}
+	hasTemplate := slices.ContainsFunc(files, func(f namedBlob) bool { return f.name == "chat_template.jinja" })
+	for _, f := range files {
+		if err := link(f.name, f.path); err != nil {
+			return "", err
+		}
+		if f.name == "tokenizer_config.json" && !hasTemplate {
+			if t := chatTemplate(f.path); t != "" {
+				if err := os.WriteFile(filepath.Join(tmp, "chat_template.jinja"), []byte(t), 0o644); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(tmp, ".manifest"), []byte(stamp), 0o644); err != nil {
+		return "", err
+	}
+	os.RemoveAll(dir)
+	if err := os.Rename(tmp, dir); err != nil {
+		// Another kinfer made it at the same moment; theirs will do.
+		if b, rerr := os.ReadFile(filepath.Join(dir, ".manifest")); rerr == nil && string(b) == stamp {
+			return dir, nil
+		}
+		return "", err
+	}
+	return dir, nil
+}
+
+// chatTemplate is the chat template a tokenizer_config.json carries: one
+// string, or the one named default of several.
+func chatTemplate(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var tc struct {
+		ChatTemplate json.RawMessage `json:"chat_template"`
+	}
+	if json.Unmarshal(raw, &tc) != nil {
+		return ""
+	}
+	var one string
+	if json.Unmarshal(tc.ChatTemplate, &one) == nil {
+		return one
+	}
+	var named []struct{ Name, Template string }
+	json.Unmarshal(tc.ChatTemplate, &named)
+	for _, t := range named {
+		if t.Name == "default" {
+			return t.Template
+		}
+	}
+	return ""
 }
 
 // ollamaRoot finds Ollama's model store.

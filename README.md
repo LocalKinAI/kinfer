@@ -119,9 +119,10 @@ What each does, and how serve sizes itself: [docs/serving.md](docs/serving.md).
 
 A model can also be a directory of safetensors as Hugging Face publishes it,
 and kinfer serves it on Apple's MLX: Qwen3.5 dense, at bf16 or MLX 4-bit, such as
-mlx-community's conversions. `kinfer pull mlx-community/Qwen3.8-27B-4bit` fetches
+mlx-community's conversions, or NVFP4. `kinfer pull mlx-community/Qwen3.8-27B-4bit` fetches
 one into the store; from there it is listed, run and served like a GGUF, through
-the same four dialects. The engine is Go over mlx-c, with no cgo and no Python,
+the same four dialects. Ollama's own MLX models (`qwen3.8:27b-mlx`) are listed
+and served where they lie, as its GGUFs are. The engine is Go over mlx-c, with no cgo and no Python,
 and checked against mlx-lm layer by layer. MLX's libraries (78 MB) are fetched
 once, the first time an MLX model loads, and need macOS 26.2.
 

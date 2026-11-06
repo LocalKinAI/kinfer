@@ -136,14 +136,27 @@ func ReadQwen35Config(dir string) (*Qwen35Config, error) {
 
 // Linear is a weight matrix [out, in], plain or quantized the way MLX's
 // QuantizedLinear stores it: packed W, per-group Scales and, in affine mode,
-// Biases.
+// Biases. An NVFP4 weight as NVIDIA's ModelOpt exports it, and Ollama stores
+// it, has a scale of its own besides, Global: the weight is W·Scales·Global.
 type Linear struct {
 	W, Scales, Biases mlx.Array
 	Group, Bits       int
 	Mode              string
+	Global            float32
 }
 
 func (l Linear) quantized() bool { return l.Scales != 0 }
+
+// global applies the weight's own scale to y, a product with it, in float32:
+// rounded to y's bfloat16 first, the scale would be off by as much as 0.4% in
+// every layer. MLX's dequantize takes a global scale too, but means by it the
+// weight's largest value, 2688 times this one.
+func (l Linear) global(y mlx.Array) mlx.Array {
+	if l.Global == 0 {
+		return y
+	}
+	return mlx.Astype(mlx.Multiply(y, mlx.ScalarAs(l.Global, mlx.Float32)), y.Dtype())
+}
 
 func (l Linear) arrays() []mlx.Array {
 	r := []mlx.Array{l.W}
@@ -158,7 +171,7 @@ func (l Linear) arrays() []mlx.Array {
 // linear is x @ w.T.
 func linear(x mlx.Array, w Linear) mlx.Array {
 	if w.quantized() {
-		return mlx.QuantizedMatmul(x, w.W, w.Scales, w.Biases, w.Group, w.Bits, w.Mode)
+		return w.global(mlx.QuantizedMatmul(x, w.W, w.Scales, w.Biases, w.Group, w.Bits, w.Mode))
 	}
 	return mlx.Matmul(x, mlx.T(w.W))
 }
@@ -172,7 +185,7 @@ func (l Linear) rows(ids mlx.Array) mlx.Array {
 	if l.Biases != 0 {
 		b = mlx.Take(l.Biases, ids, 0)
 	}
-	return mlx.Dequantize(mlx.Take(l.W, ids, 0), mlx.Take(l.Scales, ids, 0), b, l.Group, l.Bits, l.Mode)
+	return l.global(mlx.Dequantize(mlx.Take(l.W, ids, 0), mlx.Take(l.Scales, ids, 0), b, l.Group, l.Bits, l.Mode))
 }
 
 type linearAttn struct {
@@ -218,7 +231,8 @@ func (m *Qwen35) head() Linear {
 }
 
 // LoadQwen35 reads config.json and the safetensors files in dir: a Hugging
-// Face release, or an MLX conversion of one (mlx_lm.convert), quantized or not.
+// Face release, or an MLX conversion of one (mlx_lm.convert), quantized or not,
+// or one quantized to NVFP4 as Ollama keeps it.
 //
 // EditFile is an edited model's weights that differ from its base's, beside
 // the base's own files (see kinlab edit): loaded last, each of its tensors
@@ -350,6 +364,20 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 	lin := func(module string) Linear {
 		wk := must(module + ".weight")
 		l := Linear{W: take(wk)}
+		// NVFP4 as ModelOpt exports it and Ollama stores it: 4-bit floats
+		// eight to a uint32, an FP8 scale for each 16 of them, and one scale
+		// for the whole weight.
+		if s, ok := raw[wk+".scale"]; ok {
+			ws, ss := l.W.Shape(), s.Shape()
+			if l.W.Dtype() != mlx.Uint32 || s.Dtype() != mlx.Uint8 || len(ws) != 2 || len(ss) != 2 || ss[1]*16 != ws[1]*8 {
+				panic(&mlx.Error{Msg: fmt.Sprintf("%s is %v %v with a %v %v scale, not NVFP4", wk, l.W.Dtype(), ws, s.Dtype(), ss)})
+			}
+			l.Scales, l.Group, l.Bits, l.Mode = take(wk+".scale"), 16, 4, "nvfp4"
+			if g, ok := raw[wk+".global_scale"]; ok {
+				l.Global = g.Float32s()[0]
+			}
+			return l
+		}
 		base := strings.TrimSuffix(wk, ".weight")
 		if _, ok := raw[base+".scales"]; ok {
 			q := Quantization{GroupSize: 64, Bits: 4, Mode: "affine"}

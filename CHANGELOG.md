@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+### Added — Ollama's MLX models, NVFP4 among them, read where they lie
+
+Ollama 0.40 keeps an MLX model as no single file: its manifest names a blob for
+each tensor, a safetensors file holding it and its scales, and blobs for
+config.json, tokenizer.json and the rest by their names. kinfer listed only
+Ollama's GGUFs, so `kinfer list` did not show one. Now it does (`qwen3.8:27b-mlx
+… ollama, MLX`) and serves it: for each such model kinfer keeps a directory of
+symbolic links to the blobs, under the names they stand for, in
+`~/Library/Caches/kinfer/ollama-mlx`, with the chat template Ollama keeps in
+tokenizer_config.json written out beside them. Nothing is copied, nothing of
+Ollama's is touched, the directory is made again when the manifest changes, and
+`kinfer rm` points at `ollama rm`.
+
+Ollama's are NVIDIA's NVFP4, as ModelOpt exports it: 4-bit floats eight to a
+uint32, an FP8 scale for each 16 and one scale for the whole weight. The MLX
+engine now reads that alongside bf16 and MLX's own 4-bit: MLX's nvfp4 product,
+then the weight's own scale, in float32 (MLX's dequantize takes a global scale
+too, but means by it the weight's largest value, 2688 times the stored one).
+
+Measured on a MacBook Pro (M5 Max), Ollama 0.40.14's qwen3.8:27b-mlx from the
+same blobs, back to back, greedy:
+
+| | Ollama | kinfer |
+|---|---:|---:|
+| decode | 53–99 tok/s, with MTP drafting | 30.2–31.0 tok/s |
+| a 7,753-token prompt | 794 tok/s | 662 tok/s |
+| memory | 20.0 GiB | 21 GB |
+
+The replies are the same answers, word for word for their first 5 to 196
+characters and then in other words, as two engines' rounding makes greedy
+replies part; a misread scale gives no sense at all. Ollama drafts with the
+model's MTP head and kinfer's MLX engine does not yet, which is most of the
+decode difference: 31 tok/s is about what the laptop's memory gives a 27B dense
+model reading every weight once a token.
+
 ## v0.2.1 — 2026-11-05
 
 ### Fixed — two models named but for case were one name

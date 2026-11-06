@@ -591,6 +591,101 @@ func fakeOllama(t *testing.T, root, name string) string {
 	return blob
 }
 
+// An MLX model of Ollama's is a manifest naming a blob for each tensor and
+// for each of its JSON files. kinfer lists it as a directory of links to
+// those blobs, with the chat template written out, made again only when the
+// manifest changes, and never deletes it.
+func TestOllamaMLXModel(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Setenv("OLLAMA_MODELS", root)
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	blob := func(digest, content string, size int64) string {
+		p := filepath.Join(root, "blobs", "sha256-"+digest)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Create(p)
+		if err == nil {
+			_, err = f.WriteString(content)
+		}
+		if err == nil && size > 0 {
+			err = f.Truncate(size)
+		}
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	weight := blob("w", "", 2<<20)
+	blob("c", `{"model_type":"qwen3_5"}`, 0)
+	blob("t", `{}`, 0)
+	blob("tc", `{"chat_template":"{{ messages }}"}`, 0)
+	manifest := filepath.Join(root, "manifests", "registry.ollama.ai", "library", "qwen3.8", "27b-mlx")
+	if err := os.MkdirAll(filepath.Dir(manifest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	layers := `{"mediaType":"application/vnd.ollama.image.tensor","digest":"sha256:w","size":2097152,"name":"model.layers.0.mlp.up_proj.weight"},` +
+		`{"mediaType":"application/vnd.ollama.image.json","digest":"sha256:c","size":24,"name":"config.json"},` +
+		`{"mediaType":"application/vnd.ollama.image.json","digest":"sha256:t","size":2,"name":"tokenizer.json"},` +
+		`{"mediaType":"application/vnd.ollama.image.json","digest":"sha256:tc","size":33,"name":"tokenizer_config.json"}`
+	write := func(layers string) {
+		if err := os.WriteFile(manifest, []byte(`{"layers":[`+layers+`]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	find := func() Model {
+		for _, m := range OllamaModels() {
+			if m.Name == "qwen3.8:27b-mlx" {
+				return m
+			}
+		}
+		t.Fatalf("Ollama's MLX model is not listed: %+v", OllamaModels())
+		return Model{}
+	}
+	write(layers)
+
+	m := find()
+	if m.Format != "safetensors" || m.Source != FromOllama || m.Size != 2<<20 || !strings.HasPrefix(m.Path, OllamaMLXRoot()) {
+		t.Fatalf("listed as %+v", m)
+	}
+	if got, err := os.Readlink(filepath.Join(m.Path, "model.layers.0.mlp.up_proj.weight.safetensors")); err != nil || got != weight {
+		t.Errorf("the tensor's link points at %q, %v; want %s", got, err, weight)
+	}
+	if b, err := os.ReadFile(filepath.Join(m.Path, "config.json")); err != nil || !strings.Contains(string(b), "qwen3_5") {
+		t.Errorf("config.json reads %q, %v", b, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(m.Path, "chat_template.jinja")); err != nil || string(b) != "{{ messages }}" {
+		t.Errorf("chat_template.jinja reads %q, %v", b, err)
+	}
+
+	// Listed again, the directory is the one already made.
+	mark := filepath.Join(m.Path, "mark")
+	if err := os.WriteFile(mark, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if find(); !exists(mark) {
+		t.Error("the directory was made again for the same manifest")
+	}
+	// A new manifest — the model pulled again — makes it again.
+	write(layers + `,{"mediaType":"application/vnd.ollama.image.json","digest":"sha256:t","size":2,"name":"vocab.json"}`)
+	if m2 := find(); exists(mark) || !exists(filepath.Join(m2.Path, "vocab.json")) {
+		t.Error("a changed manifest did not make the directory again")
+	}
+
+	s := newStore(t)
+	s.borrow = true
+	if err := s.Remove("qwen3.8:27b-mlx"); err == nil || !strings.Contains(err.Error(), "ollama rm") {
+		t.Errorf("rm of Ollama's MLX model: %v, want a pointer to ollama rm", err)
+	}
+	if !exists(weight) || !exists(filepath.Join(m.Path, "config.json")) {
+		t.Error("rm took something of Ollama's")
+	}
+}
+
+func exists(path string) bool { _, err := os.Stat(path); return err == nil }
+
 // An Ollama client's bare name is its :latest tag, before any model the name
 // begins — as on the box, where "qwen3.8" also begins two of kinfer's own.
 func TestResolveTakesABareNameAsLatest(t *testing.T) {

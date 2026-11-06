@@ -362,7 +362,7 @@ func (s *Store) Remove(name string) error {
 		// A borrowed model must not be deletable by a kinfer command. That
 		// store belongs to Ollama and is not kinfer's to damage.
 		sep := string(filepath.Separator)
-		if strings.Contains(path, sep+"blobs"+sep) {
+		if r := OllamaMLXRoot(); strings.Contains(path, sep+"blobs"+sep) || r != "" && strings.HasPrefix(path, r+sep) {
 			return fmt.Errorf("%s belongs to Ollama; remove it with `ollama rm %s` instead", name, name)
 		}
 		return fmt.Errorf("%s is outside the model directory; delete it yourself", path)
