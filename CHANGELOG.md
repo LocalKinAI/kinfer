@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — two models named but for case were one name
+
+A name was matched without regard to case, and the first match taken, newest
+first. An MLX directory and a GGUF of the same weights are often named so —
+`kinfer pull mlx-community/Qwen3.5-0.8B-bf16` and `kinfer pull
+ggml-org/Qwen3.5-0.8B-GGUF:BF16` give Qwen3.5-0.8B-bf16 and Qwen3.5-0.8B-BF16 —
+and with both in the store, both names ran the newer one, the other could not be
+run at all, and `kinfer rm` of the older one deleted the newer. A name now means
+the model of exactly that name, and only failing that one named so but for case;
+a name that is two models but for case, and neither exactly, is refused as
+ambiguous, as a prefix already was. A pull of exactly the name, unfinished, is
+that model too: asked for, it says it has not finished, and `rm` takes what
+arrived of it rather than the finished model beside it. A name that matches one
+model but for case finds it as before.
+
 ## v0.2.0 — 2026-11-05
 
 ### Added — MLX: a directory of safetensors served in Go, no Python

@@ -608,6 +608,69 @@ func TestResolveTakesABareNameAsLatest(t *testing.T) {
 	}
 }
 
+// An MLX directory and a GGUF of the same weights can be named but for case.
+// Each name is its own model, whichever is newer, and rm takes the one named;
+// a name that is neither, but for case, is ambiguous.
+func TestNamesThatDifferOnlyInCase(t *testing.T) {
+	s := newStore(t, "Qwen3.5-0.8B-BF16.gguf")
+	dir := writeDir(t, s, "Qwen3.5-0.8B-bf16", "config.json", "tokenizer.json", "model.safetensors")
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "model.safetensors"), later, later); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, want := range map[string]string{"Qwen3.5-0.8B-BF16": "gguf", "Qwen3.5-0.8B-bf16": "safetensors"} {
+		if m, err := s.Lookup(name); err != nil || m.Format != want {
+			t.Errorf("Lookup(%s) = %s %v, want the %s", name, m.Format, err, want)
+		}
+	}
+	if p, err := s.Resolve("Qwen3.5-0.8B-BF16"); err != nil || filepath.Base(p) != "Qwen3.5-0.8B-BF16.gguf" {
+		t.Errorf("Resolve(Qwen3.5-0.8B-BF16) = %q, %v; want the GGUF", p, err)
+	}
+	if p, err := s.Resolve("Qwen3.5-0.8B-bf16"); err != nil || p != dir {
+		t.Errorf("Resolve(Qwen3.5-0.8B-bf16) = %q, %v; want the directory", p, err)
+	}
+	for _, name := range []string{"qwen3.5-0.8b-bf16", "QWEN3.5-0.8B-BF16"} {
+		if _, err := s.Resolve(name); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+			t.Errorf("Resolve(%s): %v, want ambiguous", name, err)
+		}
+		if _, err := s.Lookup(name); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+			t.Errorf("Lookup(%s): %v, want ambiguous", name, err)
+		}
+	}
+
+	if err := s.Remove("Qwen3.5-0.8B-BF16"); err != nil {
+		t.Fatal(err)
+	}
+	if models, _ := s.List(); len(models) != 1 || models[0].Format != "safetensors" {
+		t.Errorf("rm Qwen3.5-0.8B-BF16 left %+v, want only the directory", models)
+	}
+}
+
+// Pulled again under the other case, a model half arrived is that model:
+// asked for, it is unfinished, and rm takes what arrived, not the finished
+// one beside it.
+func TestAnUnfinishedPullNamedButForCase(t *testing.T) {
+	s := newStore(t, "Qwen3.5-0.8B-BF16.gguf")
+	writeDir(t, s, "Qwen3.5-0.8B-bf16", "config.json", "model.safetensors.part")
+
+	if _, err := s.Resolve("Qwen3.5-0.8B-bf16"); err == nil || !strings.Contains(err.Error(), "not finished") {
+		t.Errorf("Resolve of the half-pulled directory: %v, want a not-finished error", err)
+	}
+	if p, err := s.Resolve("Qwen3.5-0.8B-BF16"); err != nil || filepath.Base(p) != "Qwen3.5-0.8B-BF16.gguf" {
+		t.Errorf("Resolve(Qwen3.5-0.8B-BF16) = %q, %v; want the GGUF", p, err)
+	}
+	if err := s.Remove("Qwen3.5-0.8B-bf16"); err != nil {
+		t.Fatal(err)
+	}
+	if models, _ := s.List(); len(models) != 1 || models[0].Name != "Qwen3.5-0.8B-BF16" {
+		t.Errorf("rm of the unfinished directory took the GGUF: %+v", models)
+	}
+	if un, _ := s.Unfinished(); len(un) != 0 {
+		t.Errorf("rm left the unfinished pull: %+v", un)
+	}
+}
+
 // writeDir makes dir in s with the given files, each holding its own name.
 func writeDir(t *testing.T, s *Store, dir string, files ...string) string {
 	t.Helper()

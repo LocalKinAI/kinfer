@@ -237,11 +237,27 @@ func (s *Store) Lookup(name string) (Model, error) {
 	if err != nil {
 		return Model{}, err
 	}
-	lower := strings.ToLower(name)
+	// A name is the model of exactly that name before one that has it but for
+	// case: an MLX directory and a GGUF of the same weights are often named so
+	// (Qwen3.5-0.8B-bf16, Qwen3.5-0.8B-BF16).
 	for _, m := range models {
-		if strings.ToLower(m.Name) == lower {
+		if m.Name == name {
 			return m, nil
 		}
+	}
+	lower := strings.ToLower(name)
+	var folded []Model
+	for _, m := range models {
+		if strings.ToLower(m.Name) == lower {
+			folded = append(folded, m)
+		}
+	}
+	switch len(folded) {
+	case 0:
+	case 1:
+		return folded[0], nil
+	default:
+		return Model{}, fmt.Errorf("%q is ambiguous: %s", name, strings.Join(names(folded), ", "))
 	}
 	// Ollama's own clients accept a bare name for a :latest tag.
 	for _, m := range models {
@@ -269,11 +285,29 @@ func (s *Store) Resolve(name string) (string, error) {
 		return "", err
 	}
 
-	lower := strings.ToLower(name)
+	// Exactly the name first, then the name but for case, as Lookup does; a
+	// pull of exactly the name, unfinished, is that model too.
 	for _, m := range models {
-		if strings.EqualFold(m.Name, name) || strings.EqualFold(filepath.Base(m.Path), name) {
+		if m.Name == name || filepath.Base(m.Path) == name {
 			return m.Path, nil
 		}
+	}
+	if u, ok := s.unfinished(name); ok && u.Name == name {
+		return "", fmt.Errorf("%s has not finished arriving — the kinfer pull that fetched it goes on when run again", u.Name)
+	}
+	lower := strings.ToLower(name)
+	var folded []Model
+	for _, m := range models {
+		if strings.EqualFold(m.Name, name) || strings.EqualFold(filepath.Base(m.Path), name) {
+			folded = append(folded, m)
+		}
+	}
+	switch len(folded) {
+	case 0:
+	case 1:
+		return folded[0].Path, nil
+	default:
+		return "", fmt.Errorf("%q is ambiguous: %s", name, strings.Join(names(folded), ", "))
 	}
 	// Ollama's clients send a bare name for its :latest tag. It means that
 	// model, before any other the name begins: "qwen3.8" on the box is
@@ -313,7 +347,7 @@ func (s *Store) Resolve(name string) (string, error) {
 // of an unfinished model alone removes what is here of it.
 func (s *Store) Remove(name string) error {
 	if u, ok := s.unfinished(name); ok {
-		if _, err := s.Lookup(name); err != nil {
+		if m, err := s.Lookup(name); err != nil || (u.Name == name && m.Name != name) {
 			return removeAll(u.Files)
 		}
 	}
@@ -508,9 +542,14 @@ func (s *Store) Unfinished() ([]Unfinished, error) {
 	return out, nil
 }
 
-// unfinished finds an unfinished model by its name.
+// unfinished finds an unfinished model by its name, exactly that name first.
 func (s *Store) unfinished(name string) (Unfinished, bool) {
 	all, _ := s.Unfinished()
+	for _, u := range all {
+		if u.Name == name {
+			return u, true
+		}
+	}
 	for _, u := range all {
 		if strings.EqualFold(u.Name, name) {
 			return u, true
