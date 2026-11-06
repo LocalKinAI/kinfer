@@ -92,7 +92,7 @@ check that raised it.
 
 ```bash
 kinfer fit                   # what this machine can actually run
-kinfer pull <repo>[:quant]   # Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M
+kinfer pull <repo>[:quant]   # Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M, or an MLX repo: mlx-community/Qwen3.8-27B-4bit
 kinfer list                  # what is installed
 kinfer rm <model>            # delete one
 kinfer run <model> [prompt]  # chat — no prompt means interactive
@@ -114,6 +114,23 @@ each file takes its name only once it matches the sha256 Hugging Face publishes
 for it.
 
 What each does, and how serve sizes itself: [docs/serving.md](docs/serving.md).
+
+## MLX models
+
+A model can also be a directory of safetensors as Hugging Face publishes it,
+and kinfer serves it on Apple's MLX: Qwen3.5 dense, at bf16 or MLX 4-bit, such as
+mlx-community's conversions. `kinfer pull mlx-community/Qwen3.8-27B-4bit` fetches
+one into the store; from there it is listed, run and served like a GGUF, through
+the same four dialects. The engine is Go over mlx-c, with no cgo and no Python,
+and checked against mlx-lm layer by layer. MLX's libraries (78 MB) are fetched
+once, the first time an MLX model loads, and need macOS 26.2.
+
+Where it stands against llama.cpp on the M3 Ultra: a small model at many replies
+at once is MLX's (Qwen3.5-0.8B at 64: 2,833 tok/s against 1,031, in half the
+memory); Qwen3.8-27B decodes alone at 36 tok/s against 31, but llama.cpp's MTP
+drafting reaches 51, and at 16 replies llama.cpp leads, 130 against 105. A mixture
+of experts, MTP, pictures and embeddings run only on llama.cpp so far. The
+numbers: [CHANGELOG.md](CHANGELOG.md).
 
 ## Models bigger than the machine
 
@@ -234,6 +251,11 @@ libraries, the version stamped in, packed with its sha256 into `dist/`.
 formula for that release into the tap,
 [LocalKinAI/homebrew-tap](https://github.com/LocalKinAI/homebrew-tap).
 
+`cmd/kinlab` is a bench for editing a small model's weights and measuring what
+an edit does — `kinlab edit` writes an edited model into kinfer's store, `kinlab
+eval` runs a set of problems through it against its base. It builds from the
+same tree (`go build -o kinlab ./cmd/kinlab`) and is not part of a release.
+
 ## Roadmap
 
 - [x] **Phase 0** — feasibility: pure-Go inference, Metal, single binary
@@ -258,6 +280,8 @@ formula for that release into the tap,
 - [x] **Bigger than one machine, at speed** — over Thunderbolt 5 with the GPUs
       kept warm a split decodes as fast as the box alone, and `kinfer run` borrows a
       worker it finds on the cable only for a model that does not fit here
+- [x] **MLX** — safetensors served on MLX from Go: Qwen3.5 dense, batched, with a
+      prefix pool; a small model's many replies at once 2.7 times llama.cpp's
 - [ ] **Phase 2** — the reason this exists: health probing, automatic failover,
       circuit breaking, per-agent model routing
 - [ ] **Phase 3** — apply `fit`'s backend choice automatically, honest benchmarks

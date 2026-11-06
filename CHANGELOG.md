@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+### Added — MLX: a directory of safetensors served in Go, no Python
+
+A model can now be a directory as Hugging Face publishes it: config.json,
+tokenizer.json and safetensors. kinfer serves such a directory on Apple's MLX,
+and a GGUF on llama.cpp as before. The server makes no difference between them:
+the same four dialects, the same chat template read from the model, and the same
+thinking kept apart from the answer. The MLX engine is Go over mlx-c, through
+purego, as llama.cpp is bound: no cgo and no Python.
+
+- **What it runs.** Qwen3.5 dense (`model_type` qwen3_5), at bf16 or MLX 4-bit,
+  such as the mlx-community conversions. Checked against mlx-lm layer by layer
+  on Qwen3.5-0.8B (bf16 and 4-bit) and Qwen3.8-27B 4-bit: the same hidden states
+  at every layer, the same greedy tokens. The tokenizer reads tokenizer.json; it
+  matched the tokenizers library on 537 texts, 36,390 tokens.
+- **Getting one.** `kinfer pull mlx-community/Qwen3.8-27B-4bit` pulls a repo
+  with no GGUF and a model_type MLX serves as a directory of the store, named
+  for the repo. It takes the weights and the files that describe them, goes on
+  where it stopped, and checks the weights against Hugging Face's sha256.
+  `kinfer list` shows it as "kinfer, MLX". It resolves by name or prefix, and
+  `kinfer rm` deletes it whole. `kinfer can-run` sizes such a repo against the
+  machine, and for a safetensors repo MLX does not serve, it now gets as far as
+  suggesting GGUF conversions; it used to stop with an error.
+- **The libraries.** MLX's libraries (78 MB) are not inside kinfer. The first
+  MLX model fetches them once from this repository's mlx-0.32.4 release into
+  `~/.kinfer/mlx/0.32.4`, checked against a pinned sha256. They need macOS 26.2.
+- **Serving.** Replies run batched, one forward pass for all. They are sampled
+  on the GPU in llama.cpp's order, repeat penalty to temperature, and the next
+  step starts before the host reads the last one's tokens. A finished reply's
+  row is reused in place. Each row's attention reads its own columns only, so
+  one long reply does not make the others read its length. Recent prompts are
+  pooled as the GGUF engine pools a model with recurrent state: an agent's next
+  turn and its next conversation skip what they share. MLX's buffer cache is
+  capped at 4 GB; unbounded, it had held 76 GB.
+- **Measured** on the M3 Ultra. Qwen3.5-0.8B, the same bf16 weights both ways:
+
+  | | kinfer on llama.cpp | kinfer on MLX |
+  |---|---|---|
+  | 1 / 4 / 16 / 64 replies at once | 201 / 576 / 1,160 / 1,031 tok/s | 217 / 671 / 1,270 / 2,833 |
+  | memory | 15 GB | 8.3 GB |
+
+  Qwen3.8-27B, Q4_K_M on llama.cpp against MLX 4-bit:
+
+  | | llama.cpp, no drafts | llama.cpp, MTP | MLX |
+  |---|---|---|---|
+  | greedy decode | 31.0 tok/s | 35.7–51.3 | 36.0 |
+  | a prompt of 11,245 tokens | 36.8 s | 39.2 s | 35.0 s |
+  | 1 / 4 / 16 at once | 31 / 63 / 130 | 40 / 87 / 121 | 35 / 83 / 105 |
+
+  With a 9,000-token system prompt, a 27B agent's second and third turns, and
+  its next conversation, read their prompts in 0.28–0.37 s instead of 28 s.
+- **Not yet on MLX:** a mixture of experts, MTP drafting, pictures, embeddings,
+  and architectures besides Qwen3.5. A GGUF of any of them runs on llama.cpp.
+
+### Changed — a Qwen model thinks as its template says, as in Ollama
+
+Qwen's templates have the model think by ending the prompt in `<think>\n`.
+Qwen3.8's do it unless told not to; Qwen3.5's only when told to. kinfer renders
+templates through llama.cpp's C API, which runs no Jinja, and the opener was
+left out. So qwen3.8-27b answered without thinking even when a request asked
+for it, and Qwen3.5 on MLX almost never thought.
+
+Requests are now rendered as Ollama renders them, from the model's default:
+- a request that says nothing gets what the template does by default;
+- one that asks to think gets the opener: `think: true` or a level, OpenAI's
+  `reasoning_effort`, Anthropic's `thinking`, the Responses API's
+  `reasoning.effort`;
+- `think: false` gets the empty think block, as before.
+
+On the box, characters of thinking with think absent / true / false:
+- qwen3.8-27b: 360 / 360 / 0, where it was 0 / 0 / 0;
+- ornith-1.5-35b: 508 / 508 / 0, unchanged (it writes its own `<think>`);
+- Qwen3.5-0.8B on MLX: 0 / 1,474 / 0.
+
+Ollama 0.40.11 defaults qwen3.8 to thinking (medium), so this matches it. **A
+client of a Qwen3.8 model that sent no `think` now gets thinking**, and with it
+longer replies; it should send `think: false` (or Anthropic's thinking disabled,
+or a reasoning effort of none) to answer straight away as before.
+
 ### Fixed — a kinfer built without cgo died on its first BF16 GGUF
 
 Metal compiles llama.cpp's kernels at the language version of the SDK the

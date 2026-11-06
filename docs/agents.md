@@ -237,9 +237,14 @@ POST /api/chat  {"think": true, …}
              "thinking":"The user asks \"What is 2+2?\" and wants just the number…"}}
 ```
 
-Without `think` the model thinks, and the working out comes back in `thinking`
-as it does from Ollama; `content` is the answer and nothing else either way.
-`"think": false` keeps the model out of its think block altogether. Dropping the
+Without `think` the model does what it does by default, as in Ollama, and its
+working out comes back in `thinking`; `content` is the answer and nothing else
+either way. `"think": true` has it think, and `"think": false` keeps it out of
+its think block altogether. Qwen's templates make the difference in the prompt:
+they open the think block there, Qwen3.8's unless told not to and Qwen3.5's only
+when told to, and kinfer renders the opener as the template would (llama.cpp's C
+API, which renders the template, leaves it out). So a Qwen3.8 model thinks when
+nothing is said, and a Qwen3.5 one does not. Dropping the
 thinking when the field was absent — the old behaviour — returned an empty reply
 with nothing to show for it whenever a reasoning model ran out of time.
 
