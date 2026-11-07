@@ -169,14 +169,15 @@ rows a token — with no flags; a 7,753-token prompt and three 200-token replies
 | machine | GPU memory | where the model went | prompt | decode |
 |---|---:|---|---:|---:|
 | Mac Studio M3 Ultra, 96 GB | 88 GiB | all of it on the GPU | 748 tok/s | 43 tok/s |
-| MacBook Pro M5 Max, 48 GB | 40 GiB | 28 of 48 layers' experts in host memory and on the SSD, a 9 GiB cache | 706-726 tok/s | 27-29 tok/s |
-| the MacBook Pro, the Mac Studio as its peer over USB 2.0 | 40 + 88 GiB | layers 0-17 on the Mac Studio | 258 tok/s | 23 tok/s |
+| MacBook Pro M5 Max, 48 GB | 40 GiB | 44 of 48 layers' experts in host memory and on the SSD, a 15 GiB cache (v0.2.5) | 876 tok/s | 30-32 tok/s |
+| the MacBook Pro, the Mac Studio as its peer over Thunderbolt 5 | 40 + 88 GiB | 17 GB of it on the Mac Studio's GPU | 1,274-1,325 tok/s | 43.6-44.4 tok/s |
 
 `kinfer plan <model>` shows where a model would go, without loading it. Reading
 experts from the SSD at that speed takes kinfer's build of llama.cpp
 (`scripts/build-libs.sh`, below); with the release libraries the MacBook Pro
-decoded at 9 tok/s. Over that USB 2.0 cable the laptop's own SSD beat the other
-machine's GPU; a Thunderbolt 5 link is the next measurement.
+decoded at 9 tok/s. Over Thunderbolt 5 the other machine's GPU beats the laptop's
+own SSD; over the USB 2.0 cable used first it did not (23 tok/s against 28,
+[docs/big-models.md](docs/big-models.md#over-thunderbolt-5-and-the-gpu-that-waits)).
 
 Against Ollama on the same MacBook Pro, from the same files, the same requests
 back to back, and the same reply from all three:
