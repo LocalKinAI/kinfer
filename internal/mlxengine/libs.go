@@ -22,9 +22,13 @@ import (
 // keeps them in ~/.kinfer/mlx/<version>; after that they are local, and a new
 // MLX version simply lands in a directory of its own.
 //
-// The package is built by scripts/mlx-libs.sh: libmlxc.dylib (mlx-c at the
-// commit for this MLX, rpath @loader_path), and libmlx.dylib, libjaccl.dylib
-// and mlx.metallib from Apple's mlx-metal wheel, which need macOS 26.2.
+// The package is built by scripts/mlx-libs.sh: libmlxc.dylib (mlx-c, rpath
+// @loader_path), and libmlx.dylib, libjaccl.dylib and mlx.metallib from Apple's
+// mlx-metal wheel, which need macOS 26.2. This MLX is not a release: it is
+// 0f4740d (2026-10-27), the wheel MLX's own CI built of it that night, which
+// has the kernels for passes of six to sixteen rows that drafting checks its
+// drafts with — 0.32.4, the last release, has not — and is the MLX Ollama
+// ships. mlx-c is 0.8.0 with patches/mlx-c.
 var mlxLibs = struct {
 	Version  string
 	URL      string
@@ -32,10 +36,10 @@ var mlxLibs = struct {
 	Size     int64
 	MinMacOS [2]int
 }{
-	Version:  "0.32.4",
-	URL:      "https://github.com/LocalKinAI/kinfer/releases/download/mlx-0.32.4/kinfer-mlx-0.32.4-darwin-arm64.tar.gz",
-	SHA256:   "dfc2697d3ddc4b918de3902dbf39f9abb4a0894e2d7d6a8b2ad1e84e92de47e8",
-	Size:     77645625,
+	Version:  "0.32.5-0f4740d",
+	URL:      "https://github.com/LocalKinAI/kinfer/releases/download/mlx-0.32.5-0f4740d/kinfer-mlx-0.32.5-0f4740d-darwin-arm64.tar.gz",
+	SHA256:   "561234c600f4dc81cf13a44f13ca7b1354d6316abd5631cbf3992159191c3d45",
+	Size:     78835850,
 	MinMacOS: [2]int{26, 2},
 }
 

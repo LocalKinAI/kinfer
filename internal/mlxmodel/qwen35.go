@@ -681,18 +681,25 @@ func (m *Qwen35) ReadAll(tokens []int32, cache *Qwen35Cache) (logits mlx.Array, 
 	return logits, nil
 }
 
-// Verify reads tokens — the token the reply is sure of, and the drafts after
-// it — for one sequence and returns, evaluated, the logits after each,
-// [len(tokens), vocab], and the model's normed hidden state after each,
-// [len(tokens), hidden], from which the head drafts on (SettleHead).
-func (m *Qwen35) Verify(tokens []int32, cache *Qwen35Cache) (logits, hidden mlx.Array, err error) {
+// Verify builds the pass that reads tok — the token the reply is sure of —
+// and the drafts after it, [1, n] as Draft gave them or 0, for one sequence.
+// It returns, unevaluated, the logits after each token, [n+1, vocab], and the
+// model's normed hidden state after each, [n+1, hidden], from which the head
+// drafts on (Keep); the caller evaluates them with the cache's Arrays. Built
+// while the drafts are still being worked out, the pass costs no time of its
+// own between them and its evaluation.
+func (m *Qwen35) Verify(tok int32, drafts mlx.Array, cache *Qwen35Cache) (logits, hidden mlx.Array, err error) {
 	defer mlx.Recover(&err)
-	ids := mlx.FromInt32(tokens, 1, len(tokens))
+	ids := mlx.FromInt32([]int32{tok}, 1, 1)
+	if drafts != 0 {
+		all := mlx.Concatenate(1, ids, drafts)
+		ids.Free()
+		ids = all
+	}
 	cache.keepSteps = true
 	logits, hidden = m.step(ids, cache, nil, true)
 	cache.keepSteps = false
 	ids.Free()
-	mlx.Eval(append([]mlx.Array{logits, hidden}, cache.Arrays()...)...)
 	return logits, hidden, nil
 }
 
@@ -794,13 +801,15 @@ func (m *Qwen35) headRead(tokens, before mlx.Array, cache *Qwen35Cache) mlx.Arra
 
 // Draft proposes the n tokens after tok, each the head's most likely, for a
 // sequence the model has read up to the token before tok: the head pairs
-// tok with the model's state there, then each draft with its own output. The
-// cache is left as it was — the head's positions written while drafting are
-// written again by the pass that checks them.
-func (m *Qwen35) Draft(cache *Qwen35Cache, tok int32, n int) (drafts []int32, err error) {
+// tok with the model's state there, then each draft with its own output. It
+// starts working them out and returns them before they are, [1, n], for the
+// pass that checks them (Verify) to be built meanwhile; 0 when it has none.
+// The caller frees them. The cache is left as it was — the head's positions
+// written while drafting are written again by the pass that checks them.
+func (m *Qwen35) Draft(cache *Qwen35Cache, tok int32, n int) (drafts mlx.Array, err error) {
 	defer mlx.Recover(&err)
 	if m.mtp == nil || !cache.Drafting || cache.headH == 0 || n <= 0 {
-		return nil, nil
+		return 0, nil
 	}
 	scope := mlx.NewScope()
 	defer scope.Close()
@@ -812,11 +821,12 @@ func (m *Qwen35) Draft(cache *Qwen35Cache, tok int32, n int) (drafts []int32, er
 		t = mlx.Astype(mlx.Argmax(linear(h, m.head()), -1, false), mlx.Int32)
 		toks[i] = t
 	}
-	all := mlx.Concatenate(1, toks...)
-	drafts = all.Int32s()
-	// The buffers the drafts were written into belong to the scope; the
-	// cache keeps the ones it had, which were not written in place while
-	// these handles held them.
+	drafts = mlx.Concatenate(1, toks...)
+	scope.Escape(drafts)
+	mlx.AsyncEval(drafts)
+	// The buffers the drafts are written into belong to their graph; the
+	// cache keeps the ones it had, which are not written in place while
+	// these handles hold them.
 	cache.headKeys, cache.headVals, cache.headOffset = keys, vals, off
 	return drafts, nil
 }
@@ -832,7 +842,8 @@ func (c *Qwen35Cache) Mark() Mark { return Mark{c.Offset, c.headOffset} }
 // inputs as they were after it, which the pass left for this; the attention
 // layers and the head go back to just after it, their buffers written again
 // from there; and the head drafts from the model's state after it, hidden's
-// i-th row. With every token kept there is nothing to take back.
+// i-th row. With every token kept there is nothing to take back. What it
+// takes back is left unevaluated, for the next pass to work out with its own.
 func (c *Qwen35Cache) Keep(mk Mark, i int, hidden mlx.Array) (err error) {
 	defer mlx.Recover(&err)
 	read := c.Offset - mk.offset
@@ -863,7 +874,6 @@ func (c *Qwen35Cache) Keep(mk Mark, i int, hidden mlx.Array) (err error) {
 			}
 		}
 		scope.Escape(kept...)
-		mlx.Eval(kept...)
 		c.Offset, c.headOffset = mk.offset+i+1, mk.headOffset+i+1
 	}
 	for l := range c.steps {

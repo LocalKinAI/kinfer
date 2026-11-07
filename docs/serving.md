@@ -328,12 +328,14 @@ and the log says how many were when the model unloads.
 
 On MLX the same head drafts, for a Qwen3.5 or Qwen3.8 model that keeps it —
 Ollama's NVFP4 models and Hugging Face's releases do, mlx-community's conversions
-drop it — three tokens a step, while a reply writes alone; a second request puts
+drop it — five tokens a step, while a reply writes alone; a second request puts
 the step back to one token a reply, and the one that was drafting goes on in the
-batch. A model under 4 GB of weights does not draft unless `-draft N` says so:
-on the M3 Ultra, Qwen3.5-0.8B wrote 221 tok/s alone without drafts and 141 with
-three. qwen3.8:27b-mlx on a MacBook Pro (M5 Max) went from 30 tok/s to 38–75,
-five of six replies the same word for word.
+batch. A step waits on the GPU once: the pass that checks the drafts is built
+while they are worked out. A model under 4 GB of weights does not draft unless
+`-draft N` says so: on the M3 Ultra, Qwen3.5-0.8B wrote 221 tok/s alone without
+drafts and 141 with three. qwen3.8:27b-mlx on a MacBook Pro (M5 Max) went from
+30 tok/s to 40–107, 72.5 on average over six replies — Ollama 0.40.15 averaged 78
+on the same six.
 
 ## Embeddings, beside the chat model
 

@@ -1,0 +1,12 @@
+diff --git a/mlx/c/fast.cpp b/mlx/c/fast.cpp
+index 2054aeb..d8e5314 100644
+--- a/mlx/c/fast.cpp
++++ b/mlx/c/fast.cpp
+@@ -670,6 +670,7 @@ extern "C" int mlx_fast_scaled_dot_product_attention(
+             mlx_array_get_(keys),
+             mlx_array_get_(values),
+             scale,
++            /* window_size: none, as before MLX took one */ -1,
+             std::string(mask_mode),
+             (mask_arr.ctx ? std::make_optional(mlx_array_get_(mask_arr))
+                           : std::nullopt),

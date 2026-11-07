@@ -499,10 +499,12 @@ func (e *Engine) run() {
 }
 
 // defaultDrafts is how many tokens a step drafts when -draft does not say.
-// On Ollama's qwen3.8:27b-mlx on an M5 Max, one to four drafts gave 44, 55,
-// 60 and 59 tok/s on average over six replies against 30 without, three
-// the best of the slowest reply too.
-const defaultDrafts = 3
+// On Ollama's qwen3.8:27b-mlx on an M5 Max, six replies averaged 72.5 tok/s
+// with five drafts against 67.4 with three and 30 with none: MLX's kernels for
+// passes of six to sixteen rows (after 0.32.4) make checking five drafts cost
+// little more than checking three. With 0.32.4, where a pass of five rows or
+// more costs more per row than one of four, three was the best.
+const defaultDrafts = 5
 
 // draftsFrom is the size of weights below which a model does not draft unless
 // -draft says so. A small model's step is quick beside its head's, which also
@@ -519,8 +521,20 @@ const draftsFrom = 4e9
 // last token kept is taken back from the states it left (Keep). It returns
 // when the reply ends (nil) or another request arrives, with j's cache read
 // up to j.last, as a batch row's is.
+//
+// A step waits on the GPU once: the pass is built while the drafts it checks
+// are worked out, and is evaluated with them, with what Keep took back before
+// them, and, greedy, with the tokens the reply takes.
 func (e *Engine) solo(j *job, c *mlxmodel.Qwen35Cache) *mlxmodel.Qwen35Cache {
+	var drafts mlx.Array
+	free := func() {
+		if drafts != 0 {
+			drafts.Free()
+			drafts = 0
+		}
+	}
 	fail := func(err error) *mlxmodel.Qwen35Cache {
+		free()
 		c.Free()
 		e.finish(j, err)
 		return nil
@@ -531,27 +545,29 @@ func (e *Engine) solo(j *job, c *mlxmodel.Qwen35Cache) *mlxmodel.Qwen35Cache {
 	}
 	for {
 		if len(e.jobs) > 0 || e.closing() {
+			free()
 			return c
 		}
 		mark := c.Mark()
-		logits, hidden, err := e.model.Verify(append([]int32{j.last}, drafts...), c)
+		logits, hidden, err := e.model.Verify(j.last, drafts, c)
 		if err != nil {
 			return fail(err)
 		}
-		toks, err := e.checkDrafts(logits, 0, drafts, j)
+		ds, toks, err := e.checkPass(logits, hidden, drafts, c, j)
 		logits.Free()
+		free()
 		if err != nil {
 			hidden.Free()
 			return fail(err)
 		}
-		e.drafted.Add(int64(len(drafts)))
+		e.drafted.Add(int64(len(ds)))
 		kept, ended := 0, false
 		for i, tok := range toks {
 			if !e.accept(j, tok) {
 				ended = true
 				break
 			}
-			if i < len(drafts) && tok == drafts[i] {
+			if i < len(ds) && tok == ds[i] {
 				kept++
 			}
 		}
@@ -572,30 +588,59 @@ func (e *Engine) solo(j *job, c *mlxmodel.Qwen35Cache) *mlxmodel.Qwen35Cache {
 	}
 }
 
-// checkDrafts reads the logits of a verified pass from index at on, where the
-// first draft's position is, and returns the reply's tokens there: each
-// sampled as the reply would sample it, up to and including the first that
-// differs from its draft, or one past the last draft when all hold.
-func (e *Engine) checkDrafts(logits mlx.Array, at int, drafts []int32, j *job) (toks []int32, err error) {
+// checkPass evaluates a Verify pass, with the drafts it checks, and returns
+// those drafts and the reply's tokens at their positions: each sampled as the
+// reply would sample it, up to and including the first that differs from its
+// draft, or one past the last draft when all hold.
+func (e *Engine) checkPass(logits, hidden, drafts mlx.Array, c *mlxmodel.Qwen35Cache, j *job) (ds, toks []int32, err error) {
+	defer mlx.Recover(&err)
+	// Greedy and without penalties, every row's token is its argmax, worked
+	// out with the pass; otherwise each is sampled with the history before it.
+	greedy := j.params.Temperature <= 0 && !sampling.PenaltiesOn(j.params.Params)
+	var best []int32
+	func() {
+		scope := mlx.NewScope()
+		defer scope.Close()
+		out := append([]mlx.Array{hidden}, c.Arrays()...)
+		if drafts != 0 {
+			out = append(out, drafts)
+		}
+		var b mlx.Array
+		if greedy {
+			b = mlx.Astype(mlx.Argmax(logits, -1, false), mlx.Int32)
+			out = append(out, b)
+		} else {
+			out = append(out, logits)
+		}
+		mlx.Eval(out...)
+		if drafts != 0 {
+			ds = drafts.Int32s()
+		}
+		if greedy {
+			best = b.Int32s()
+		}
+	}()
+	if !greedy {
+		toks, err = e.checkDrafts(logits, ds, j)
+		return ds, toks, err
+	}
+	for i, t := range best {
+		toks = append(toks, t)
+		if i < len(ds) && t != ds[i] {
+			break
+		}
+	}
+	return ds, toks, nil
+}
+
+// checkDrafts samples, from evaluated logits [len(drafts)+1, vocab], the
+// reply's tokens at the drafts' positions, each with the history before it,
+// up to and including the first that differs from its draft, or one past the
+// last draft when all hold.
+func (e *Engine) checkDrafts(logits mlx.Array, drafts []int32, j *job) (toks []int32, err error) {
 	defer mlx.Recover(&err)
 	V := logits.Shape()[1]
 	n := len(drafts) + 1
-	rows := mlx.Slice(logits, []int{at, 0}, []int{at + n, V})
-	defer rows.Free()
-	// Greedy and without penalties, every row's token is its argmax, read
-	// at once; otherwise each is sampled with the history before it.
-	if j.params.Temperature <= 0 && !sampling.PenaltiesOn(j.params.Params) {
-		best := mlx.Astype(mlx.Argmax(rows, -1, false), mlx.Int32)
-		all := best.Int32s()
-		best.Free()
-		for i, t := range all {
-			toks = append(toks, t)
-			if i < len(drafts) && t != drafts[i] {
-				break
-			}
-		}
-		return toks, nil
-	}
 	// The tokens taken here are the reply's history for the rows after them,
 	// as they will be once the reply takes them, and only until then.
 	gen, distinct := len(j.gen), len(j.distinct)
@@ -606,7 +651,7 @@ func (e *Engine) checkDrafts(logits mlx.Array, at int, drafts []int32, j *job) (
 		j.gen, j.distinct = j.gen[:gen], j.distinct[:distinct]
 	}()
 	for i := 0; i < n; i++ {
-		row := mlx.Slice(rows, []int{i, 0}, []int{i + 1, V})
+		row := mlx.Slice(logits, []int{i, 0}, []int{i + 1, V})
 		t, err := e.sample(row, []*job{j})
 		row.Free()
 		if err != nil {
