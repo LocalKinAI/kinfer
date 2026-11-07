@@ -640,6 +640,15 @@ sizing:
 			slots /= 2
 			prefix = min(prefix, max(slots/2, 1))
 			log.Printf("%s — %d slots + %d prefix instead, keeping %d tokens each", measured, slots, prefix, perSeq)
+		// Experts in host memory get passes of 4096 (ubatchHost), but a pool
+		// needs the KV cache unified, and a pass reads all of its cells: on the
+		// box, Flash-Next with -slots 4 lost its pool to that larger pass and
+		// read every turn whole again, 19–41 s to a first token. 2048 is what
+		// those models read prompts in before v0.2.5, and it goes before the
+		// pool does.
+		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0 && ubAuto && hostExperts != 0 && ub > ubatchLarge:
+			ub = ubatchLarge
+			log.Printf("%s — a micro-batch of %d instead, which keeps %d prefix", measured, ub, prefix)
 		// When the context is the operator's, halving it is not ours to do, so
 		// the pool goes first whatever the floor.
 		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0 && !shared:
