@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.2.5 — 2026-11-06
+
+### Faster — drafting on MLX: one wait a step, five drafts, a newer MLX
+
+Ollama's qwen3.8:27b-mlx on a MacBook Pro (M5 Max), six greedy replies: 62.2 tok/s
+on average before, **72.5** now (40–107), Ollama 0.40.15 78. Two changes:
+
+- **A step waits on the GPU once.** It waited four times: for the drafts, for the
+  pass that checks them, for the tokens taken from that pass, and for what was
+  taken back after a draft that did not hold — and the GPU sat idle for the 4 ms
+  the 64-layer pass took to build. Now the drafts are worked out while the pass is
+  built, and the pass is evaluated with them, with what was taken back and with
+  the tokens the reply takes: a step went from 48 ms to 43–46, and the six replies
+  to 67.5, word for word the same.
+- **MLX 0.32.5-0f4740d, and five drafts a step.** MLX 0.32.4 multiplies a
+  quantized matrix by five rows or more at a higher cost per row than by four, so
+  three drafts were the most that paid. The MLX after it has kernels for six to
+  sixteen rows (ml-explore/mlx#4712): a pass checking five drafts costs little more
+  than one checking three, and five drafts give 72.5 against three's 67.4. That
+  MLX is not released; the libraries are what MLX's own CI built of commit
+  0f4740d, the MLX Ollama 0.40.15 ships, with mlx-c 0.8.0 and a one-line patch
+  (patches/mlx-c). kinfer fetches them once, 79 MB, the first time it serves an
+  MLX model, into `~/.kinfer/mlx/0.32.5-0f4740d`; the 0.32.4 directory can go. On
+  the M3 Ultra they are no slower anywhere: Qwen3.5-0.8B alone 117 → 145 tok/s,
+  at 64 the same 2,850; Qwen3.8-27B at 4 bits alone 29 → 32, at 16 the same 105.
+
+Measured and left as it is: choosing how many tokens to draft from the time each
+number takes and how often each position holds, as Ollama does. It gained
+nothing on 0.32.4 and less than a fixed five on the newer MLX, and a reply then
+depends on the drafts before it: run twice, the same prompt could give two
+replies. With the number fixed it gives one.
+
+### Faster — many requests at once, with `-prefix -1`
+
+With the prefix pool off, each conversation has a stream of the cache to itself,
+and llama.cpp reads the sequences of separate streams together only while their
+ids run on without a gap. As replies ended they left gaps, and every gap split
+the step: Qwen2.5-0.5B on the M3 Ultra took 21 ms a step with 128 slots busy,
+then 36, then 60. Now the highest busy slot moves into each one that frees up —
+llama.cpp copies its stream, 12 MB for a 1024-token slot of that model — and the
+step stays at 21 ms. 128 at once went from 2,467 tok/s to 4,803, 81% of what
+`llama-batched-bench` gets on that machine; 64 from 1,983 to 3,405. The default,
+with the pool, is unchanged at 3,029 and 2,328: the pool needs llama.cpp's unified
+buffer, in which each conversation's attention reads every conversation's cells
+(`llama-batched-bench -kvu` gets 3,436 at 128). docs/performance.md says when to
+turn the pool off.
+
+### Faster — a prompt read with experts in host memory, in passes of 4096
+
+Every pass of a prompt reads the experts kept in host memory again, so the pass
+those models get unasked is now 4096 tokens, not 2048: half as many passes, half
+as many reads. Its compute buffer takes 2–3 GiB from the expert cache. On the
+MacBook Pro (M5 Max, the GPU at 40 GiB), a 7,753-token prompt and three replies,
+the replies the same word for word:
+
+| model | prompt, 2048 → 4096 | decode, 2048 → 4096 |
+|---|---|---|
+| Qwen3.8-Flash-Next | 715 → 917 tok/s | 31.5–32.8 → 30.4–31.6 |
+| DeepSeek-V4.1 | 129 → 235 | 13.8–14.1 → 13.4–13.9 |
+| Ornith-1.5-397B | 58 → 139 | 3.04–3.56 → 3.13–3.61 |
+
+An agent rereads long prompts more than it writes, so the 3% of decode is worth
+it; `-batch 2048` takes it back. Placement keeps room for the larger pass. 8192
+read Ornith's prompt at 328 tok/s but left a 9 GiB cache, which missed 98% of
+the time: decode 27% slower, and 18 GiB of swap.
+
+### Checked — a mixture of experts on MLX, end to end
+
+Ollama's qwen3.5:35b-a3b-nvfp4 (Qwen3.5's mixture of experts, 21.9 GB) on a
+MacBook Pro (M5 Max): 101–105 tok/s alone against Ollama's 123–127, a 7,753-token
+prompt read at 3,772 tok/s against 3,989, and four replies at once 188 tok/s in
+all against Ollama's 112, which serves one at a time on MLX. One reply of six
+was Ollama's word for word; the others were for a few words to a few sentences,
+then went their own way where a word was a near tie. The package has no MTP head, so nothing drafts.
+
 ## v0.2.4 — 2026-11-06
 
 ### Faster — a mixture of experts read from the SSD, on a MacBook Pro most
