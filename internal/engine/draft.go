@@ -191,6 +191,22 @@ func (d *drafter) forget(seq int32) {
 	d.tracked[seq] = true
 }
 
+// move mirrors the scheduler moving a reply from sequence src to dst, whose
+// cells it has already forgotten (compact): the head's cache, the hidden state
+// and the position go over, and src is left as forget leaves a sequence.
+func (d *drafter) move(src, dst int32) {
+	if d == nil {
+		return
+	}
+	llama.CopySequence(d.ctx, src, dst, -1, -1)
+	llama.ForgetSequence(d.ctx, src, -1, -1)
+	d.state[src], d.state[dst] = d.state[dst], d.state[src]
+	d.at[dst], d.tracked[dst] = d.at[src], d.tracked[src]
+	clear(d.state[src])
+	d.at[src] = -1
+	d.tracked[src] = true
+}
+
 // untrack stops drafting for a sequence, and the head reading it: one read some
 // other way, or not worth drafting for.
 func (d *drafter) untrack(seq int32) {

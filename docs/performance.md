@@ -205,11 +205,32 @@ said never 12–16 until the libraries changed under it. A rule like this belong
 to one build, and is measured again with every upgrade.
 
 The table is the machine's ceiling, not kinfer's throughput. kinfer itself, end
-to end through HTTP with 256-token replies at temperature 0, gets 96% of it for
-one request on the M3 Ultra, 69% at 8 and 44% at 128 (2,597 tok/s): the rest is
-each step's work outside the forward pass.
+to end through HTTP with 256-token replies at temperature 0, on the M3 Ultra
+(2026-11-06, the same libraries):
 
-That is Phase 2, and it is why per-stream speed is the smaller opportunity.
+| at once | kinfer, the default | `-prefix -1` | `llama-batched-bench` that day |
+|---:|---:|---:|---:|
+| 1 | 295 | 295 | 306 |
+| 16 | 2,588 | 2,812 | 3,264 |
+| 64 | 2,328 | 3,405 | 4,428 |
+| 128 | 3,029 | 4,803 | 5,934 |
+
+Most of what the default leaves is not kinfer's steps but the cache layout the
+prefix pool needs. The pool shares cells between sequences, which only
+llama.cpp's unified KV buffer allows, and there the cells of 128 conversations
+lie interleaved, so each one's attention reads all of them: `llama-batched-bench
+-kvu`, the ceiling with that buffer, gets 3,436 at 128 and 2,360 at 64.
+`-prefix -1` turns the pool off and gives each conversation a stream of the cache
+to itself. A step of 128 then takes 21 ms, as the ceiling's does, and stays there
+as replies end: llama.cpp reads sequences of separate streams together only while
+their ids run on without a gap, so kinfer moves the highest busy slot into each
+one that frees up (in v0.2.4 a step went from 21 ms to 60 as the gaps grew).
+
+So for many short requests that do not share a long system prompt — a benchmark,
+a batch job — run with `-prefix -1`. An agent fleet whose agents open every turn
+with the same soul gains more from the pool than it loses here: with 8 ornith
+agents and 7.8k-token prompts the unified buffer cost about 10%, and the pool
+saves reading those 7.8k tokens on every turn.
 
 Model load is 0.49 s warm. The first Metal run on a machine pays a one-off ~5 s
 for shader compilation, which macOS then caches — every later process, not just

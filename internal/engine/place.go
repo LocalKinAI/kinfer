@@ -128,8 +128,8 @@ type Placed struct {
 // with free bytes free, when -slots, -ctx and -batch are as given (0 for
 // unset) and neither -host-experts nor -moe-cache is. The room it keeps is for
 // the conversations asked for, or one, of the context asked for, or of what
-// sizing aims at (ctxFloor); and for a pass of -batch, or the 2048 host
-// experts get.
+// sizing aims at (ctxFloor); and for a pass of -batch, or the 4096 host
+// experts get (ubatchHost).
 func PlaceUnasked(sh store.Shape, free uint64, slots, ctx, batch int) (Placed, error) {
 	p := placeRoom(sh, slots, ctx, batch)
 	var err error
@@ -150,7 +150,7 @@ func placeRoom(sh store.Shape, slots, ctx, batch int) Placed {
 		}
 	}
 	if p.Ubatch <= 0 {
-		p.Ubatch = ubatchLarge
+		p.Ubatch = ubatchHost
 	}
 	p.Reserve = placeReserve(sh, p.Tokens, p.Slots, p.Ubatch)
 	return p

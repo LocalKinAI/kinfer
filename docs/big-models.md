@@ -381,7 +381,7 @@ are read from the SSD.
 The header says how much each layer's experts take, every shard's tensors
 counted; the GPU says what it has free. kinfer keeps room for one conversation
 of 32768 tokens (or what `-slots` and `-ctx` ask for) with a prompt pool entry,
-a pass of 2048 and the 2 GiB it warns below, then leaves the experts of as few
+a pass of 4096 (2048 before v0.2.5) and the 2 GiB it warns below, then leaves the experts of as few
 layers on the host as free what is missing plus a GPU cache of a third of them
 — the ratio of the best configuration found by hand above. The context is sized
 to the room kept, not to half of what is left; and when the measured context
@@ -405,6 +405,21 @@ will not fit. The rule was tuned where the host experts come from the SSD; where
 they would fit in host memory instead, it has not been measured against the
 fewest layers and no cache. With `-peers`, placement decides the split as well:
 see [Split by itself](#split-by-itself).
+
+Since v0.2.5 the pass is 4096, not 2048: every pass reads the host experts
+again, so a prompt read in half as many passes reads them half as often. The
+pass's compute buffer takes 2–3 GiB from the cache in return. On the MacBook
+Pro (v0.2.4 with `-batch 2048` and `-batch 4096`, the same replies from both):
+
+| model | prompt, 2048 | prompt, 4096 | decode, 2048 | decode, 4096 |
+|---|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next | 715 tok/s | 917 | 31.5–32.8 | 30.4–31.6 |
+| DeepSeek-V4.1 | 129 | 235 | 13.8–14.1 | 13.4–13.9 |
+| Ornith-1.5-397B | 58 | 139 | 3.04–3.56 | 3.13–3.61 |
+
+`-batch 2048` gives back the 3% of decode. A pass of 8192 read Ornith's prompt
+at 328 tok/s, but its buffer left a 9 GiB cache, which missed 98% of the time:
+decode 2.3–2.6 tok/s and 18 GiB of swap.
 
 ### Against Ollama on the same laptop
 

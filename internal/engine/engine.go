@@ -556,10 +556,11 @@ func Open(path string, opts Options) (*Engine, error) {
 		// and a pass of 2048 reads them a quarter as often as one of 512: on
 		// the MacBook Pro, Flash-Next with 24 layers' experts on the host read
 		// a 7,753-token prompt at 73 tok/s in passes of 512 and 162 in passes
-		// of 2048 (kinfer's patched llama.cpp makes it 502). The context
-		// measured below takes it back down when it costs too much.
+		// of 2048 (kinfer's patched llama.cpp makes it 502); see ubatchHost
+		// for 4096. The context measured below takes it back down when it
+		// costs too much.
 		if hostExperts != 0 {
-			ub = max(ub, ubatchLarge)
+			ub = max(ub, ubatchHost)
 		}
 		// Placement kept room for a pass of its own size.
 		if placed.Reserve != 0 {
@@ -788,11 +789,11 @@ sizing:
 	switch {
 	case !ubAuto:
 		how = "as -batch asked"
-	case hostExperts != 0 && ub < ubatchLarge:
+	case hostExperts != 0 && ub < ubatchHost:
 		// The headroom is not this process's to spend: on a shared machine
 		// it is what other processes' memory crosses the line with.
 		how = fmt.Sprintf("not %d: the host experts are read again by every pass, and %d would leave less than %s free "+
-			"— a smaller -moe-cache makes room, or -batch %d takes it from that", ubatchLarge, ubatchLarge, gib(thinHeadroom), ubatchLarge)
+			"— a smaller -moe-cache makes room, or -batch %d takes it from that", ubatchHost, ubatchHost, gib(thinHeadroom), ubatchHost)
 	case hostExperts != 0:
 		how = "sized for experts in host memory, which every pass reads again"
 	case grownFrom != 0:

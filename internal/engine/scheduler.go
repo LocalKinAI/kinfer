@@ -193,6 +193,7 @@ type scheduler struct {
 	tokSum    int
 	activeSum int
 	admitted  int
+	moved     int // replies compact moved down a slot
 	promptTok int
 	reusedTok int
 	lastLog   time.Time
@@ -396,6 +397,8 @@ func (s *scheduler) run() {
 			s.drain()
 			return
 		}
+
+		s.compact()
 
 		if s.active() == 0 && s.fatal == nil {
 			// Nothing to do. Block rather than spin — an idle fleet should not
@@ -859,6 +862,10 @@ func (s *scheduler) step() error {
 				reuse += fmt.Sprintf("   drafts %d, %.0f%% accepted", d, 100*float64(a)/float64(d))
 			}
 			s.loggedDrafts, s.loggedAccepted = s.drafted.Load(), s.draftsAccepted.Load()
+			if s.moved > 0 {
+				reuse += fmt.Sprintf("   moved %d replies down a slot", s.moved)
+				s.moved = 0
+			}
 			ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) / float64(s.steps) }
 			wall := float64(time.Since(s.lastLog)) / float64(time.Millisecond) / float64(s.steps)
 			log.Printf("sched: %4d steps/s   mean batch %5.1f tokens   mean active slots %4.1f   "+
@@ -1239,6 +1246,44 @@ func (s *scheduler) release(sl *slot, err error) {
 	sl.admitted = time.Time{}
 	sl.evalStart = time.Time{}
 	sl.out.Reset()
+}
+
+// compact keeps the slots in use numbered from 0 on, with no gap, when each
+// sequence has a stream of the cache to itself — with no prefix pool, which is
+// what asks for one buffer shared by all (see newContext). llama.cpp reads the
+// sequences of such a cache through the model together only while their ids
+// run on unbroken, and splits a batch at every gap: at 128 replies of
+// Qwen2.5-0.5B on the M3 Ultra a step took 21 ms while every slot was busy,
+// then 36 and 60 as replies ended and left gaps. So the highest slot in use
+// moves into the lowest free one: llama.cpp copies its stream (whole, as it
+// copies across streams — for a 0.5B model's 1024-token slot, 12 MB), and the
+// two slots trade places and sequence ids. admit has already given the free
+// slots below to requests waiting for one, which is cheaper still.
+func (s *scheduler) compact() {
+	if s.pool != nil || s.lctx == 0 {
+		return
+	}
+	for {
+		free, last := -1, -1
+		for i, sl := range s.slots {
+			switch {
+			case sl.job != nil:
+				last = i
+			case free < 0:
+				free = i
+			}
+		}
+		if free < 0 || last < free {
+			return
+		}
+		from, to := s.slots[last], s.slots[free]
+		llama.CopySequence(s.lctx, from.seq, to.seq, -1, -1)
+		llama.ForgetSequence(s.lctx, from.seq, -1, -1)
+		s.draft.move(from.seq, to.seq)
+		from.seq, to.seq = to.seq, from.seq
+		s.slots[free], s.slots[last] = from, to
+		s.moved++
+	}
 }
 
 // forget drops a sequence's cells, from the head's cache too.

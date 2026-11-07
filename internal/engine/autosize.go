@@ -248,6 +248,15 @@ const (
 	ubatchLarge   = 2048
 )
 
+// ubatchHost is the pass a model with experts in host memory reads its prompt
+// in, as every pass reads those experts again. On the MacBook Pro (M5 Max, the
+// GPU at 40 GiB), 4096 against 2048 read a 7,753-token prompt at 917 tok/s
+// against 715 for Flash-Next, 235 against 129 for DeepSeek-V4.1 and 139 against
+// 58 for Ornith-1.5-397B, and its compute buffer cost the expert cache 2–3 GiB:
+// decode 3% slower for the first two, the same for Ornith. 8192 read Ornith's
+// prompt at 328 but left a 9 GiB cache, decode 27% slower and 18 GiB of swap.
+const ubatchHost = 4096
+
 // autoUbatch is Ollama's micro-batch for a model whose longest conversation is
 // longest tokens.
 func autoUbatch(longest int, predicted, available uint64) int {
