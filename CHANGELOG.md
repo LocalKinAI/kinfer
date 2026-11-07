@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — a pool lost to the larger pass for experts in host memory
+
+v0.2.5 reads prompts in passes of 4096 when experts are in host memory, and a
+prefix pool needs the KV cache unified, whose pass reads every conversation's
+cells. On the box, Flash-Next under the service's `-slots 4 -prefix auto` lost
+its pool to that: every turn of an agent's conversation was read whole again,
+19–41 s to a first token with 11–21k-token prompts. Before the pool gives way,
+the pass now goes back to 2048. The same box, back to back with the same flags:
+v0.2.5 kept no pool and read the 7,813-token second turn in 9.6 s; now one entry
+stays and the turn is read in 0.4 s. Models whose experts are all on the GPU are
+untouched.
+
+### Fixed — an Ollama MLX model served without its chat template
+
+kinfer serves Ollama's MLX models from a directory of links to their blobs,
+with the chat template written out from `tokenizer_config.json`, and stamps the
+directory with the manifest. One made while that blob was still being copied
+into Ollama's store read no template, was stamped all the same, and stayed so:
+qwen3.8:27b-mlx, copied to the box over Thunderbolt, was served with chatml,
+which does not know Qwen's tool calls — empty replies, and a call returned as
+text. A directory that lacks the template its `tokenizer_config.json` carries is
+now made again; on the box the same model parses its tool calls.
+
 ## v0.2.5 — 2026-11-06
 
 ### Faster — drafting on MLX: one wait a step, five drafts, a newer MLX

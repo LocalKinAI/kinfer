@@ -172,7 +172,8 @@ func OllamaMLXRoot() string {
 // under the names they stand for, and the chat template, which Ollama keeps
 // in tokenizer_config.json, written out as chat_template.jinja. Nothing is
 // copied and nothing of Ollama's is touched. A stamp of the manifest says
-// whether the directory is still its own.
+// whether the directory is still its own, unless it lacks a template its
+// tokenizer_config.json now carries (missesTemplate).
 func ollamaMLXDir(name string, manifest []byte, tensors, files []namedBlob) (string, error) {
 	root := OllamaMLXRoot()
 	if root == "" {
@@ -181,7 +182,7 @@ func ollamaMLXDir(name string, manifest []byte, tensors, files []namedBlob) (str
 	dir := filepath.Join(root, strings.NewReplacer(":", "_", "/", "_").Replace(name))
 	sum := sha256.Sum256(manifest)
 	stamp := hex.EncodeToString(sum[:])
-	if b, err := os.ReadFile(filepath.Join(dir, ".manifest")); err == nil && string(b) == stamp {
+	if b, err := os.ReadFile(filepath.Join(dir, ".manifest")); err == nil && string(b) == stamp && !missesTemplate(dir, files) {
 		return dir, nil
 	}
 
@@ -227,6 +228,26 @@ func ollamaMLXDir(name string, manifest []byte, tensors, files []namedBlob) (str
 		return "", err
 	}
 	return dir, nil
+}
+
+// missesTemplate reports whether dir lacks the chat template the
+// tokenizer_config.json among files carries. A directory made while that blob
+// was still being copied into Ollama's store read no template from it and was
+// stamped all the same: on the box, qwen3.8:27b-mlx copied over Thunderbolt
+// was then served with chatml, which does not know its tool calls — empty
+// replies, and a call returned as text.
+func missesTemplate(dir string, files []namedBlob) bool {
+	if slices.ContainsFunc(files, func(f namedBlob) bool { return f.name == "chat_template.jinja" }) {
+		return false
+	}
+	i := slices.IndexFunc(files, func(f namedBlob) bool { return f.name == "tokenizer_config.json" })
+	if i < 0 {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, "chat_template.jinja")); err == nil {
+		return false
+	}
+	return chatTemplate(files[i].path) != ""
 }
 
 // chatTemplate is the chat template a tokenizer_config.json carries: one

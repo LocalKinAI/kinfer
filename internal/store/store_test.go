@@ -674,6 +674,21 @@ func TestOllamaMLXModel(t *testing.T) {
 		t.Error("a changed manifest did not make the directory again")
 	}
 
+	// A directory made while tokenizer_config.json was still being copied in
+	// has no template; once the file is whole, the next listing makes it again.
+	tc := filepath.Join(root, "blobs", "sha256-tc")
+	if err := os.WriteFile(tc, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	write(layers + `,{"mediaType":"application/vnd.ollama.image.json","digest":"sha256:t","size":2,"name":"merges.txt"}`)
+	if m3 := find(); exists(filepath.Join(m3.Path, "chat_template.jinja")) {
+		t.Fatal("a template was written from an empty tokenizer_config.json")
+	}
+	blob("tc", `{"chat_template":"{{ messages }}"}`, 0)
+	if m3 := find(); !exists(filepath.Join(m3.Path, "chat_template.jinja")) {
+		t.Error("the directory kept no template after tokenizer_config.json came whole")
+	}
+
 	s := newStore(t)
 	s.borrow = true
 	if err := s.Remove("qwen3.8:27b-mlx"); err == nil || !strings.Contains(err.Error(), "ollama rm") {
