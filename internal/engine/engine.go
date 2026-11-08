@@ -532,6 +532,15 @@ func Open(path string, opts Options) (*Engine, error) {
 	}
 
 	plan, err := AutoSize(shape, left, slotsWant, opts.PrefixSlots, ctx)
+	// Experts placed by hand that leave a little room are sized as ones that
+	// leave none are: the defaults, which the measurement below cuts down, and
+	// a warning when it is done. Refused instead, -host-experts 36 -moe-cache
+	// 20000 on the MacBook Pro served on 11-06 with 0.0 GiB left and not on
+	// 11-07 with 2.2 GiB, once its GPU limit was raised to 40 GiB.
+	if err != nil && (opts.HostExperts != 0 || opts.MoeCache > 0) {
+		log.Printf("sizing: %v — sized as though nothing were left, then measured", err)
+		plan, err = AutoSize(shape, 0, slotsWant, opts.PrefixSlots, ctx)
+	}
 	if err != nil {
 		llama.FreeProjector(mtmd)
 		llama.FreeModel(model)
@@ -598,6 +607,15 @@ sizing:
 	for {
 		lctx, draft = openLayout(model, layout{slots: slots, prefix: prefix, perSeq: perSeq, shared: shared, ubatch: ub},
 			moeCache, shape.CacheQ8, shape.Draft)
+		// A pass of our own choosing can ask for more than the GPU has before
+		// anything is measured: with -host-experts 36 and no -moe-cache,
+		// Flash-Next's pass of 4096 asked 36.9 GiB of the MacBook Pro's 40
+		// for its buffers, and the load failed. A smaller pass is tried first.
+		if lctx == 0 && ubAuto && ub > ubatchDefault {
+			log.Printf("sizing: the context could not be made with a pass of %d — %d instead", ub, lowerUbatch(ub))
+			ub = lowerUbatch(ub)
+			continue
+		}
 		if lctx == 0 {
 			llama.FreeProjector(mtmd)
 			llama.FreeModel(model)
@@ -640,15 +658,6 @@ sizing:
 			slots /= 2
 			prefix = min(prefix, max(slots/2, 1))
 			log.Printf("%s — %d slots + %d prefix instead, keeping %d tokens each", measured, slots, prefix, perSeq)
-		// Experts in host memory get passes of 4096 (ubatchHost), but a pool
-		// needs the KV cache unified, and a pass reads all of its cells: on the
-		// box, Flash-Next with -slots 4 lost its pool to that larger pass and
-		// read every turn whole again, 19–41 s to a first token. 2048 is what
-		// those models read prompts in before v0.2.5, and it goes before the
-		// pool does.
-		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0 && ubAuto && hostExperts != 0 && ub > ubatchLarge:
-			ub = ubatchLarge
-			log.Printf("%s — a micro-batch of %d instead, which keeps %d prefix", measured, ub, prefix)
 		// When the context is the operator's, halving it is not ours to do, so
 		// the pool goes first whatever the floor.
 		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0 && !shared:
@@ -665,6 +674,17 @@ sizing:
 		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0 && cacheAuto && moeCache-cut >= cacheFloor:
 			moeCache -= cut
 			log.Printf("%s — the expert cache gives up %d MiB instead, keeping %d prefix with %d MiB of cache", measured, cut, prefix, moeCache)
+		// Experts in host memory get passes of 4096 (ubatchHost), but a pool
+		// needs the KV cache unified, and a pass reads all of its cells: on the
+		// box, Flash-Next with -slots 4 lost its pool to that larger pass and
+		// read every turn whole again, 19–41 s to a first token. 2048 is what
+		// those models read prompts in before v0.2.5, and it goes before the
+		// pool's last entry does — only then: taken sooner, on the MacBook
+		// Pro it read Flash-Next's 11,000-token prompt at 660 tok/s where
+		// v0.2.5, giving up a pool entry instead, read it at 820.
+		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix == 1 && ubAuto && hostExperts != 0 && ub > ubatchLarge:
+			ub = ubatchLarge
+			log.Printf("%s — a micro-batch of %d instead, which keeps the pool's last entry", measured, ub)
 		case (perSeq/2 < floor || !ctxAuto) && prefixAuto && prefix > 0:
 			prefix--
 			log.Printf("%s — %d prefix instead, keeping %d tokens each", measured, prefix, perSeq)
@@ -1074,11 +1094,26 @@ func (e *Engine) EvalTokens() int64 {
 	return e.counter(func(s *scheduler) int64 { return s.evalSeen.Load() })
 }
 
+// Reuse is how many prompt tokens the prefix pool gave a reply instead of the
+// model reading them, since the model loaded, and how many entries the pool
+// has in the layout the context has now: 0 reads every prompt whole.
+func (e *Engine) Reuse() (tokens int64, entries int) {
+	return e.counter(func(s *scheduler) int64 { return s.reusedSeen.Load() }),
+		int(e.counter(func(s *scheduler) int64 { return int64(s.nPrefix.Load()) }))
+}
+
 // Drafts is how many tokens the model's MTP head drafted since it loaded, and
 // how many of them the model accepted; counters too.
 func (e *Engine) Drafts() (drafted, accepted int64) {
 	return e.counter(func(s *scheduler) int64 { return s.drafted.Load() }),
 		e.counter(func(s *scheduler) int64 { return s.draftsAccepted.Load() })
+}
+
+// ToolGrammar is how many replies' tool calls the grammar took hold of since
+// the model loaded, and how many of their tokens it had drawn again.
+func (e *Engine) ToolGrammar() (held, redrawn int64) {
+	return e.counter(func(s *scheduler) int64 { return s.callsHeld.Load() }),
+		e.counter(func(s *scheduler) int64 { return s.redrawn.Load() })
 }
 
 func (e *Engine) counter(read func(*scheduler) int64) int64 {

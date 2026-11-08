@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -75,6 +78,78 @@ func TestCanChat(t *testing.T) {
 	}{{nil, true}, {[]string{"completion", "vision"}, true}, {[]string{"embedding"}, false}} {
 		if got := canChat(c.caps); got != c.want {
 			t.Errorf("canChat(%q) = %v, want %v", c.caps, got, c.want)
+		}
+	}
+}
+
+// Pi is pointed at a directory of kinfer's, whose models.json has kinfer as
+// its one provider, and the model is picked by a name without colons, since
+// Pi's --model reads ":<suffix>" as a thinking level.
+func TestPiGetsADirectoryOfItsOwn(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	a, _ := findAgent("pi")
+	args, set := a.setup("http://127.0.0.1:11500", "qwen3.8:27b-mlx", 32768)
+	dir := filepath.Join(home, ".kinfer", "agents", "pi")
+	if !slices.Equal(args, []string{"--provider", "kinfer", "--model", "qwen3.8-27b-mlx"}) ||
+		!slices.Equal(set, []string{"PI_CODING_AGENT_DIR=" + dir}) {
+		t.Errorf("args %q, env %q", args, set)
+	}
+	if got, err := writeAgentFiles(a, "http://127.0.0.1:11500", "qwen3.8:27b-mlx", 32768); err != nil || got != dir {
+		t.Fatalf("written to %q, %v; want %s", got, err, dir)
+	}
+	var cfg struct {
+		Providers map[string]struct {
+			BaseURL string `json:"baseUrl"`
+			API     string `json:"api"`
+			Models  []struct {
+				ID            string `json:"id"`
+				Name          string `json:"name"`
+				ContextWindow int    `json:"contextWindow"`
+			} `json:"models"`
+		} `json:"providers"`
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "models.json"))
+	if err != nil || json.Unmarshal(b, &cfg) != nil {
+		t.Fatalf("models.json: %s, %v", b, err)
+	}
+	p := cfg.Providers["kinfer"]
+	if len(cfg.Providers) != 1 || p.BaseURL != "http://127.0.0.1:11500/v1" || p.API != "openai-completions" || len(p.Models) != 1 ||
+		p.Models[0].ID != "qwen3.8:27b-mlx" || p.Models[0].Name != "qwen3.8-27b-mlx" || p.Models[0].ContextWindow != 32768 {
+		t.Errorf("models.json: %s", b)
+	}
+}
+
+// Hermes gets a home of kinfer's, whose config.yaml names kinfer as its custom
+// provider and the context it compresses against.
+func TestHermesGetsAHomeOfItsOwn(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	a, _ := findAgent("hermes")
+	if _, set := a.setup("http://192.168.0.21:11590", "ornith-1.5:35b", 65536); !slices.Equal(set,
+		[]string{"HERMES_HOME=" + filepath.Join(home, ".kinfer", "agents", "hermes")}) {
+		t.Errorf("env %q", set)
+	}
+	got := string(a.files("http://192.168.0.21:11590", "ornith-1.5:35b", 65536)["config.yaml"])
+	for _, want := range []string{"model:\n", `  provider: "custom"`, `  base_url: "http://192.168.0.21:11590/v1"`,
+		`  default: "ornith-1.5:35b"`, "  context_length: 65536"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("config.yaml lacks %q:\n%s", want, got)
+		}
+	}
+}
+
+// OpenClaw is told, not run: the snippet has kinfer as a provider and the
+// model as its agents' primary.
+func TestOpenClawIsOnlyToldHow(t *testing.T) {
+	a, _ := findAgent("openclaw")
+	if a.printOnly == nil || a.setup != nil || a.files != nil {
+		t.Fatal("openclaw should only print")
+	}
+	got := a.printOnly("http://127.0.0.1:11500", "qwen3.8-27b-q4_k_m", 32768)
+	for _, want := range []string{`"baseUrl": "http://127.0.0.1:11500/v1"`, `"primary": "kinfer/qwen3.8-27b-q4_k_m"`, `"contextWindow": 32768`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lacks %s:\n%s", want, got)
 		}
 	}
 }

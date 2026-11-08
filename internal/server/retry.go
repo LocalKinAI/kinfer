@@ -172,6 +172,8 @@ func (rt *retrying) Load() (waiting, busy, slots int) { return rt.current().Load
 func (rt *retrying) PromptTokens() int64              { return rt.current().PromptTokens() }
 func (rt *retrying) EvalTokens() int64                { return rt.current().EvalTokens() }
 func (rt *retrying) Drafts() (int64, int64)           { return rt.current().Drafts() }
+func (rt *retrying) Reuse() (int64, int)              { return rt.current().Reuse() }
+func (rt *retrying) ToolGrammar() (int64, int64)      { return rt.current().ToolGrammar() }
 func (rt *retrying) Context() (int, int)              { return rt.current().Context() }
 func (rt *retrying) ToolFormat() tools.Format         { return rt.current().ToolFormat() }
 

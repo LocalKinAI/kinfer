@@ -82,6 +82,11 @@ type Shape struct {
 	// them only when asked to, and keeps their cache in a context of its own.
 	Nextn int
 
+	// ChatTemplate is the chat template the file carries
+	// (tokenizer.chat_template), or "" for none: what /api/show reads a
+	// model's tools and thinking from.
+	ChatTemplate string
+
 	// MTP says the file carries that head's weights. A quantization can leave
 	// them out and keep the header's count, and llama.cpp then loads the
 	// model as if it had a head it cannot run.
@@ -443,6 +448,8 @@ func ReadHeader(r io.Reader, fileSize int64) (Header, error) {
 			sh.SSMInner = int(n)
 		case strings.HasSuffix(key, ".nextn_predict_layers"):
 			sh.Nextn = int(n)
+		case key == "tokenizer.chat_template":
+			sh.ChatTemplate, _ = v.(string)
 		case key == "tokenizer.ggml.tokens":
 			if a, ok := v.(arrayLen); ok {
 				sh.Vocab = int(a)

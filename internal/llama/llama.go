@@ -69,6 +69,22 @@ type SamplerChainParams struct {
 	NoPerf uint8
 }
 
+// TokenData mirrors struct llama_token_data (12 bytes): one candidate.
+type TokenData struct {
+	ID    Token
+	Logit float32
+	P     float32
+}
+
+// TokenDataArray mirrors struct llama_token_data_array (32 bytes): the
+// candidates a sampler narrows, and which of them it picked.
+type TokenDataArray struct {
+	Data     *TokenData
+	Size     uint64
+	Selected int64
+	Sorted   bool
+}
+
 // ModelParams mirrors struct llama_model_params (80 bytes).
 type ModelParams struct {
 	Devices              uintptr
@@ -212,6 +228,9 @@ var (
 	samplerSample       func(s Sampler, c Context, idx int32) Token
 	samplerReset        func(s Sampler)
 	samplerFree         func(s Sampler)
+	samplerInitGrammar  func(v Vocab, grammar, root string) Sampler
+	samplerApply        func(s Sampler, cur *TokenDataArray)
+	samplerAccept       func(s Sampler, t Token)
 
 	modelChatTemplate    func(m Model, name *byte) *byte
 	chatApplyTemplate    func(tmpl *byte, msgs *chatMessage, n uint64, addAss bool, buf *byte, length int32) int32
@@ -255,6 +274,8 @@ func bind(dir string) error {
 		{"llama_context_params", unsafe.Sizeof(ContextParams{}), 168},
 		{"llama_batch", unsafe.Sizeof(Batch{}), 56},
 		{"llama_sampler_chain_params", unsafe.Sizeof(SamplerChainParams{}), 1},
+		{"llama_token_data", unsafe.Sizeof(TokenData{}), 12},
+		{"llama_token_data_array", unsafe.Sizeof(TokenDataArray{}), 32},
 	} {
 		if c.got != c.want {
 			return fmt.Errorf("%s is %d bytes in Go but %d in llama.h — "+
@@ -320,6 +341,9 @@ func bind(dir string) error {
 		{&samplerSample, "llama_sampler_sample"},
 		{&samplerReset, "llama_sampler_reset"},
 		{&samplerFree, "llama_sampler_free"},
+		{&samplerInitGrammar, "llama_sampler_init_grammar"},
+		{&samplerApply, "llama_sampler_apply"},
+		{&samplerAccept, "llama_sampler_accept"},
 		{&modelChatTemplate, "llama_model_chat_template"},
 		{&chatApplyTemplate, "llama_chat_apply_template"},
 		{&chatBuiltinTemplates, "llama_chat_builtin_templates"},
@@ -792,6 +816,26 @@ func SamplerReset(s Sampler) { samplerReset(s) }
 
 // SamplerFree releases a sampler and, for a chain, everything in it.
 func SamplerFree(s Sampler) { samplerFree(s) }
+
+// SamplerGrammar builds a sampler that rules out every token the GBNF grammar
+// does not allow next, starting from the rule named root. Zero means the
+// grammar did not parse; llama.cpp has written why to stderr.
+//
+// It throws — and so aborts the process — if it is ever told to accept a token
+// it would have ruled out, so a caller accepts only what it drew through it.
+func SamplerGrammar(v Vocab, grammar, root string) Sampler {
+	return samplerInitGrammar(v, grammar, root)
+}
+
+// SamplerApply runs s over cur, without accepting anything.
+func SamplerApply(s Sampler, cur *TokenDataArray) {
+	samplerApply(s, cur)
+	runtime.KeepAlive(cur)
+}
+
+// SamplerAccept records t as drawn: the penalty history of a chain, the
+// position in its text of a grammar.
+func SamplerAccept(s Sampler, t Token) { samplerAccept(s, t) }
 
 // libName is the file to dlopen. It is the versioned soname, not the plain
 // one: llama.cpp's own macOS builds reference @rpath/libggml.0.dylib, so the

@@ -18,7 +18,13 @@
 //	repetition penalty → top-k → top-p → temperature → draw
 package sampling
 
-import "github.com/LocalKinAI/kinfer/internal/llama"
+import (
+	"errors"
+	"math"
+	"unsafe"
+
+	"github.com/LocalKinAI/kinfer/internal/llama"
+)
 
 // Params configures a Sampler. The zero value is not useful; start from
 // DefaultParams.
@@ -77,6 +83,38 @@ func PenaltiesOn(p Params) bool {
 // reclaim.
 type Sampler struct {
 	chain llama.Sampler
+
+	// grammar holds the reply to a grammar from the moment trigger is drawn
+	// outside a think block; see Constrain. held is that moment passed.
+	grammar                  llama.Sampler
+	trigger, open, close     llama.Token
+	thinking, startsThinking bool
+	held                     bool
+	redrawn                  int
+	nVocab                   int32
+	cur                      []llama.TokenData // allocated once held
+}
+
+// NoToken is no token: a Grammar's think block, where the model has none.
+const NoToken llama.Token = -1
+
+// Grammar holds what a Sampler draws to a GBNF grammar from the moment it draws
+// Trigger, the token the grammar's text opens with, to the end of the reply.
+type Grammar struct {
+	Vocab llama.Vocab
+
+	// Rules is the grammar, its first rule named root.
+	Rules string
+
+	// Trigger is drawn freely; it and everything after it are held to Rules.
+	Trigger llama.Token
+
+	// Open and Close are a think block's tokens, or NoToken, and Thinking
+	// says the reply starts inside one the prompt opened. Inside it a model
+	// may write anything, a call it is only thinking about included, so
+	// Trigger counts only outside one.
+	Open, Close llama.Token
+	Thinking    bool
 }
 
 // New builds a sampler chain for p.
@@ -132,21 +170,111 @@ func New(p Params) *Sampler {
 // the position its last token occupied, and -1 (the last row) would hand every
 // slot the same token.
 func (s *Sampler) Sample(ctx llama.Context, idx int32) llama.Token {
-	return llama.SamplerSample(s.chain, ctx, idx)
+	if s.held {
+		return s.drawHeld(llama.Logits(ctx, idx, s.nVocab))
+	}
+	tok := llama.SamplerSample(s.chain, ctx, idx)
+	s.saw(tok)
+	return tok
 }
 
-// Reset forgets the penalty history, as if the sampler were new.
+// saw follows a token drawn freely: a think block's open or close, or the
+// grammar's trigger, which it takes as the first of its text.
+func (s *Sampler) saw(tok llama.Token) {
+	if s.grammar == 0 {
+		return
+	}
+	switch {
+	case tok == s.open:
+		s.thinking = true
+	case tok == s.close:
+		s.thinking = false
+	case tok == s.trigger && !s.thinking:
+		llama.SamplerAccept(s.grammar, tok)
+		s.held = true
+	}
+}
+
+// Constrain holds the rest of the reply to g. An error means its rules did
+// not parse, and the sampler draws as it did.
+func (s *Sampler) Constrain(g Grammar) error {
+	gs := llama.SamplerGrammar(g.Vocab, g.Rules, "root")
+	if gs == 0 {
+		return errors.New("llama.cpp did not take the grammar")
+	}
+	if s.grammar != 0 {
+		llama.SamplerFree(s.grammar)
+	}
+	s.grammar, s.trigger, s.open, s.close = gs, g.Trigger, g.Open, g.Close
+	s.thinking, s.startsThinking, s.held = g.Thinking, g.Thinking, false
+	s.nVocab = llama.NVocab(g.Vocab)
+	return nil
+}
+
+// drawHeld draws from logits under the grammar the way llama.cpp's own server
+// does: from the chain first, and only when the grammar rules out what that
+// drew, again with the grammar applied first. A model writing a call it was taught nearly
+// always draws an allowed token, and applying the grammar first every time
+// would test all of the vocabulary's 151,936 candidates against it for each
+// token instead of one.
+//
+// Only a token drawn through the grammar is ever accepted by it: a grammar
+// told to accept one it rules out throws, which aborts the process.
+func (s *Sampler) drawHeld(logits []float32) llama.Token {
+	tok := s.pick(logits, false)
+	one := llama.TokenData{ID: tok, Logit: 1}
+	llama.SamplerApply(s.grammar, &llama.TokenDataArray{Data: &one, Size: 1, Selected: -1})
+	if math.IsInf(float64(one.Logit), -1) {
+		tok = s.pick(logits, true)
+		s.redrawn++
+	}
+	llama.SamplerAccept(s.chain, tok)
+	llama.SamplerAccept(s.grammar, tok)
+	return tok
+}
+
+// pick runs the chain over every candidate, after the grammar if grammarFirst,
+// and returns the token it selected without accepting it.
+func (s *Sampler) pick(logits []float32, grammarFirst bool) llama.Token {
+	if len(s.cur) != len(logits) {
+		s.cur = make([]llama.TokenData, len(logits))
+	}
+	for i, l := range logits {
+		s.cur[i] = llama.TokenData{ID: llama.Token(i), Logit: l}
+	}
+	arr := llama.TokenDataArray{Data: &s.cur[0], Size: uint64(len(s.cur)), Selected: -1}
+	if grammarFirst {
+		llama.SamplerApply(s.grammar, &arr)
+	}
+	llama.SamplerApply(s.chain, &arr)
+	return unsafe.Slice(arr.Data, arr.Size)[arr.Selected].ID
+}
+
+// Held reports whether a grammar took hold of the reply, and how many of the
+// tokens drawn since it did were drawn again because it ruled the first out.
+func (s *Sampler) Held() (held bool, redrawn int) { return s.held, s.redrawn }
+
+// Reset forgets the penalty history, as if the sampler were new. A grammar
+// stays, waiting for its trigger again.
 func (s *Sampler) Reset() {
 	if s.chain != 0 {
 		llama.SamplerReset(s.chain)
 	}
+	if s.grammar != 0 {
+		llama.SamplerReset(s.grammar)
+		s.thinking, s.held, s.redrawn = s.startsThinking, false, 0
+	}
 }
 
-// Close frees the chain. Safe to call twice.
+// Close frees the chain and any grammar. Safe to call twice.
 func (s *Sampler) Close() {
 	if s.chain != 0 {
 		llama.SamplerFree(s.chain)
 		s.chain = 0
+	}
+	if s.grammar != 0 {
+		llama.SamplerFree(s.grammar)
+		s.grammar = 0
 	}
 }
 

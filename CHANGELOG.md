@@ -2,17 +2,108 @@
 
 ## Unreleased
 
+### Added — function-xml tool calls held to their form and their schema
+
+A GGUF model that writes its calls in the XML form (Qwen3.5 and later, and
+what is built on them) now writes each `<tool_call>` outside its thinking under
+a grammar made from the request's tools: a well-formed, closed call; a declared
+parameter that says integer, number, boolean, enum, object or array reads as
+one; nothing after the last call but the end of the turn. Other values, a
+file's contents among them, are free as long as they do not close the
+parameter early, and so are functions and parameters the request did not
+declare, which the caller goes on reporting: a grammar of declared names only
+would have turned the 4 calls to a missing `bash` or `shell`, in the 19,813 the
+LocalKin swarm logged, into calls to something else. Every one of the swarm's
+241 skills gets through with values of each kind its schema allows. Tokens are
+drawn as before and drawn again under the grammar only when it rules one out,
+as llama-server does: 0.1 ms a token, 9–25 ms for one drawn again; making the
+grammar costs a request 4 ms with 57 tools. A value may not run into
+`</function>` or `</tool_call>` either, so a model that leaves a parameter
+open is led back to `</parameter>` rather than writing past its turn.
+
+Played the way the box's 22 swarm seats play it — their prompts and tools,
+214 tools for the family seats, a canned answer to each call, up to four
+rounds — on the box and the laptop, the grammar on and off:
+
+| | calls | invalid, on / off | tokens drawn again | decode, on / off |
+|---|---|---|---|---|
+| ornith-1.5:35b, box | 78 / 72 | 6 / 7 | 0 | 120 / 112 tok/s |
+| ornith-1.5:35b, laptop | 82 / 87 | 3 / 8 | 0 | 138.4 / 138.6 |
+| ornith, laptop, 8 at once | 80 | 5 | 0 | |
+| qwen3.8-27b, box | 107 / 105 | 0 / 2 | 2 | 52.2 / 53.1 |
+| Flash-Next, laptop | 95 / 108 | 4 / 10 | 7 | 9.5 / 9.8 |
+| qwen2.5-0.5b (Hermes), box | 8 / 8 | 0 / 0 | not held | 311 / 309 |
+
+What is left invalid with the grammar on is a call to a function the seat
+does not have (`bash`, `weather`, `lean_verify`), passed through as before.
+What it changed: qwen3.8-27b's and Flash-Next's `"hourly": True` and `False`,
+read as strings, became booleans; told to break the schema, ornith wrote
+`"unit": "K"`, `"days": "到月底"`, `"hourly": "要"` and a comma-separated
+string for an array, and under the grammar `celsius`, `14`, `true` and a JSON
+array. Two runs with the grammar off differ from each other as much as on
+from off (11 of 13 cases on fresh servers, greedy), so replies that differ
+are not the grammar's doing; the tokens it drew again are. Hermes, DSML and
+MLX models are unchanged; `KINFER_NO_TOOL_GRAMMAR=1` turns it off.
+
+### Added — `kinfer launch pi`, `hermes` and `openclaw`, untested
+
+Written from each agent's documentation (2026-11-07) and not run against kinfer.
+Pi and Hermes Agent take their provider only from files, so each is pointed, by
+`PI_CODING_AGENT_DIR` and `HERMES_HOME`, at a directory of kinfer's under
+`~/.kinfer/agents` holding kinfer as its one provider, the model and its context
+window; their own `~/.pi` and `~/.hermes` are neither read nor changed. Pi picks
+the model by a name without colons, which its `--model` reads as a thinking
+level. OpenClaw runs as a background service of its own, so `launch openclaw`
+prints the configuration to merge and runs nothing. launch installs none of
+them.
+
+### Added — what agents read to fit themselves to a server
+
+- `/api/show` lists `tools`, `thinking` and `vision` among a model's
+  capabilities, from its chat template (now read from the GGUF header) and its
+  projector; `model_info` gives its architecture and trained context; and while
+  it is loaded `parameters` holds `num_ctx`, the window each conversation has,
+  which Hermes sizes its history by.
+- `/props`, as llama-server answers it, with that window, the slots and the
+  template's capabilities.
+- `/v1/models` gives the loaded model's `context_length`.
+- `/metrics`: `kinfer_prompt_reused_tokens_total`, the prompt tokens the prefix
+  pool gave, and `kinfer_prefix_entries`, the pool's entries now — 0 reads every
+  prompt whole, as the box's Flash-Next did for an hour with nothing to say so.
+
+### Fixed — `-host-experts` without `-moe-cache` loads again
+
+v0.2.5 gives experts in host memory passes of 4096, and with no GPU cache that
+pass asks llama.cpp for buffers the GPU may not have: Flash-Next with
+`-host-experts 36` on the MacBook Pro asked for 36.9 GiB of its 40 and failed to
+load, where v0.2.4 served it in passes of 2048. A context that cannot be made
+with a pass kinfer chose is now tried with a smaller one, 2048 first, before
+the load fails; that one loaded with 4 slots of 32768 and 6.2 GiB to spare.
+
+### Fixed — experts placed by hand that leave a little room are not refused
+
+`-host-experts 24 -moe-cache 8192 -batch 2048` and `-host-experts 36
+-moe-cache 20000` on the MacBook Pro left 1.7 and 2.2 GiB after the weights
+and were refused ("no room for a context"), while the same flags leaving 0.0
+GiB were loaded with a warning, as chosen on 11-06. Experts placed by hand are
+now sized like that whatever is left, measured down to what fits, and loaded
+with the warning: both answer.
+
 ### Fixed — a pool lost to the larger pass for experts in host memory
 
 v0.2.5 reads prompts in passes of 4096 when experts are in host memory, and a
 prefix pool needs the KV cache unified, whose pass reads every conversation's
 cells. On the box, Flash-Next under the service's `-slots 4 -prefix auto` lost
 its pool to that: every turn of an agent's conversation was read whole again,
-19–41 s to a first token with 11–21k-token prompts. Before the pool gives way,
-the pass now goes back to 2048. The same box, back to back with the same flags:
+19–41 s to a first token with 11–21k-token prompts. Before the pool's last
+entry gives way — after the pool has shared the slots' cells and the expert
+cache has given up what it may, as in v0.2.5 — the pass now goes back to 2048.
+The same box with its services running, back to back with the same flags:
 v0.2.5 kept no pool and read the 7,813-token second turn in 9.6 s; now one entry
-stays and the turn is read in 0.4 s. Models whose experts are all on the GPU are
-untouched.
+stays and the turn is read in 0.4 s. Where v0.2.5 kept a pool, nothing changes:
+Flash-Next with `-slots 4` on the MacBook Pro still reads an 11,000-token prompt
+at 761–846 tok/s (v0.2.5 804–844), and DeepSeek-V4.1 placed on the box at 222.
+Models whose experts are all on the GPU are untouched.
 
 ### Fixed — an Ollama MLX model served without its chat template
 

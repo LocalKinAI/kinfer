@@ -318,3 +318,17 @@ func TestReadShapeFindsTheMTPHead(t *testing.T) {
 		t.Errorf("without them: Nextn %d, MTP %v; want 1, false", without.Nextn, without.MTP)
 	}
 }
+
+// The header's chat template is read, for /api/show to say what the model
+// can do: tools, thinking.
+func TestReadHeaderReadsTheChatTemplate(t *testing.T) {
+	tpl := `{%- if tools %}<tools></tools>{%- endif %}<think>`
+	raw := ggufFile(map[string]any{"general.architecture": "qwen35", "tokenizer.chat_template": tpl}, nil)
+	h, err := ReadHeader(bytes.NewReader(raw), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Shape.ChatTemplate != tpl {
+		t.Errorf("ChatTemplate = %q, want %q", h.Shape.ChatTemplate, tpl)
+	}
+}

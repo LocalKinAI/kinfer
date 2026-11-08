@@ -1181,6 +1181,8 @@ func (f *fakeEngine) Load() (waiting, busy, slots int) { return 0, 0, 1 }
 func (f *fakeEngine) PromptTokens() int64              { return 0 }
 func (f *fakeEngine) EvalTokens() int64                { return 0 }
 func (f *fakeEngine) Drafts() (int64, int64)           { return 0, 0 }
+func (f *fakeEngine) Reuse() (int64, int)              { return 0, 0 }
+func (f *fakeEngine) ToolGrammar() (int64, int64)      { return 0, 0 }
 func (f *fakeEngine) Context() (int, int)              { return 4096, 16384 }
 
 // CountTokens counts a token a word, and one more for each tool offered, so a
@@ -1301,6 +1303,33 @@ func TestMetricsFileA503AsRefused(t *testing.T) {
 	}
 }
 
+type reuseEngine struct{ fakeEngine }
+
+func (*reuseEngine) Reuse() (int64, int) { return 1234, 2 }
+
+// /metrics says how much of the prompts the prefix pool gave and how many
+// entries it has: on the box a pool sized down to 0 read every agent turn
+// whole for an hour, and no number said so.
+func TestMetricsReportThePrefixPool(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	srv.open = func(p string, _ engine.Options) (generator, error) {
+		return &reuseEngine{fakeEngine{path: p}}, nil
+	}
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/api/chat", strings.NewReader(
+		`{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("setup: status %d %s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for _, want := range []string{"kinfer_prompt_reused_tokens_total 1234\n", "kinfer_prefix_entries 2\n"} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("/metrics lacks %q:\n%s", want, w.Body.String())
+		}
+	}
+}
+
 // A 4xx must be counted. It was not: a client sending prompts too large for a
 // slot got 413 on every request, /metrics showed nothing but zeros, and the
 // operator's question — "why does it not answer" — had no number to point at.
@@ -1355,5 +1384,77 @@ func TestHelloAnswers(t *testing.T) {
 	srv.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/api/hello", nil))
 	if w.Code != http.StatusOK {
 		t.Errorf("HEAD /api/hello: status %d, want 200", w.Code)
+	}
+}
+
+// A model's template says what /api/show reports beside completion: Qwen's
+// lays out tools and has a think block; plain ChatML has neither.
+func TestTemplateCaps(t *testing.T) {
+	qwen := `{%- if tools %}<tools>{% for tool in tools %}{{ tool | tojson }}{% endfor %}</tools>{%- endif %}` +
+		`{%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>{%- endif %}`
+	if tools, thinking := templateCaps(qwen); !tools || !thinking {
+		t.Errorf("Qwen's template: tools %v, thinking %v; want both", tools, thinking)
+	}
+	chatml := `{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}`
+	if tools, thinking := templateCaps(chatml); tools || thinking {
+		t.Errorf("ChatML: tools %v, thinking %v; want neither", tools, thinking)
+	}
+}
+
+// An MLX directory is described from its config.json and chat_template.jinja.
+func TestDescribeAnMLXDirectory(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"config.json":         `{"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144}}`,
+		"tokenizer.json":      `{}`,
+		"model.safetensors":   "",
+		"chat_template.jinja": `{%- if tools %}…{% endif %}<think>`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := describe(dir)
+	if !f.mlx || f.arch != "qwen3_5_text" || f.trained != 262144 || !f.tools || !f.thinking {
+		t.Errorf("described as %+v", f)
+	}
+}
+
+// The loaded model's window per conversation is what /api/show (num_ctx),
+// /props (n_ctx) and the models list (context_length) report, so an agent
+// sizes its history to what kinfer gives; with nothing loaded /props says 0.
+func TestResidentModelReportsItsWindow(t *testing.T) {
+	srv, _ := newTestServer(t, "alpha")
+	defer srv.Close()
+	get := func(method, path, body string) map[string]any {
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(body)))
+		var m map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil || w.Code != http.StatusOK {
+			t.Fatalf("%s %s: status %d, %s (%v)", method, path, w.Code, w.Body.String(), err)
+		}
+		return m
+	}
+	nCtx := func(props map[string]any) any {
+		return props["default_generation_settings"].(map[string]any)["n_ctx"]
+	}
+	if n := nCtx(get(http.MethodGet, "/props", "")); n != float64(0) {
+		t.Errorf("/props with nothing loaded: n_ctx %v, want 0", n)
+	}
+	if p, ok := get(http.MethodPost, "/api/show", `{"model":"alpha"}`)["parameters"]; ok {
+		t.Errorf("/api/show of a model not loaded has parameters %v", p)
+	}
+
+	get(http.MethodPost, "/api/chat", `{"model":"alpha","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	props := get(http.MethodGet, "/props", "")
+	if n := nCtx(props); n != float64(4096) || props["total_slots"] != float64(1) {
+		t.Errorf("/props: n_ctx %v, total_slots %v; want 4096, 1", n, props["total_slots"])
+	}
+	if p := get(http.MethodPost, "/api/show", `{"model":"alpha"}`)["parameters"]; p != "num_ctx 4096" {
+		t.Errorf("/api/show parameters %v, want num_ctx 4096", p)
+	}
+	data := get(http.MethodGet, "/v1/models", "")["data"].([]any)
+	if len(data) != 1 || data[0].(map[string]any)["context_length"] != float64(4096) {
+		t.Errorf("/v1/models: %v, want alpha with context_length 4096", data)
 	}
 }

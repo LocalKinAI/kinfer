@@ -144,9 +144,11 @@ type scheduler struct {
 	// queue to be sized, and waits here for a slot or for the layout it needs.
 	held *job
 
-	// nSlots and holding mirror len(slots) and held != nil for readers on
-	// other goroutines: the slots are replaced when the layout changes.
+	// nSlots, nPrefix and holding mirror len(slots), the pool's entries and
+	// held != nil for readers on other goroutines: the slots and the pool are
+	// replaced when the layout changes.
 	nSlots  atomic.Int32
+	nPrefix atomic.Int32
 	holding atomic.Bool
 
 	// onFatal is called when llama.cpp's backend fails unrecoverably, so the
@@ -180,10 +182,25 @@ type scheduler struct {
 	busy       atomic.Int64
 	promptSeen atomic.Int64
 	evalSeen   atomic.Int64
+	// reusedSeen is the prompt tokens of promptSeen the prefix pool gave a
+	// slot instead of the model reading them.
+	reusedSeen atomic.Int64
 
 	// drafted and draftsAccepted count the MTP head's drafts the model read
 	// and the ones it agreed with, across every context this scheduler had.
 	drafted, draftsAccepted atomic.Int64
+
+	// callOpen, thinkOpen and thinkClose are the tokens <tool_call>, <think>
+	// and </think>, or sampling.NoToken where one is more than one; see
+	// toolGrammar. noGrammar is KINFER_NO_TOOL_GRAMMAR, which leaves calls
+	// unchecked.
+	callOpen, thinkOpen, thinkClose llama.Token
+	noGrammar                       bool
+
+	// callsHeld counts the replies whose tool calls the grammar took hold of,
+	// and redrawn the tokens in them drawn again because it ruled out the
+	// first: how often it changed what a model wrote.
+	callsHeld, redrawn atomic.Int64
 
 	// debug counters, printed when KINFER_DEBUG_SCHED is set. Batch
 	// composition is the thing worth watching: if steps mostly carry one token
@@ -330,6 +347,10 @@ func newScheduler(lctx llama.Context, draft *drafter, home layout, vocab llama.V
 		stop:          make(chan struct{}),
 		stopped:       make(chan struct{}),
 		debug:         os.Getenv("KINFER_DEBUG_SCHED") != "",
+		callOpen:      oneToken(vocab, "<tool_call>"),
+		thinkOpen:     oneToken(vocab, "<think>"),
+		thinkClose:    oneToken(vocab, "</think>"),
+		noGrammar:     os.Getenv("KINFER_NO_TOOL_GRAMMAR") != "",
 	}
 	s.install(lctx, draft, home)
 	go s.run()
@@ -756,6 +777,52 @@ func (s *scheduler) occupy(sl *slot, j *job, tokens []llama.Token, reused int, c
 	sl.evalStart = time.Time{}
 	sl.promptEval = 0
 	sl.sampler = sampling.New(j.params.Params)
+	if g, ok := s.toolGrammar(j); ok {
+		if err := sl.sampler.Constrain(g); err != nil {
+			log.Printf("tool calls go unchecked: %v", err)
+		}
+	}
+}
+
+// toolGrammar is the grammar that holds a job's tool calls to their form and
+// to the schemas it declared, for a model that writes them in the XML form: a
+// call left open, prose after it, or an integer that is not one then cannot be
+// written. A small model gets these wrong often enough that an agent loses
+// turns to them. Names it did not declare are let through; see
+// tools.FunctionXMLGrammar.
+//
+// Only a call is held, from its <tool_call> on; whatever the model writes
+// before it is drawn as ever. Inside a think block, the prompt's or the
+// model's own, nothing is held, so a call the model only thinks about is not
+// taken for one. A resumed reply goes unchecked: what it has written so far is
+// not known to the grammar.
+func (s *scheduler) toolGrammar(j *job) (sampling.Grammar, bool) {
+	p := j.params
+	if s.noGrammar || len(p.Tools) == 0 || p.Resume != "" ||
+		s.tpl.ToolFormat() != tools.FunctionXML || s.callOpen == sampling.NoToken {
+		return sampling.Grammar{}, false
+	}
+	thinking := s.tpl.OpensThink(p.thinking())
+	if thinking && s.thinkClose == sampling.NoToken {
+		return sampling.Grammar{}, false
+	}
+	rules, err := tools.FunctionXMLGrammar(p.Tools)
+	if err != nil {
+		log.Printf("tool calls go unchecked: %v", err)
+		return sampling.Grammar{}, false
+	}
+	return sampling.Grammar{Vocab: s.vocab, Rules: rules, Trigger: s.callOpen,
+		Open: s.thinkOpen, Close: s.thinkClose, Thinking: thinking}, true
+}
+
+// oneToken is the token text is, when it is exactly one and reads back as
+// text, or sampling.NoToken.
+func oneToken(v llama.Vocab, text string) llama.Token {
+	toks, err := llama.Tokenize(v, text, false, true)
+	if err != nil || len(toks) != 1 || llama.TokenToPiece(v, toks[0], true) != text {
+		return sampling.NoToken
+	}
+	return toks[0]
 }
 
 // replyRoom is how much of a slot a fitted prompt leaves for the reply: what
@@ -1219,6 +1286,10 @@ func (s *scheduler) release(sl *slot, err error) {
 		s.forget(sl.seq)
 	}
 	if sl.sampler != nil {
+		if held, n := sl.sampler.Held(); held {
+			s.callsHeld.Add(1)
+			s.redrawn.Add(int64(n))
+		}
 		sl.sampler.Close()
 		sl.sampler = nil
 	}
@@ -1238,6 +1309,7 @@ func (s *scheduler) release(sl *slot, err error) {
 	s.rate.done()
 	s.busy.Add(-1)
 	s.promptSeen.Add(int64(len(sl.prompt) + sl.media))
+	s.reusedSeen.Add(int64(sl.reused))
 	s.evalSeen.Add(int64(sl.nGen))
 	sl.job = nil
 	sl.prompt = nil

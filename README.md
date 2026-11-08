@@ -229,7 +229,8 @@ several. How it works, and every measurement behind it:
   bounded queue that refuses rather than hangs; `fit`, `plan` and `can-run` size
   a model before it is loaded or downloaded.
 - **Agents** ([docs/agents.md](docs/agents.md)): `kinfer launch claude` or
-  `kinfer launch codex` starts Claude Code or Codex on a local model; a prefix
+  `kinfer launch codex` starts Claude Code or Codex on a local model (and Pi
+  and Hermes Agent, untested so far; OpenClaw is told how); a prefix
   pool, so a repeated system prompt is read once; chat templates read from the
   model; tool calls in the Ollama and OpenAI dialects; a reasoning model's
   thinking kept apart from its answer.

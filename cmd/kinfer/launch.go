@@ -9,7 +9,10 @@
 // the server if nothing is serving, settles on a model, and hands the agent its
 // settings in its environment and on its command line. Nothing is written to
 // an agent's own configuration, so there is nothing to restore afterwards: the
-// agent started without launch is the agent it was.
+// agent started without launch is the agent it was. An agent that takes its
+// provider only from files (Pi, Hermes) is given a directory of its own under
+// ~/.kinfer/agents instead of the one it keeps; one that runs as a background
+// service of its own (OpenClaw) is told how, and nothing is run.
 package main
 
 import (
@@ -24,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -42,6 +46,14 @@ type agent struct {
 	// the environment.
 	setup func(base, model string, window int) (args, env []string)
 	drop  []string
+	// files are what kinfer writes, by name, into agentDir for an agent that
+	// reads its provider only from files; setup points the agent there.
+	files func(base, model string, window int) map[string][]byte
+	// printOnly, for an agent that runs as a background service of its own,
+	// is how to point it at kinfer: launch prints it and runs nothing.
+	printOnly func(base, model string, window int) string
+	// minWindow is the context the agent asks for at least.
+	minWindow int
 }
 
 var agents = []agent{
@@ -58,6 +70,89 @@ var agents = []agent{
 		install: "npm install -g @openai/codex",
 		setup:   codexSetup,
 	},
+	// The three below are written from their documentation (2026-11-07) and
+	// have not been run against kinfer.
+	{
+		name: "pi", bin: "pi", what: "Pi",
+		install: "npm install -g @earendil-works/pi-coding-agent",
+		setup:   piSetup, files: piFiles,
+	},
+	{
+		name: "hermes", bin: "hermes", what: "Hermes Agent",
+		install: "its installer, from https://hermes-agent.nousresearch.com",
+		setup:   hermesSetup, files: hermesFiles,
+		// Hermes says it needs 64k tokens of context at least.
+		minWindow: 65536,
+	},
+	{
+		name: "openclaw", bin: "openclaw", what: "OpenClaw",
+		install:   "npm install -g openclaw@latest",
+		printOnly: openclawSetup,
+	},
+}
+
+// agentDir is the directory kinfer keeps an agent's settings in, for an agent
+// whose own it does not touch.
+func agentDir(name string) string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".kinfer", "agents", name)
+}
+
+// piSetup and piFiles: Pi reads its providers from models.json in its agent
+// directory (~/.pi/agent), which PI_CODING_AGENT_DIR moves. kinfer's has kinfer
+// as its one provider. Pi's --model takes a ":<thinking>" suffix, so the model
+// is picked by a name without colons; the id it sends is kinfer's.
+func piSetup(base, model string, window int) (args, env []string) {
+	return []string{"--provider", "kinfer", "--model", piName(model)}, []string{"PI_CODING_AGENT_DIR=" + agentDir("pi")}
+}
+
+func piName(model string) string { return strings.ReplaceAll(model, ":", "-") }
+
+func piFiles(base, model string, window int) map[string][]byte {
+	m := map[string]any{"id": model, "name": piName(model)}
+	if window > 0 {
+		m["contextWindow"] = window
+	}
+	b, _ := json.MarshalIndent(map[string]any{"providers": map[string]any{"kinfer": map[string]any{
+		"baseUrl": base + "/v1", "api": "openai-completions", "apiKey": "kinfer", "models": []any{m},
+	}}}, "", "  ")
+	return map[string][]byte{"models.json": b}
+}
+
+// hermesSetup and hermesFiles: Hermes keeps its settings in HERMES_HOME
+// (~/.hermes); kinfer's config.yaml there names kinfer as its custom,
+// OpenAI-compatible provider, and the context it compresses history against.
+func hermesSetup(base, model string, window int) (args, env []string) {
+	return nil, []string{"HERMES_HOME=" + agentDir("hermes")}
+}
+
+func hermesFiles(base, model string, window int) map[string][]byte {
+	var b strings.Builder
+	b.WriteString("# Written by kinfer launch hermes, again at every launch.\n")
+	fmt.Fprintf(&b, "model:\n  provider: \"custom\"\n  base_url: %q\n  default: %q\n", base+"/v1", model)
+	if window > 0 {
+		fmt.Fprintf(&b, "  context_length: %d\n", window)
+	}
+	return map[string][]byte{"config.yaml": []byte(b.String())}
+}
+
+// openclawSetup: OpenClaw runs as a background gateway of its own, and its
+// documentation warns against starting it against another state directory, so
+// launch says how to point it at kinfer and runs nothing.
+func openclawSetup(base, model string, window int) string {
+	m := map[string]any{"id": model, "name": model, "input": []string{"text"}}
+	if window > 0 {
+		m["contextWindow"] = window
+	}
+	b, _ := json.MarshalIndent(map[string]any{
+		"models": map[string]any{"mode": "merge", "providers": map[string]any{"kinfer": map[string]any{
+			"baseUrl": base + "/v1", "apiKey": "kinfer-local", "api": "openai-completions", "models": []any{m},
+		}}},
+		"agents": map[string]any{"defaults": map[string]any{"model": map[string]any{"primary": "kinfer/" + model}}},
+	}, "", "  ")
+	return "OpenClaw runs as a background service of its own, which kinfer does not start or change.\n" +
+		"To point it at kinfer, merge this into its configuration:\n\n" + string(b) + "\n\n" +
+		"or answer its onboarding (openclaw onboard) with Custom provider, base URL " + base + "/v1, model " + model + ".\n"
 }
 
 // claudeSetup: Claude Code asks for a model by role as well as by name — a
@@ -176,7 +271,7 @@ func cmdLaunch(args []string) error {
 		return fmt.Errorf("kinfer launch knows %s, not %q", agentNames(), name)
 	}
 	bin, err := exec.LookPath(a.bin)
-	if err != nil {
+	if err != nil && a.printOnly == nil {
 		return fmt.Errorf("%s is not installed here (%s is not on PATH): %s", a.what, a.bin, a.install)
 	}
 
@@ -218,6 +313,21 @@ func cmdLaunch(args []string) error {
 		return err
 	}
 
+	if a.printOnly != nil {
+		fmt.Print(a.printOnly(base, *model, window))
+		return nil
+	}
+	if a.minWindow > 0 && window > 0 && window < a.minWindow {
+		fmt.Fprintf(os.Stderr, "kinfer launch: %s asks for %d tokens of context and this model holds %d; "+
+			"-ctx %d where kinfer serves gives it that\n", a.what, a.minWindow, window, a.minWindow)
+	}
+	if a.files != nil {
+		dir, err := writeAgentFiles(a, base, *model, window)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "kinfer launch: %s's settings for kinfer are in %s; its own are not read or changed\n", a.what, dir)
+	}
 	pre, set := a.setup(base, *model, window)
 	argv := append(append([]string{a.bin}, pre...), rest...)
 	held := ""
@@ -232,6 +342,20 @@ func cmdLaunch(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "kinfer launch: %s with %s at %s%s\n", a.what, *model, base, held)
 	return execAgent(bin, argv, agentEnv(os.Environ(), a, set))
+}
+
+// writeAgentFiles writes a's files into its directory under ~/.kinfer/agents.
+func writeAgentFiles(a agent, base, model string, window int) (string, error) {
+	dir := agentDir(a.name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	for name, b := range a.files(base, model, window) {
+		if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
 }
 
 // loadForAgent loads model at base and returns the longest conversation the

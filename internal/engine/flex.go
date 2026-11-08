@@ -258,6 +258,7 @@ func (s *scheduler) install(lctx llama.Context, draft *drafter, l layout) {
 	// Pooled prefixes live in sequence ids above the slots.
 	s.pool = newPrefixPool(lctx, draft, int32(l.slots), l.prefix, minPrefixMatch, s.wholePrefixes)
 	s.nSlots.Store(int32(l.slots))
+	s.nPrefix.Store(int32(max(l.prefix, 0)))
 }
 
 func (s *scheduler) freeSlot() *slot {

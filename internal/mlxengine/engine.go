@@ -81,7 +81,9 @@ type Engine struct {
 
 	waiting, busy      atomic.Int32
 	promptTok, evalTok atomic.Int64
-	broken             atomic.Bool
+	// reusedTok is the prompt tokens of promptTok a pooled prompt gave.
+	reusedTok atomic.Int64
+	broken    atomic.Bool
 
 	// drafts is how many tokens a reply writing alone drafts a step with
 	// the model's MTP head (solo); 0 when it has none or -draft is off.
@@ -307,8 +309,20 @@ func (e *Engine) ToolFormat() tools.Format          { return e.tpl.ToolFormat() 
 func (e *Engine) PromptTokens() int64               { return e.promptTok.Load() }
 func (e *Engine) EvalTokens() int64                 { return e.evalTok.Load() }
 func (e *Engine) Drafts() (drafted, accepted int64) { return e.drafted.Load(), e.accepted.Load() }
-func (e *Engine) Context() (perSlot, most int)      { return e.ctx, e.ctx }
-func (e *Engine) Path() string                      { return e.path }
+
+// ToolGrammar is always zero: MLX replies are not held to a grammar.
+func (e *Engine) ToolGrammar() (held, redrawn int64) { return 0, 0 }
+
+// Reuse is the prompt tokens a pooled prompt gave since the model loaded, and
+// how many entries the pool has; it is made once, at load.
+func (e *Engine) Reuse() (tokens int64, entries int) {
+	if e.pool == nil {
+		return e.reusedTok.Load(), 0
+	}
+	return e.reusedTok.Load(), len(e.pool.entries)
+}
+func (e *Engine) Context() (perSlot, most int) { return e.ctx, e.ctx }
+func (e *Engine) Path() string                 { return e.path }
 
 // Load is the queue, the replies in progress, and the most there can be.
 func (e *Engine) Load() (waiting, busy, slots int) {
@@ -750,6 +764,7 @@ func (e *Engine) prefill(j *job, drafting bool) *mlxmodel.Qwen35Cache {
 	if p := e.pool.match(j.prompt); p != nil {
 		c.Free()
 		c, read = p.cache.(*mlxmodel.Qwen35Cache).Clone(), len(p.tokens)
+		e.reusedTok.Add(int64(read))
 	}
 	// A reply that will draft has the head read its prompt too; one pooled
 	// without it does not draft (HeadReady), since the head would draft

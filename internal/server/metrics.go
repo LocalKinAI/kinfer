@@ -111,6 +111,16 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"counter", drafted, "")
 		metric("draft_accepted_total", "Drafted tokens the model accepted: written as drafted, a pass sooner.",
 			"counter", accepted, "")
+		reused, entries := cur.eng.Reuse()
+		metric("prompt_reused_tokens_total", "Prompt tokens of prompt_tokens_total the prefix pool gave instead of the model reading them.",
+			"counter", reused, "")
+		metric("prefix_entries", "Entries the prefix pool has in the layout the context has now; 0 reads every prompt whole.",
+			"gauge", entries, "")
+		held, redrawn := cur.eng.ToolGrammar()
+		metric("tool_calls_held_total", "Replies whose tool calls were written under the grammar made from the request's tools.",
+			"counter", held, "")
+		metric("tool_tokens_redrawn_total", "Tokens of those the grammar had drawn again because it ruled out what was drawn first.",
+			"counter", redrawn, "")
 		metric("model_loaded", "1 for the model currently resident.", "gauge", 1,
 			fmt.Sprintf("{model=%q}", cur.path))
 	} else {

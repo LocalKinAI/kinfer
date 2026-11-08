@@ -46,7 +46,7 @@ Examples:
   kinfer pull mlx-community/Qwen3.8-27B-4bit  # served on MLX (macOS 26.2 or later)
   kinfer run qwen                        # interactive, model stays warm
   kinfer run qwen "explain merkle trees" # one shot, same warm model
-  kinfer launch claude -model qwen3.8    # Claude Code on a local model
+  kinfer launch claude -model qwen3.8    # Claude Code on a local model (or codex, pi, hermes, openclaw)
   kinfer worker -on jackysub             # lend the GPU of the Mac at the other end of the cable
   kinfer serve -addr :11500
 

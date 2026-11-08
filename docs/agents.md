@@ -32,6 +32,46 @@ supplies them and nothing else:
 - Nothing is written to either agent's configuration, so there is nothing to
   restore afterwards. Then launch execs the agent.
 
+Three more, written from their documentation (2026-11-07) and not yet run
+against kinfer:
+
+```bash
+kinfer launch pi -model qwen3.8          # Pi
+kinfer launch hermes -model ornith-1.5:35b  # Hermes Agent
+kinfer launch openclaw -model qwen3.8    # OpenClaw: prints how, runs nothing
+```
+
+- Pi and Hermes take a provider only from files, so each gets a directory of
+  kinfer's, written again at every launch, and is pointed at it instead of its
+  own, which is neither read nor changed:
+  - Pi: `~/.kinfer/agents/pi/models.json`, with kinfer as its one provider, the
+    model and its context window; `PI_CODING_AGENT_DIR` points Pi there, and
+    `--provider kinfer --model` picks the model by a name without colons,
+    since Pi reads `:<suffix>` as a thinking level.
+  - Hermes: `~/.kinfer/agents/hermes/config.yaml`, kinfer as its custom
+    provider and `context_length` the window; `HERMES_HOME` points Hermes there.
+    Hermes asks for 64k tokens of context at least, and launch says so when the
+    model holds less.
+  - Their sessions, memories and other settings live in those directories too:
+    a launched Pi or Hermes starts without the ones it has elsewhere.
+- OpenClaw runs as a background gateway service of its own, and its
+  documentation warns against starting one against another state directory. So
+  `launch openclaw` loads the model and prints the configuration to merge into
+  OpenClaw's (kinfer as a provider, the model as its agents' primary) and the
+  answers to its onboarding, and starts nothing.
+- None of them is installed by launch: a missing one is named, with how to get
+  it.
+
+What these agents read from a server to fit themselves to it, kinfer answers:
+
+- `/api/show` lists `tools`, `thinking` and `vision` among a model's
+  capabilities when its template and files say so, its architecture and trained
+  context in `model_info`, and, while it is loaded, the window each conversation
+  has as `num_ctx` in `parameters`.
+- `/props`, as llama-server answers it: `n_ctx`, the slots, and the template's
+  capabilities, for the model loaded now.
+- `/v1/models` gives the loaded model's `context_length`.
+
 `/api/ps` says the context a loaded model gives each conversation
 (`context_length`, as Ollama's does) and the most one can have
 (`context_max`), which is where launch reads it.
@@ -207,6 +247,30 @@ rather than the string the XML form carries.
 Both conventions wrap their calls in `<tool_call>`, so only the inner form tells
 them apart — checking the outer tag first would misread every XML model as
 Hermes.
+
+**A function-xml call is held to its form and its schema.** From the
+`<tool_call>` a model writes outside its thinking, every token is drawn under a
+grammar made from the request's functions: the call has to be well formed and
+closed, a declared parameter whose schema says integer, number, boolean or an
+enum, or an object or array, has to read as one, and after the last call only
+the end of the turn may come. Any other value — a file's contents, HTML
+included — is written as it is, as long as it writes none of the closes
+`</parameter>`, `</function>` and `</tool_call>` itself: a model that leaves
+a parameter open is led back to closing it, rather than writing on past its
+turn. A function or parameter that was not declared is written as it is too,
+for the caller to report as it always has: holding a model to the declared
+names would turn the call it meant into one it did not, and in 19,813 calls the
+LocalKin swarm's seats logged, 4 asked for a `bash` or `shell` they did not
+have. Which parameters a call gives is left to the model. It is drawn the way
+llama-server draws under a grammar: from the sampler as ever, and again with the
+grammar applied first only when the grammar rules out that token, about 0.1 ms
+a token and 9–25 ms for one drawn again. Making the grammar costs a request
+1.3 ms with 12 functions, 4 ms with 57 and 14 ms with 241, the swarm's every
+skill. On the swarm's own seats it rewrote no token of ornith-1.5:35b's
+calls; it turned qwen3.8-27b's and Flash-Next's `"hourly": True`, which reads
+as a string, into `true`, and ornith's `"days": "到月底"`, written because a
+prompt said to, into a number (see the CHANGELOG for the runs). GGUF models
+only, for now; `KINFER_NO_TOOL_GRAMMAR=1` turns it off.
 
 A model whose template describes neither is refused rather than answered
 uselessly, since it would reply in prose however the functions are declared:

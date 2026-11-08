@@ -12,6 +12,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -115,6 +116,8 @@ type generator interface {
 	PromptTokens() int64
 	EvalTokens() int64
 	Drafts() (drafted, accepted int64)
+	Reuse() (tokens int64, entries int)
+	ToolGrammar() (held, redrawn int64)
 	Context() (perSlot, most int)
 	CountTokens(msgs []chat.Message, p engine.GenParams) (int, error)
 	Close()
@@ -148,6 +151,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tags", s.handleOllamaTags)
 	mux.HandleFunc("/api/ps", s.handlePS)
 	mux.HandleFunc("/api/show", s.handleShow)
+	mux.HandleFunc("/props", s.handleProps)
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"version": Version})
 	})
@@ -891,24 +895,139 @@ func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	info := describe(path)
 	capabilities := []string{"completion"}
-	if sh, err := store.ReadShape(path); err == nil && sh.Embeds() {
+	switch {
+	case info.embeds:
 		capabilities = []string{"embedding"}
+	default:
+		if info.tools {
+			capabilities = append(capabilities, "tools")
+		}
+		if info.thinking {
+			capabilities = append(capabilities, "thinking")
+		}
+		if !info.mlx && s.store.ProjectorFor(path) != "" {
+			capabilities = append(capabilities, "vision")
+		}
 	}
 	format := "gguf"
-	if mlxengine.IsModelDir(path) {
+	if info.mlx {
 		format = "safetensors"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	modelInfo := map[string]any{}
+	if info.arch != "" {
+		modelInfo["general.architecture"] = info.arch
+		if info.trained > 0 {
+			modelInfo[info.arch+".context_length"] = info.trained
+		}
+	}
+	resp := map[string]any{
 		"details": map[string]any{
 			"family":             chat.Detect(path).Name,
 			"format":             format,
 			"parameter_size":     "",
 			"quantization_level": "",
 		},
-		"model_info":   map[string]any{},
+		"model_info":   modelInfo,
 		"capabilities": capabilities,
-	})
+	}
+	// The window each conversation of the resident model has, in the field
+	// Ollama keeps a Modelfile's num_ctx in: an agent that sizes its history
+	// by it (Hermes reads num_ctx here) stays inside what kinfer gives,
+	// where the trained length would let it run past.
+	if ctx := s.residentContext(path); ctx > 0 {
+		resp["parameters"] = fmt.Sprintf("num_ctx %d", ctx)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// residentContext is the context each conversation has in the model at path
+// when it is the one loaded, else 0.
+func (s *Server) residentContext(path string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cur == nil || s.cur.path != path {
+		return 0
+	}
+	ctx, _ := s.cur.eng.Context()
+	return ctx
+}
+
+// handleProps answers GET /props as llama-server does, for the agents that read
+// a server's context window and template capabilities from there (Hermes and
+// OpenClaw do): the model loaded now, or no context while none is.
+func (s *Server) handleProps(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	cur := s.cur
+	s.mu.Unlock()
+	props := map[string]any{"default_generation_settings": map[string]any{"n_ctx": 0}, "total_slots": 0}
+	if cur != nil {
+		ctx, _ := cur.eng.Context()
+		_, _, slots := cur.eng.Load()
+		info := describe(cur.path)
+		props = map[string]any{
+			"default_generation_settings": map[string]any{"n_ctx": ctx},
+			"total_slots":                 slots,
+			"model_path":                  cur.path,
+			"model_alias":                 modelName(cur.path),
+			"chat_template_caps": map[string]any{
+				"supports_tools":            info.tools,
+				"supports_tool_calls":       info.tools,
+				"supports_reasoning":        info.thinking,
+				"supports_reasoning_effort": strings.Contains(info.template, "reasoning_effort"),
+			},
+		}
+	}
+	writeJSON(w, http.StatusOK, props)
+}
+
+// modelFacts is what /api/show and /props say of a model without loading it:
+// read from a GGUF's header, or an MLX directory's config.json and template.
+type modelFacts struct {
+	mlx, embeds     bool
+	arch, template  string
+	trained         int
+	tools, thinking bool
+}
+
+func describe(path string) modelFacts {
+	var f modelFacts
+	if mlxengine.IsModelDir(path) {
+		f.mlx = true
+		if b, err := os.ReadFile(filepath.Join(path, "chat_template.jinja")); err == nil {
+			f.template = string(b)
+		}
+		var cfg struct {
+			ModelType  string `json:"model_type"`
+			MaxPos     int    `json:"max_position_embeddings"`
+			TextConfig struct {
+				ModelType string `json:"model_type"`
+				MaxPos    int    `json:"max_position_embeddings"`
+			} `json:"text_config"`
+		}
+		if b, err := os.ReadFile(filepath.Join(path, "config.json")); err == nil && json.Unmarshal(b, &cfg) == nil {
+			f.arch = cmp.Or(cfg.TextConfig.ModelType, cfg.ModelType)
+			f.trained = cmp.Or(cfg.TextConfig.MaxPos, cfg.MaxPos)
+		}
+	} else if sh, err := store.ReadShape(path); err == nil {
+		f.embeds, f.arch, f.trained, f.template = sh.Embeds(), sh.Arch, sh.TrainedCtx, sh.ChatTemplate
+	}
+	f.tools, f.thinking = templateCaps(f.template)
+	return f
+}
+
+// templateCaps reads a chat template for what Ollama reports as a model's
+// capabilities: tools when it lays tools out for the model, thinking when it
+// has a think block or a switch for one.
+func templateCaps(tpl string) (tools, thinking bool) {
+	tools = strings.Contains(tpl, "tools")
+	for _, mark := range []string{"<think>", "enable_thinking", "reasoning_content", "reasoning_effort"} {
+		if strings.Contains(tpl, mark) {
+			thinking = true
+		}
+	}
+	return tools, thinking
 }
 
 // errEmbeddingModel is an embedding model asked to write text.
@@ -1222,7 +1341,14 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 
 	data := make([]any, len(models))
 	for i, m := range models {
-		data[i] = modelEntry(m.Name, m.Modified)
+		e := modelEntry(m.Name, m.Modified)
+		// The loaded model's window per conversation, which agents that read
+		// the models list for one (Hermes) take; reading every model's header
+		// for its trained length would make a list scraped often slow.
+		if ctx := s.residentContext(m.Path); ctx > 0 {
+			e["context_length"] = ctx
+		}
+		data[i] = e
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data, "has_more": false})
 }
