@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.6 — 2026-11-07
 
 ### Added — function-xml tool calls held to their form and their schema
 
