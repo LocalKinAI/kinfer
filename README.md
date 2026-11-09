@@ -101,8 +101,32 @@ another project, so the package is `kinfer-ai`; the command is still `kinfer`):
 pip install kinfer-ai
 ```
 
-The wheel holds the same release binary, for macOS 26 on Apple Silicon, and
-`pip install -U kinfer-ai` upgrades it.
+The wheel holds the same release binary, for macOS 26 on Apple Silicon or the
+Linux and Windows builds below, and `pip install -U kinfer-ai` upgrades it.
+
+### Linux and Windows: a preview, on the CPU
+
+kinfer is developed and tested on the Mac. The Linux and Windows builds run on
+the CPU only for now: x86-64 and arm64 pass the test suite and serve a small
+model on real machines in CI, and nobody here runs them daily. Reports are
+welcome, and so is help with GPU support.
+
+On Linux, the same script as on a Mac (glibc 2.34 or newer on x86-64, 2.38 or
+newer on arm64; not Alpine):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LocalKinAI/kinfer/main/scripts/install.sh | sh
+```
+
+On Windows, in PowerShell (it needs the Visual C++ runtime, and warns if that is
+missing):
+
+```powershell
+irm https://raw.githubusercontent.com/LocalKinAI/kinfer/main/scripts/install.ps1 | iex
+```
+
+MLX models, reading experts from the SSD, splitting a model across machines and
+`kinfer install` are Mac only.
 
 ## Commands
 
@@ -268,7 +292,8 @@ patched one reaches 42), and whose connections notice a machine that went away
 within about 25 s instead of two hours.
 
 `scripts/release.sh v0.1.0` builds what a release ships: those patched
-libraries, the version stamped in, packed with its sha256 into `dist/`.
+libraries, the version stamped in, packed with its sha256 into `dist/`, and then
+the Linux and Windows packages, on llama.cpp's own CPU builds.
 `scripts/brew-formula.sh v0.1.0 > ../homebrew-tap/Formula/kinfer.rb` writes the
 formula for that release into the tap,
 [LocalKinAI/homebrew-tap](https://github.com/LocalKinAI/homebrew-tap).

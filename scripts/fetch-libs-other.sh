@@ -10,9 +10,10 @@
 # internal/nativelib/libs/<os>_<arch>_<build>, and every directory there is
 # embedded, so a release build should have only its own platform's.
 #
-# Linux wants libgomp.so.1, which a minimal system does not have. Pass a copy to
-# carry it in the binary, taken from Ubuntu 22.04: it needs glibc 2.34, as
-# upstream's x86-64 libraries do, and anything newer would raise that floor.
+# Linux wants libgomp.so.1, which a minimal system does not have, so the binary
+# carries one: Ubuntu 22.04's, fetched from its archive unless a copy is given.
+# It needs glibc 2.34, as upstream's x86-64 libraries do, and anything newer
+# would raise that floor. Unpacking it takes ar and zstd.
 #
 # Windows wants the Visual C++ runtime (msvcp140, vcruntime140) on the machine.
 
@@ -40,12 +41,39 @@ NAME=llama-$VERSION-bin-$ASSET.$EXT
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+sum256() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# fetch_gomp leaves GOMP naming the libgomp.so.1 of Ubuntu 22.04's libgomp1.
+fetch_gomp() {
+  local deb=libgomp1_12.3.0-1ubuntu1~22.04.3_$ARCH.deb url want
+  case "$ARCH" in
+  amd64)
+    url=https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-12/$deb
+    want=d46f9225c1883039e8a6853e6d96ca1af11d034ce186a090952e4a7c8a7c2fdc
+    ;;
+  arm64)
+    url=https://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-12/$deb
+    want=53d7318d8e1addc4d2990c028daba609f8dc1af16a501255eb5c4d59b7e2b601
+    ;;
+  esac
+  mkdir "$TMP/gomp"
+  # Ubuntu's pool drops a version once a newer one replaces it; Launchpad keeps it.
+  curl -fsSL -o "$TMP/gomp/$deb" "$url" ||
+    curl -fsSL -o "$TMP/gomp/$deb" "https://launchpad.net/ubuntu/+archive/primary/+files/$deb"
+  (cd "$TMP/gomp" && ar x "$deb" && zstd -dcq data.tar.zst | tar -xf -)
+  GOMP=$(find "$TMP/gomp" -type f -name 'libgomp.so.1*' | head -n 1)
+  local got
+  got=$(sum256 "$GOMP")
+  if [ "$got" != "$want" ]; then
+    echo "fetch-libs-other: libgomp.so.1 has sha256 $got, want $want" >&2
+    exit 1
+  fi
+}
+
 curl -fsSL -o "$TMP/$NAME" "https://github.com/ggml-org/llama.cpp/releases/download/$VERSION/$NAME"
-if command -v sha256sum >/dev/null; then
-  GOT=$(sha256sum "$TMP/$NAME" | cut -d' ' -f1)
-else
-  GOT=$(shasum -a 256 "$TMP/$NAME" | cut -d' ' -f1)
-fi
+GOT=$(sum256 "$TMP/$NAME")
 if [ "$GOT" != "$SHA" ]; then
   echo "fetch-libs-other: $NAME has sha256 $GOT, want $SHA" >&2
   exit 1
@@ -62,11 +90,8 @@ linux)
   # for libggml-*.so and carry no version.
   cp -L "$X/libllama.so.0" "$X/libggml.so.0" "$X/libggml-base.so.0" "$X/libmtmd.so.0" "$DEST/"
   cp "$X"/libggml-rpc.so "$X"/libggml-cpu-*.so "$DEST/"
-  if [ -n "$GOMP" ]; then
-    cp "$GOMP" "$DEST/libgomp.so.1"
-  else
-    echo "fetch-libs-other: no libgomp.so.1 given; the binary will need it on the machine" >&2
-  fi
+  [ -n "$GOMP" ] || fetch_gomp
+  cp "$GOMP" "$DEST/libgomp.so.1"
   ;;
 windows)
   unzip -q "$TMP/$NAME" -d "$TMP/x"

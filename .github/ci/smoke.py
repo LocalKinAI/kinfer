@@ -85,6 +85,9 @@ check("pull with checksum", rc == 0 and "sha256 matches" in out, out.strip().spl
 rc, out = kinfer("ls")
 check("list", rc == 0 and MODEL in out)
 
+rc, out = kinfer("fit")
+check("fit", rc == 0, out.strip().splitlines()[0] if out.strip() else "")
+
 rc, out = kinfer("can-run", "Qwen/Qwen2.5-0.5B-Instruct-GGUF")
 print(out.strip()[:800], flush=True)
 

@@ -38,19 +38,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Take libgomp from Ubuntu 22.04
-        if: matrix.goos == 'linux'
-        run: |
-          docker run --rm -v "$PWD:/out" ubuntu:22.04 bash -c '
-            apt-get update -qq &&
-            apt-get install -y -qq --no-install-recommends libgomp1 &&
-            cp -L /usr/lib/*-linux-gnu/libgomp.so.1 /out/libgomp.so.1'
-
       - name: Fetch llama.cpp's libraries
-        run: |
-          gomp=""
-          [ "${{ matrix.goos }}" = linux ] && gomp="$PWD/libgomp.so.1"
-          bash scripts/fetch-libs-other.sh ${{ matrix.goos }} ${{ matrix.goarch }} $gomp
+        run: bash scripts/fetch-libs-other.sh ${{ matrix.goos }} ${{ matrix.goarch }}
 
       - name: Vet
         run: go vet ./...
@@ -64,3 +53,58 @@ jobs:
       - name: A real model
         if: ${{ !cancelled() }}
         run: python .github/ci/smoke.py ./kinfer-ci${{ matrix.exe }}
+
+  # What a release ships, installed the way a user installs it. Linux in a
+  # container with nothing added but what the install and the test itself use.
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, goos: linux, goarch: amd64 }
+          - { runner: ubuntu-24.04-arm, goos: linux, goarch: arm64 }
+          - { runner: windows-2025, goos: windows, goarch: amd64 }
+          - { runner: windows-11-arm, goos: windows, goarch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      KINFER_VERSION: v0.0.0-ci
+      KINFER_BASE_URL: http://127.0.0.1:8765
+    steps:
+      - name: Keep test fixtures byte for byte
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package
+        run: bash scripts/package-other.sh $KINFER_VERSION ${{ matrix.goos }} ${{ matrix.goarch }}
+      - name: Install and run on a clean Linux
+        if: matrix.goos == 'linux'
+        run: |
+          python -m http.server 8765 --bind 127.0.0.1 --directory dist &
+          sleep 2
+          docker run --rm --network host -e KINFER_VERSION -e KINFER_BASE_URL -v "$PWD:/src:ro" ubuntu:24.04 bash -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends curl python3 ca-certificates >/dev/null
+            sh /src/scripts/install.sh
+            python3 /src/.github/ci/smoke.py ~/.local/bin/kinfer'
+      - name: Install and run on Windows
+        if: matrix.goos == 'windows'
+        shell: powershell
+        run: |
+          Start-Process -FilePath python -ArgumentList '-m','http.server','8765','--bind','127.0.0.1','--directory','dist' -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          ./scripts/install.ps1
+          $k = Join-Path $env:LOCALAPPDATA 'Programs\kinfer\kinfer.exe'
+          & $k version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python .github/ci/smoke.py $k
+          exit $LASTEXITCODE

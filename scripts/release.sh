@@ -1,7 +1,8 @@
 #!/bin/bash
-# release.sh — build a release of kinfer for Apple Silicon: llama.cpp with
+# release.sh — build a release of kinfer: for Apple Silicon with llama.cpp and
 # kinfer's patch (build-libs.sh) inside, the version stamped in, packed as
-# dist/kinfer-VERSION-darwin-arm64.tar.gz with its .sha256.
+# dist/kinfer-VERSION-darwin-arm64.tar.gz with its .sha256; then Linux and
+# Windows, x86-64 and arm64, on upstream's CPU libraries (package-other.sh).
 #
 #   scripts/release.sh v0.1.0                     the patched llama.cpp from GitHub's source tarball
 #   scripts/release.sh v0.1.0 llama-b11998.tgz    that tarball, already downloaded
@@ -36,3 +37,8 @@ tar -C "$WORK" -czf "$ROOT/dist/$NAME.tar.gz" "$NAME"
 
 "$WORK/$NAME/kinfer" version
 ls -l "$ROOT/dist/$NAME.tar.gz"
+
+for target in "linux amd64" "linux arm64" "windows amd64" "windows arm64"; do
+  # shellcheck disable=SC2086  # the target is two words on purpose
+  bash "$ROOT/scripts/package-other.sh" "$VERSION" $target
+done
