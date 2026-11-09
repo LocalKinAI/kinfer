@@ -88,6 +88,7 @@ func TestCanChat(t *testing.T) {
 func TestPiGetsADirectoryOfItsOwn(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	a, _ := findAgent("pi")
 	args, set := a.setup("http://127.0.0.1:11500", "qwen3.8:27b-mlx", 32768)
 	dir := filepath.Join(home, ".kinfer", "agents", "pi")
@@ -125,6 +126,7 @@ func TestPiGetsADirectoryOfItsOwn(t *testing.T) {
 func TestHermesGetsAHomeOfItsOwn(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	a, _ := findAgent("hermes")
 	if _, set := a.setup("http://192.168.0.21:11590", "ornith-1.5:35b", 65536); !slices.Equal(set,
 		[]string{"HERMES_HOME=" + filepath.Join(home, ".kinfer", "agents", "hermes")}) {

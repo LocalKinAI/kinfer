@@ -55,7 +55,9 @@ func readEdit(t *testing.T, st *store.Store, name string) map[string][]float32 {
 }
 
 func TestEditOperations(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	st, _ := store.Open()
 	tinyModel(t, st, "base", []float32{1, 2, 3, 4, 5, 6})
 	tinyModel(t, st, "other", []float32{3, 2, 1, 8, 5, 2})

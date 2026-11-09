@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 )
 
@@ -32,7 +33,17 @@ func Supports(dir, arch string) (supported, known bool) {
 	if !hasCString(data, "llama") {
 		return false, false
 	}
-	return hasCString(data, arch), true
+	if hasCString(data, arch) {
+		return true, true
+	}
+	// Upstream's Linux and Windows x86-64 libraries were linked to store a name
+	// inside any longer string ending the same way: "qwen2" is the end of
+	// "rwkv6qwen2" there, with no NUL of its own before it.
+	return runtime.GOOS != "darwin" && endsAString(data, arch), true
+}
+
+func endsAString(data []byte, s string) bool {
+	return s != "" && bytes.Contains(data, append([]byte(s), 0))
 }
 
 func hasCString(data []byte, s string) bool {

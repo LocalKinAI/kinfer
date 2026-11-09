@@ -20,6 +20,18 @@ func TestHasCStringMatchesWholeStringsOnly(t *testing.T) {
 	}
 }
 
+func TestEndsAStringFindsAMergedName(t *testing.T) {
+	data := []byte("\x00rwkv6qwen2\x00qwen2moe\x00")
+	if !endsAString(data, "qwen2") {
+		t.Error(`"qwen2" at the end of "rwkv6qwen2" was not found`)
+	}
+	for _, s := range []string{"qwen", "rwkv6", ""} {
+		if endsAString(data, s) {
+			t.Errorf("endsAString(%q) = true, want false", s)
+		}
+	}
+}
+
 // The check has to fail closed. A caller that cannot be told the truth must be
 // told nothing rather than a guess — and in particular must never be told "not
 // supported", which would stop someone trying a model that works.

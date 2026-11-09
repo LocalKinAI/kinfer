@@ -599,6 +599,7 @@ func TestOllamaMLXModel(t *testing.T) {
 	root, home := t.TempDir(), t.TempDir()
 	t.Setenv("OLLAMA_MODELS", root)
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	blob := func(digest, content string, size int64) string {
 		p := filepath.Join(root, "blobs", "sha256-"+digest)

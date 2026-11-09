@@ -242,7 +242,7 @@ type record struct {
 // only while the name still leads to it.
 func (d *download) open(path string) error {
 	for range 3 {
-		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+		f, err := openPart(path)
 		if err != nil {
 			return err
 		}

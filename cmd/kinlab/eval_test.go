@@ -63,6 +63,7 @@ func TestMcNemar(t *testing.T) {
 func TestEditFromKeepsOnlyWhatDiffers(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	st, err := store.Open()
 	if err != nil {
 		t.Fatal(err)

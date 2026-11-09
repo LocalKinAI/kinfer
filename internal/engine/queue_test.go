@@ -53,6 +53,7 @@ func TestCompletionRateStaysSilentUntilItHasData(t *testing.T) {
 	if got := c.wait(10); got != 0 {
 		t.Errorf("wait = %v after one completion, want 0 — one point is not an interval", got)
 	}
+	time.Sleep(20 * time.Millisecond) // Windows' clock can read the same twice
 	c.done()
 	if got := c.wait(10); got <= 0 {
 		t.Error("wait = 0 after two completions, so no estimate is ever produced")

@@ -178,12 +178,19 @@ func dialWorker(endpoint string, timeout time.Duration) (net.Conn, error) {
 	pause := 50 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		c, err := net.DialTimeout("tcp", endpoint, timeout)
-		if err == nil || attempt == 7 || !(errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET)) {
+		if err == nil || attempt == 7 || !refusedOrReset(err) {
 			return c, err
 		}
 		time.Sleep(pause)
 		pause = min(2*pause, 400*time.Millisecond)
 	}
+}
+
+// refusedOrReset also knows Winsock's numbers for these, WSAECONNREFUSED and
+// WSAECONNRESET, which syscall's names do not stand for on Windows.
+func refusedOrReset(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.Errno(10061)) || errors.Is(err, syscall.Errno(10054))
 }
 
 // RPCDevices connects to a worker and returns its devices, for a model's
