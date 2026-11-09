@@ -150,3 +150,28 @@ jobs:
           grep -q 'on GPU Vulkan0' selftest.txt
       - name: A real model, served on the GPU path
         run: python .github/ci/smoke.py ./kinfer-ci
+      # No card here, so what this can show is that each arrives whole, that
+      # only the driver is missing, and that a failed try leaves things as they were.
+      - name: CUDA and ROCm, fetched and stepping aside
+        if: matrix.goarch == 'amd64'
+        run: |
+          ./kinfer-ci gpu
+          ! ./kinfer-ci gpu install cuda -force -y -version 13.4 > cuda.txt 2>&1
+          cat cuda.txt
+          grep -qE 'did not start|found no GPU' cuda.txt
+          D=~/.kinfer/gpu/cuda-13.4-b11998
+          ls -la $D
+          ldd $D/libggml-cuda.so | tee ldd.txt
+          ! grep 'not found' ldd.txt | grep -v 'libcuda.so.1'
+          ./kinfer-ci gpu | tee status.txt
+          grep -E '^cuda-13.4 .*fetched' status.txt
+          ./kinfer-ci selftest qwen2.5-0.5b-instruct-q4_k_m | tee after.txt
+          grep -q 'on GPU Vulkan0' after.txt
+          ./kinfer-ci gpu remove cuda
+          test ! -e $D
+          ! ./kinfer-ci gpu install rocm -force -y > rocm.txt 2>&1
+          cat rocm.txt
+          grep -qE 'did not start|found no GPU' rocm.txt
+          ls -la ~/.kinfer/gpu/rocm-10.0-b11998
+          ./kinfer-ci gpu remove rocm
+          test ! -e ~/.kinfer/gpu/rocm-10.0-b11998

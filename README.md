@@ -118,6 +118,17 @@ Here it has only run on a software Vulkan driver on Linux, so real GPUs, and
 Windows, are yours to try: `kinfer selftest` runs a small model on the GPU and on
 the CPU and says whether the answers make sense. Please send what it prints.
 
+CUDA on NVIDIA cards and ROCm on AMD ones are hundreds of megabytes, so they are
+fetched only when asked for, and they have never run on a real card here either:
+
+```bash
+kinfer gpu install cuda   # says the size first (about 600 MB) and asks
+kinfer gpu install rocm   # about 250 MB, 1.2 GB unpacked; on Linux AMD's ROCm 10 must be installed
+kinfer gpu                # what is fetched, and what models load on
+```
+
+A backend that does not start, or finds no GPU, is left unused.
+
 On Linux, the same script as on a Mac (glibc 2.34 or newer on x86-64, 2.38 or
 newer on arm64; not Alpine):
 

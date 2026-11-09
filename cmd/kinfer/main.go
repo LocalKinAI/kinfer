@@ -40,6 +40,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer fit                   what this machine can actually run
   kinfer can-run <hf-repo>     whether a model on Hugging Face will run here
   kinfer selftest [model]      run a small model on the GPU and the CPU, and check the answers
+  kinfer gpu                   GPU backends off a Mac: install cuda or rocm, use, remove
   kinfer version               this build, and the llama.cpp inside it
 
 Examples:
@@ -109,6 +110,8 @@ func main() {
 		err = cmdPlan(os.Args[2:])
 	case "can-run":
 		err = cmdCanRun(os.Args[2:])
+	case "gpu":
+		err = cmdGPU(os.Args[2:])
 	case "selftest":
 		err = cmdSelftest(os.Args[2:])
 	case "selftest-run":

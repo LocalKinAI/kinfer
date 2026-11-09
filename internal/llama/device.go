@@ -84,6 +84,11 @@ func LoadBackend(path string) error {
 	if backendLoad == nil {
 		return fmt.Errorf("this build cannot load a backend")
 	}
+	if runtime.GOOS == "windows" {
+		// A backend's own libraries, NVIDIA's or AMD's, are kept beside it, and
+		// Windows looks for what a library imports along the PATH.
+		os.Setenv("PATH", filepath.Dir(path)+";"+os.Getenv("PATH"))
+	}
 	if backendLoad(path) == 0 {
 		return fmt.Errorf("llama.cpp could not load %s", path)
 	}

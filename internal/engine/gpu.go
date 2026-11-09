@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -18,11 +20,12 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
 )
 
-// Off a Mac the GPU is reached through Vulkan, as an experiment that must never
-// cost anyone the CPU path that works: the backend is fetched only where there
-// is a driver to talk to, tried first in a process of its own, because a driver
-// that crashes takes the process with it, and any model that does not fit or
-// does not load runs on the CPU instead. KINFER_GPU=off leaves all of it out.
+// Off a Mac the GPU is reached through Vulkan, or CUDA or ROCm if the user asked
+// for one with kinfer gpu, as an experiment that must never cost anyone the CPU
+// path that works: Vulkan is fetched only where there is a driver to talk to, a
+// backend is tried first in a process of its own, because a driver that crashes
+// takes the process with it, and any model that does not fit or does not load
+// runs on the CPU instead. KINFER_GPU=off leaves all of it out.
 
 // GPUProbeArgs is how the running program tries a backend in a process of its
 // own: its arguments, before the backend's path. Nil, as in a test binary or a
@@ -57,7 +60,8 @@ func (p GPUProbe) GPUs() []ProbeDevice {
 
 // GPUReport is the state of the GPU path, for kinfer selftest.
 type GPUReport struct {
-	Loader  bool     // the system has a Vulkan loader
+	Loader  bool     // there is something to try: a chosen backend, or a Vulkan loader
+	Label   string   // the backend tried
 	Backend string   // the backend's path, once fetched
 	Problem string   // why it could not be fetched
 	Probe   GPUProbe // what trying it found
@@ -67,11 +71,11 @@ type GPUReport struct {
 // earlier try found: a new driver may have changed the answer.
 func CheckGPU() GPUReport {
 	var r GPUReport
-	if _, err := dl.Open(nativelib.VulkanLoader()); err != nil {
+	path, label, err := pickBackend()
+	if errors.Is(err, errNoDriver) {
 		return r
 	}
-	r.Loader = true
-	path, err := nativelib.VulkanBackend()
+	r.Loader, r.Label = true, label
 	if err != nil {
 		r.Problem = err.Error()
 		return r
@@ -81,30 +85,51 @@ func CheckGPU() GPUReport {
 	return r
 }
 
+// ProbeBackend tries the backend at path afresh, in a process of its own.
+func ProbeBackend(path string) GPUProbe { return probeGPU(path, true) }
+
+var errNoDriver = errors.New("no Vulkan driver")
+
+// pickBackend is the backend the user chose with kinfer gpu, or else Vulkan
+// where there is a driver for it, fetched if this is the first time.
+func pickBackend() (path, label string, err error) {
+	if b, ok := nativelib.ActiveBackend(); ok {
+		if !b.Installed() {
+			return "", b.ID(), fmt.Errorf("%s is chosen but is not here; kinfer gpu install %s fetches it", b.ID(), b.Name)
+		}
+		return b.Path(), b.ID(), nil
+	}
+	if _, err := dl.Open(nativelib.VulkanLoader()); err != nil {
+		return "", "", errNoDriver
+	}
+	path, err = nativelib.VulkanBackend()
+	return path, "Vulkan", err
+}
+
 var (
 	gpuOnce     sync.Once
 	gpuAttached bool
 )
 
-// attachGPU adds the Vulkan backend to llama.cpp's devices, once, if this
-// machine has a GPU it works on. It says why not only when something failed: no
+// attachGPU adds a GPU backend to llama.cpp's devices, once, if this machine
+// has a GPU it works on. It says why not only when something failed: no
 // driver at all is the ordinary case on a server.
 func attachGPU(gpuLayers int) {
 	if runtime.GOOS == "darwin" || gpuLayers == 0 || GPUProbeArgs == nil || strings.EqualFold(os.Getenv("KINFER_GPU"), "off") {
 		return
 	}
 	gpuOnce.Do(func() {
-		if _, err := dl.Open(nativelib.VulkanLoader()); err != nil {
+		path, label, err := pickBackend()
+		if errors.Is(err, errNoDriver) {
 			return
 		}
-		path, err := nativelib.VulkanBackend()
 		if err != nil {
-			log.Printf("gpu: no Vulkan backend (%v); running on the CPU", err)
+			log.Printf("gpu: no backend (%v); running on the CPU", err)
 			return
 		}
 		p := probeGPU(path, false)
 		if !p.OK {
-			log.Printf("gpu: the Vulkan backend did not start here (%s); running on the CPU. kinfer selftest tries it again", p.Error)
+			log.Printf("gpu: the %s backend did not start here (%s); running on the CPU. kinfer selftest tries it again", label, p.Error)
 			return
 		}
 		gpus := p.GPUs()
@@ -116,7 +141,7 @@ func attachGPU(gpuLayers int) {
 			return
 		}
 		gpuAttached = true
-		log.Printf("gpu: Vulkan on %s, experimental; KINFER_GPU=off turns it off", gpus[0].Name)
+		log.Printf("gpu: %s on %s, experimental; KINFER_GPU=off turns it off", label, gpus[0].Name)
 	})
 }
 

@@ -227,17 +227,17 @@ func cmdSelftest(args []string) error {
 		case strings.EqualFold(os.Getenv("KINFER_GPU"), "off"):
 			fmt.Println("gpu: turned off with KINFER_GPU=off")
 		case !r.Loader:
-			fmt.Println("gpu: no Vulkan driver found")
+			fmt.Println("gpu: no Vulkan driver found, and no backend chosen with kinfer gpu")
 		case r.Problem != "":
-			fmt.Printf("gpu: could not fetch the Vulkan backend: %s\n", r.Problem)
+			fmt.Printf("gpu: could not use the %s backend: %s\n", r.Label, r.Problem)
 		case !r.Probe.OK:
-			fmt.Printf("gpu: the Vulkan backend crashed or failed to start: %s\n", r.Probe.Error)
+			fmt.Printf("gpu: the %s backend crashed or failed to start: %s\n", r.Label, r.Probe.Error)
 		case len(r.Probe.GPUs()) == 0:
-			fmt.Println("gpu: Vulkan found no usable GPU")
+			fmt.Printf("gpu: %s found no usable GPU\n", r.Label)
 		default:
 			canGPU = true
 			for _, d := range r.Probe.GPUs() {
-				fmt.Printf("gpu: %s, %s, %.1f GB total, %.1f GB free (Vulkan, experimental)\n", d.Name, d.Type, float64(d.Total)/(1<<30), float64(d.Free)/(1<<30))
+				fmt.Printf("gpu: %s, %s, %.1f GB total, %.1f GB free (%s, experimental)\n", d.Name, d.Type, float64(d.Total)/(1<<30), float64(d.Free)/(1<<30), r.Label)
 			}
 		}
 	}
