@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.3.0 — 2026-11-09
+
+### Added — Linux and Windows, on the CPU, as a preview
+
+kinfer is developed and tested on the Mac. This release adds packages for Linux
+and Windows, x86-64 and arm64, built on llama.cpp's own CPU libraries and
+carrying them in the one binary, as on the Mac. Linux installs with the same
+`curl … install.sh | sh`, Windows with `irm … install.ps1 | iex`, and both with
+`pip install kinfer-ai`.
+
+Each passes the test suite and serves a real model (Qwen2.5-0.5B: four APIs,
+three at once, a repeated prompt reused, `pull`, `run`, `stop`) on real machines
+in CI, installed from its package; on Linux that is a container with no other
+libraries. On four-core CI machines the 0.5B model decodes at 40–65 tok/s. Larger
+models have not been tested on the CPU and there is no GPU support yet: reports
+are welcome, and so is help with it.
+
+Linux needs glibc 2.34 or newer on x86-64 and 2.38 on arm64, so not Alpine.
+Windows needs the Visual C++ runtime. MLX models, reading experts from the SSD,
+splitting a model across machines and `kinfer install` are Mac only.
+
+### Fixed — a repeat penalty that a request asks for now applies
+
+`llama_sampler_init_penalties` has taken `n_vocab` as its first argument since
+llama.cpp b11998, and kinfer still passed the four it took before. On macOS that
+left the window at zero, which turned the penalty off: a GGUF model has ignored
+`repeat_penalty` in every release since that upgrade. It now applies. The other
+bindings to llama.cpp were compared with its headers and match.
+
+### Changed — the repeat penalty is off unless a request asks for it
+
+The default was 1.1 and is now 1.0. A GGUF model answers as it did, having had
+no penalty in practice: on the box Flash-Next, Qwen3.8-27B and ornith give the
+same replies and speeds as v0.2.6. **An MLX model does change**, since kinfer's
+MLX backend applied the 1.1 itself. Drafted tokens are no longer turned away by
+it, so Qwen3.8-27B on MLX goes from 56 to 65 tok/s on the same five prompts. Code
+and tool calls repeat tokens on purpose, which is the reason to leave it off.
+
+### Changed underneath
+
+purego 0.11.3, which every call into llama.cpp goes through. On the box against
+v0.2.6: Flash-Next 1 to 16 at once 42.1→150.9 and 42.4→152.2 tok/s, V4.1 and
+ornith as before, pictures in all four dialects, embeddings at cosine 1.0 to
+Ollama, and the swarm's 214-tool seats with no leaked calls and no errors. A model
+split across two machines was not retested for this release.
+
 ## v0.2.6 — 2026-11-07
 
 ### Added — function-xml tool calls held to their form and their schema
