@@ -36,8 +36,16 @@ def get(path):
     return r.status
 
 
-def ask(q):
+def ask(q, options=None):
     c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=300)
+    if options is not None:
+        c.request("POST", "/api/chat", json.dumps({
+            "model": MODEL, "stream": False, "options": {"num_predict": 40, "temperature": 0, "seed": 1, **options},
+            "messages": [{"role": "user", "content": q}]}), {"Content-Type": "application/json"})
+        r = c.getresponse()
+        data = r.read().decode("utf-8", "replace")
+        c.close()
+        return json.loads(data).get("message", {}).get("content", data[:200])
     c.request("POST", "/v1/chat/completions", json.dumps({
         "model": MODEL, "max_tokens": 40, "temperature": 0, "seed": 1,
         "messages": [{"role": "user", "content": q}]}), {"Content-Type": "application/json"})
@@ -49,7 +57,7 @@ def ask(q):
     return json.loads(data)["choices"][0]["message"]["content"]
 
 
-def run(label, cmd, ready, env=None, fresh_libs=False):
+def run(label, cmd, ready, env=None, fresh_libs=False, options=None):
     print(f"\n=== {label}", flush=True)
     if fresh_libs:
         shutil.rmtree(os.path.join(os.environ["LOCALAPPDATA"], "kinfer", "lib"), ignore_errors=True)
@@ -69,7 +77,7 @@ def run(label, cmd, ready, env=None, fresh_libs=False):
     if up:
         for q in QUESTIONS:
             try:
-                print("  ", repr(ask(q))[:150], flush=True)
+                print("  ", repr(ask(q, options))[:150], flush=True)
             except Exception as e:
                 print("   request failed:", repr(e), flush=True)
     else:
@@ -91,15 +99,10 @@ subprocess.run(["powershell", "-NoProfile", "-Command",
                 "(Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Format-List | Out-String).Trim()"])
 subprocess.run([KINFER, "pull", "Qwen/Qwen2.5-0.5B-Instruct-GGUF:" + MODEL + ".gguf"], stdout=subprocess.DEVNULL)
 
-server = os.path.join(UPSTREAM, "llama-server.exe")
-base = [server, "-m", FILE, "--port", str(PORT), "--host", "127.0.0.1", "-np", "1"]
-run("upstream llama-server, its defaults", base, "/health")
-run("upstream, --no-repack", base + ["--no-repack"], "/health")
-run("upstream, -t 2 -tb 2", base + ["-t", "2", "-tb", "2"], "/health")
-
 kinfer = [KINFER, "serve", "-addr", f"127.0.0.1:{PORT}"]
-run("kinfer, its defaults", kinfer, "/api/version", fresh_libs=True)
-run("kinfer, one thread", kinfer, "/api/version", env={"GOMAXPROCS": "1"})
-run("kinfer, -slots 1 -prefix 0", kinfer + ["-slots", "1", "-prefix", "0"], "/api/version")
-run("kinfer without the AVX-512 libraries", [NO512, "serve", "-addr", f"127.0.0.1:{PORT}"],
-    "/api/version", fresh_libs=True)
+run("kinfer, /v1/chat/completions", kinfer, "/api/version", fresh_libs=True)
+run("kinfer, /api/chat, repeat_penalty 1.0", kinfer, "/api/version", options={"repeat_penalty": 1.0})
+run("kinfer, /api/chat, repeat_penalty 1.1", kinfer, "/api/version", options={"repeat_penalty": 1.1})
+run("kinfer, /api/chat, repeat_penalty 1.3", kinfer, "/api/version", options={"repeat_penalty": 1.3})
+run("kinfer, /api/chat, repeat_penalty 1.0, temperature 0.7, top_p 0.9, top_k 40", kinfer, "/api/version",
+    options={"repeat_penalty": 1.0, "temperature": 0.7, "top_p": 0.9, "top_k": 40})

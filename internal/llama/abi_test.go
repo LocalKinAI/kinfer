@@ -5,8 +5,49 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/LocalKinAI/kinfer/internal/dl"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
 )
+
+// TestSamplerFloatsCrossTheCall sends float arguments into llama.cpp and reads
+// what it did with them from the logits: Windows x86-64 passes floats and
+// integers by position, every other platform in separate register files.
+func TestSamplerFloatsCrossTheCall(t *testing.T) {
+	dir, err := nativelib.Prepare()
+	if err != nil {
+		t.Skipf("no native libraries in this build: %v", err)
+	}
+	if err := Bind(dir); err != nil {
+		t.Fatal(err)
+	}
+	lib, err := dl.Open(filepath.Join(dir, libName()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var apply func(s Sampler, cur *TokenDataArray)
+	if err := register(&apply, lib, "llama_sampler_apply"); err != nil {
+		t.Fatal(err)
+	}
+
+	near := func(got, want float32) bool { return got > want-1e-3 && got < want+1e-3 }
+
+	penalties := SamplerPenalties(64, 1.25, 0, 0)
+	SamplerAccept(penalties, 1)
+	data := []TokenData{{ID: 0, Logit: 1}, {ID: 1, Logit: 2}, {ID: 2, Logit: -3}}
+	apply(penalties, &TokenDataArray{Data: &data[0], Size: 3, Selected: -1})
+	SamplerFree(penalties)
+	if !near(data[1].Logit, 1.6) || !near(data[0].Logit, 1) || !near(data[2].Logit, -3) {
+		t.Errorf("after a penalty of 1.25 on token 1: %+v, want its logit 1.6 and the others unchanged", data)
+	}
+
+	temp := SamplerTemp(0.5)
+	data = []TokenData{{ID: 0, Logit: 1}, {ID: 1, Logit: 2}}
+	apply(temp, &TokenDataArray{Data: &data[0], Size: 2, Selected: -1})
+	SamplerFree(temp)
+	if !near(data[0].Logit, 2) || !near(data[1].Logit, 4) {
+		t.Errorf("after a temperature of 0.5: %+v, want logits 2 and 4", data)
+	}
+}
 
 // TestStructsCrossTheCall passes and returns llama.cpp's structs by value, which
 // purego does differently on each system. It loads no model: the defaults come
