@@ -20,11 +20,11 @@ func TestDefaultParamsAreUsable(t *testing.T) {
 	if p.TopK <= 0 && (p.TopP <= 0 || p.TopP >= 1) {
 		t.Error("defaults narrow nothing: the full 151,936-token distribution would be drawn from")
 	}
-	if p.RepeatPenalty <= 1 {
-		t.Error("default repeat penalty must exceed 1.0 to break loops")
+	if PenaltiesOn(p) {
+		t.Errorf("repeat penalty %v by default: it is off unless a request asks for it", p.RepeatPenalty)
 	}
 	if p.RepeatLastN <= 0 {
-		t.Error("a repeat penalty with no history to look at does nothing")
+		t.Error("a request that asks for a repeat penalty would have no history to apply it to")
 	}
 }
 

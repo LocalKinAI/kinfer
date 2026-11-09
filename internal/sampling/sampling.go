@@ -58,14 +58,16 @@ type Params struct {
 	Seed int64
 }
 
-// DefaultParams are conservative settings that produce coherent prose without
-// the loops greedy decoding falls into.
+// DefaultParams are conservative settings that produce coherent prose. The
+// repeat penalty is off unless a request asks for it: it bends code and tool
+// calls, which repeat tokens on purpose, and it turns away drafted tokens the
+// model would have chosen (Qwen3.8-27B on MLX, 65 tok/s without it, 56 with).
 func DefaultParams() Params {
 	return Params{
 		Temperature:   0.7,
 		TopK:          40,
 		TopP:          0.95,
-		RepeatPenalty: 1.1,
+		RepeatPenalty: 1,
 		RepeatLastN:   64,
 	}
 }

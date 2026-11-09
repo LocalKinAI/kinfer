@@ -38,7 +38,7 @@ func main() {
 		forceTpl  = flag.String("template", "", "force a built-in chat family instead of the model's own (chatml, llama3, mistral)")
 		topP      = flag.Float64("top-p", 0.95, "nucleus sampling threshold")
 		topK      = flag.Int("top-k", 40, "keep only the K most likely tokens")
-		repeatPen = flag.Float64("repeat-penalty", 1.1, "penalty on recently used tokens")
+		repeatPen = flag.Float64("repeat-penalty", 1, "penalty on recently used tokens; 1 is off")
 		seed      = flag.Int64("seed", 0, "sampling seed (0 = random)")
 	)
 	flag.Parse()
