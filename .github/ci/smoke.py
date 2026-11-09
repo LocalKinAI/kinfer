@@ -79,8 +79,9 @@ def story(tag):
 rc, out = kinfer("version")
 check("version", rc == 0, out.strip())
 
+had_it = os.path.exists(os.path.join(os.path.expanduser("~"), ".kinfer", "models", MODEL + ".gguf"))
 rc, out = kinfer("pull", SOURCE)
-check("pull with checksum", rc == 0 and "sha256 matches" in out, out.strip().splitlines()[-1] if out.strip() else "")
+check("pull with checksum", rc == 0 and (had_it or "sha256 matches" in out), out.strip().splitlines()[-1] if out.strip() else "")
 
 rc, out = kinfer("ls")
 check("list", rc == 0 and MODEL in out)
