@@ -160,7 +160,7 @@ func TestHeldDrawFallsBackToTheGrammar(t *testing.T) {
 	}
 	open, nl, hello := one("<tool_call>"), one("\n"), one("Hello")
 
-	s := New(Params{Temperature: 0})
+	s := New(Params{Temperature: 0}, llama.NVocab(v))
 	defer s.Close()
 	if err := s.Constrain(Grammar{Vocab: v, Rules: rules, Trigger: open, Open: NoToken, Close: NoToken}); err != nil {
 		t.Fatal(err)
@@ -206,7 +206,7 @@ func TestGrammarWaitsForTheThinkBlockToClose(t *testing.T) {
 	// Stand-ins for <think> and </think>, which Qwen2.5 does not have.
 	call, open, close := one("<tool_call>"), one("<|im_start|>"), one("<|im_end|>")
 
-	s := New(Params{Temperature: 0})
+	s := New(Params{Temperature: 0}, llama.NVocab(v))
 	defer s.Close()
 	if err := s.Constrain(Grammar{Vocab: v, Rules: rules, Trigger: call, Open: open, Close: close, Thinking: true}); err != nil {
 		t.Fatal(err)

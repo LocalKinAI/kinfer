@@ -117,8 +117,8 @@ type Grammar struct {
 	Thinking    bool
 }
 
-// New builds a sampler chain for p.
-func New(p Params) *Sampler {
+// New builds a sampler chain for p, on a model of nVocab tokens.
+func New(p Params, nVocab int32) *Sampler {
 	chain := llama.NewSamplerChain()
 
 	// Penalties first, so later stages see the adjusted logits.
@@ -133,7 +133,7 @@ func New(p Params) *Sampler {
 			repeat = 1
 		}
 		llama.SamplerChainAdd(chain, llama.SamplerPenalties(
-			lastN, repeat,
+			nVocab, lastN, repeat,
 			0, // frequency penalty: off, as it is in Ollama's defaults
 			p.PresencePenalty,
 		))

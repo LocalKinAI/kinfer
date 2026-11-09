@@ -31,7 +31,7 @@ func TestSamplerFloatsCrossTheCall(t *testing.T) {
 
 	near := func(got, want float32) bool { return got > want-1e-3 && got < want+1e-3 }
 
-	penalties := SamplerPenalties(64, 1.25, 0, 0)
+	penalties := SamplerPenalties(3, 64, 1.25, 0, 0)
 	SamplerAccept(penalties, 1)
 	data := []TokenData{{ID: 0, Logit: 1}, {ID: 1, Logit: 2}, {ID: 2, Logit: -3}}
 	apply(penalties, &TokenDataArray{Data: &data[0], Size: 3, Selected: -1})

@@ -776,7 +776,7 @@ func (s *scheduler) occupy(sl *slot, j *job, tokens []llama.Token, reused int, c
 	sl.admitted = time.Now()
 	sl.evalStart = time.Time{}
 	sl.promptEval = 0
-	sl.sampler = sampling.New(j.params.Params)
+	sl.sampler = sampling.New(j.params.Params, llama.NVocab(s.vocab))
 	if g, ok := s.toolGrammar(j); ok {
 		if err := sl.sampler.Constrain(g); err != nil {
 			log.Printf("tool calls go unchecked: %v", err)

@@ -223,7 +223,7 @@ var (
 	samplerInitTopK     func(k int32) Sampler
 	samplerInitTopP     func(p float32, minKeep uint64) Sampler
 	samplerInitTemp     func(t float32) Sampler
-	samplerInitPenalty  func(lastN int32, repeat, freq, present float32) Sampler
+	samplerInitPenalty  func(nVocab, lastN int32, repeat, freq, present float32) Sampler
 	samplerInitDist     func(seed uint32) Sampler
 	samplerInitGreedy   func() Sampler
 	samplerSample       func(s Sampler, c Context, idx int32) Token
@@ -788,8 +788,8 @@ func SamplerTemp(t float32) Sampler { return samplerInitTemp(t) }
 
 // SamplerPenalties pushes down tokens seen in the last lastN positions.
 // repeat 1.0, freq 0.0 and present 0.0 each disable their term.
-func SamplerPenalties(lastN int32, repeat, freq, present float32) Sampler {
-	return samplerInitPenalty(lastN, repeat, freq, present)
+func SamplerPenalties(nVocab, lastN int32, repeat, freq, present float32) Sampler {
+	return samplerInitPenalty(nVocab, lastN, repeat, freq, present)
 }
 
 // SamplerDist draws from the distribution the chain produced. Pass DefaultSeed

@@ -146,7 +146,7 @@ func main() {
 		RepeatPenalty: float32(*repeatPen),
 		RepeatLastN:   64,
 		Seed:          *seed,
-	})
+	}, nVocab)
 	defer sampler.Close()
 
 	fmt.Printf("── output ────────────────────────────────────\n  ")
