@@ -75,7 +75,20 @@ var (
 	devMemory func(uintptr, *uint64, *uint64)
 	devName   func(uintptr) *byte
 	devType   func(uintptr) int32
+
+	backendLoad func(string) uintptr
 )
+
+// LoadBackend adds the backend library at path to llama.cpp's devices.
+func LoadBackend(path string) error {
+	if backendLoad == nil {
+		return fmt.Errorf("this build cannot load a backend")
+	}
+	if backendLoad(path) == 0 {
+		return fmt.Errorf("llama.cpp could not load %s", path)
+	}
+	return nil
+}
 
 // bindGGML resolves the device-registry entry points, which live in libggml
 // rather than libllama.
@@ -95,6 +108,9 @@ func bindGGML(dir string) {
 		var loadAll func(string)
 		if err := register(&loadAll, lib, "ggml_backend_load_all_from_path"); err == nil {
 			loadAll(dir)
+		}
+		if err := register(&backendLoad, lib, "ggml_backend_load"); err != nil {
+			backendLoad = nil
 		}
 	}
 	for _, b := range []struct {

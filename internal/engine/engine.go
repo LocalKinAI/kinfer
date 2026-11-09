@@ -348,10 +348,25 @@ type Engine struct {
 	// be used again, so the server discards this engine rather than serving
 	// the same error to every request that follows.
 	broken atomic.Bool
+
+	onGPU bool // the model's layers are on a GPU
 }
+
+// OnGPU reports whether the model runs on a GPU rather than the CPU.
+func (e *Engine) OnGPU() bool { return e.onGPU }
 
 // Open loads a GGUF file.
 func Open(path string, opts Options) (*Engine, error) {
+	e, err := open(path, opts)
+	if err != nil && gpuAttached && opts.GPULayers != 0 {
+		log.Printf("gpu: %s did not load on the GPU (%v); trying the CPU", filepath.Base(path), err)
+		opts.GPULayers = 0
+		return open(path, opts)
+	}
+	return e, err
+}
+
+func open(path string, opts Options) (*Engine, error) {
 	libDir, err := nativelib.Prepare()
 	if err != nil {
 		return nil, err
@@ -359,14 +374,17 @@ func Open(path string, opts Options) (*Engine, error) {
 	if err := llama.Bind(libDir); err != nil {
 		return nil, err
 	}
-
-	mp := llama.DefaultModelParams()
-	mp.NGpuLayers = int32(opts.GPULayers)
+	attachGPU(opts.GPULayers)
 
 	// Read the accelerator's free memory before anything is allocated, so the
 	// model's and the context's real costs can be measured rather than guessed.
 	bud := newBudget()
 	shape, _ := store.ReadShape(path)
+	opts.GPULayers, bud = runsOnGPU(filepath.Base(path), uint64(shape.WeightBytes), opts.GPULayers, bud)
+
+	mp := llama.DefaultModelParams()
+	mp.NGpuLayers = int32(opts.GPULayers)
+
 	shape.CacheQ8 = CacheQ8(shape, opts.CacheType)
 	var why string
 	if shape.Draft, why = Drafts(shape, opts.Draft); why != "" {
@@ -792,6 +810,7 @@ sizing:
 		path:  path,
 		nCtx:  actualCtx / cells,
 		slots: slots,
+		onGPU: opts.GPULayers != 0 && bud.known,
 	}
 	if hostExperts != 0 {
 		e.warmCache = 1

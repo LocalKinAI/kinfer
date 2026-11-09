@@ -104,12 +104,19 @@ pip install kinfer-ai
 The wheel holds the same release binary, for macOS 26 on Apple Silicon or the
 Linux and Windows builds below, and `pip install -U kinfer-ai` upgrades it.
 
-### Linux and Windows: a preview, on the CPU
+### Linux and Windows: a preview
 
-kinfer is developed and tested on the Mac. The Linux and Windows builds run on
-the CPU only for now: x86-64 and arm64 pass the test suite and serve a small
-model on real machines in CI, and nobody here runs them daily. Reports are
-welcome, and so is help with GPU support.
+kinfer is developed and tested on the Mac. The Linux and Windows builds are a
+preview: x86-64 and arm64 pass the test suite and serve a small model on real
+machines in CI, and nobody here runs them daily.
+
+They run on the CPU, and on a GPU through Vulkan as an experiment. On a machine
+with a Vulkan driver kinfer fetches the backend the first time a model loads
+(about 35 MB, once, into `~/.kinfer/gpu`); a model that does not fit the GPU, or
+fails on it, runs on the CPU instead, and `KINFER_GPU=off` leaves the GPU out.
+Here it has only run on a software Vulkan driver on Linux, so real GPUs, and
+Windows, are yours to try: `kinfer selftest` runs a small model on the GPU and on
+the CPU and says whether the answers make sense. Please send what it prints.
 
 On Linux, the same script as on a Mac (glibc 2.34 or newer on x86-64, 2.38 or
 newer on arm64; not Alpine):
@@ -132,6 +139,7 @@ MLX models, reading experts from the SSD, splitting a model across machines and
 
 ```bash
 kinfer fit                   # what this machine can actually run
+kinfer selftest [model]      # a small model on the GPU and the CPU: are the answers right?
 kinfer pull <repo>[:quant]   # Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M, or an MLX repo: mlx-community/Qwen3.8-27B-4bit
 kinfer list                  # what is installed
 kinfer rm <model>            # delete one

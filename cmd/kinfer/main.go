@@ -39,6 +39,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer uninstall             stop it and remove the service
   kinfer fit                   what this machine can actually run
   kinfer can-run <hf-repo>     whether a model on Hugging Face will run here
+  kinfer selftest [model]      run a small model on the GPU and the CPU, and check the answers
   kinfer version               this build, and the llama.cpp inside it
 
 Examples:
@@ -108,6 +109,12 @@ func main() {
 		err = cmdPlan(os.Args[2:])
 	case "can-run":
 		err = cmdCanRun(os.Args[2:])
+	case "selftest":
+		err = cmdSelftest(os.Args[2:])
+	case "selftest-run":
+		err = cmdSelftestRun(os.Args[2:])
+	case "gpu-probe":
+		err = cmdGPUProbe(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return

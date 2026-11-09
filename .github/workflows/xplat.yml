@@ -108,3 +108,45 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python .github/ci/smoke.py $k
           exit $LASTEXITCODE
+
+  # The GPU path, on Mesa's software Vulkan: the backend fetched on first use,
+  # tried in a child process, and a real model served through it. It says
+  # nothing about the speed or the memory of a real GPU.
+  vulkan:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, goarch: amd64 }
+          - { runner: ubuntu-24.04-arm, goarch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: "0"
+      GGML_VK_VISIBLE_DEVICES: "0" # llama.cpp passes over a CPU driver unless told
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: A software Vulkan driver
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libvulkan1 mesa-vulkan-drivers
+      - name: Build
+        run: |
+          bash scripts/fetch-libs-other.sh linux ${{ matrix.goarch }}
+          go build -ldflags "-s -w -X main.version=xplat-ci" -o kinfer-ci ./cmd/kinfer
+      - name: Selftest
+        run: |
+          ./kinfer-ci pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_k_m.gguf
+          ./kinfer-ci selftest qwen2.5-0.5b-instruct-q4_k_m | tee selftest.txt
+          grep -q 'on GPU Vulkan0' selftest.txt
+      - name: A real model, served on the GPU path
+        run: python .github/ci/smoke.py ./kinfer-ci

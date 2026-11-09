@@ -66,6 +66,7 @@ func OpenEmbedder(path string, opts Options) (*Embedder, error) {
 	if err := llama.Bind(libDir); err != nil {
 		return nil, err
 	}
+	attachGPU(opts.GPULayers)
 
 	mp := llama.DefaultModelParams()
 	mp.NGpuLayers = int32(opts.GPULayers)
