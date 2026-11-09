@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4.0 — 2026-11-09
+
+### Added — GPUs on Linux and Windows, as an experiment
+
+On a machine with a Vulkan driver kinfer fetches llama.cpp's Vulkan backend the
+first time a model loads (25–37 MB, once, checked against a pinned sha256, into
+`~/.kinfer/gpu`). A backend is tried first in a process of its own, because a
+driver that crashes takes the process with it. A model runs on the GPU if its
+weights fit with 2 GiB to spare, and otherwise on the CPU, and one that fails to
+load on the GPU is tried on the CPU. `KINFER_GPU=off` leaves all of it out.
+
+CUDA and ROCm are hundreds of megabytes, so they are fetched only when asked for:
+`kinfer gpu install cuda` says the size and asks first, and picks the CUDA build
+the NVIDIA driver can run; `kinfer gpu install rocm` needs AMD's ROCm 10 on Linux
+and brings its own runtime on Windows. `kinfer gpu` shows what is fetched and in
+use, and `use` and `remove` change it. A backend that does not start, or finds no
+GPU, is left unused.
+
+**None of this has run on a real graphics card.** On Linux, x86-64 and arm64, CI
+serves a real model through Mesa's software Vulkan driver with the right answers,
+and fetches CUDA and ROCm on a machine with no card to see that each arrives whole
+and steps aside. Windows has loaded none of the GPU backends. Reports are welcome.
+
+### Added — kinfer selftest
+
+`kinfer selftest [model]` runs a small model on the GPU and on the CPU, each in a
+process of its own, and says whether the answers make sense, in a form to paste
+into an issue. A broken forward pass goes on producing tokens at full speed and
+looks fine until they are read. It works on a Mac too.
+
+Nothing changes in how models run on a Mac.
+
 ## v0.3.0 — 2026-11-09
 
 ### Added — Linux and Windows, on the CPU, as a preview
