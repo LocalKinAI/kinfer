@@ -6,6 +6,7 @@ usage: smoke.py path/to/kinfer
 import http.client
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -58,6 +59,12 @@ def chat(content, predict=40):
     if status != 200:
         raise RuntimeError(f"HTTP {status}: {data[:300]}")
     return json.loads(data)
+
+
+def sane(text):
+    """Non-empty, and not a word said over and over, which is what a broken
+    forward pass looks like: it still produces tokens, quickly."""
+    return text.strip() != "" and re.search(r"(\w{2,}?)\s*(?:\1\s*){4,}", text) is None
 
 
 def rate(d, count, duration):
@@ -126,15 +133,15 @@ try:
             choices = json.loads(line[6:])["choices"]
             if choices and choices[0]["delta"].get("content"):
                 pieces += choices[0]["delta"]["content"]
-    check("/v1/chat/completions stream", status == 200 and pieces != "", pieces.strip())
+    check("/v1/chat/completions stream", status == 200 and sane(pieces), pieces.strip())
 
     status, data = request("POST", "/v1/messages", {
         "model": MODEL, "max_tokens": 20, "messages": [{"role": "user", "content": "Say hello."}]})
-    check("/v1/messages", status == 200 and json.loads(data)["content"][0]["text"] != "", data[:120])
+    check("/v1/messages", status == 200 and sane(json.loads(data)["content"][0]["text"]), data[:120])
 
     status, data = request("POST", "/v1/responses", {
         "model": MODEL, "max_output_tokens": 20, "input": "Say hello."})
-    check("/v1/responses", status == 200 and json.loads(data)["output"][0]["content"][0]["text"] != "", data[:120])
+    check("/v1/responses", status == 200 and sane(json.loads(data)["output"][0]["content"][0]["text"]), data[:120])
 
     replies = [None] * 3
 
@@ -150,7 +157,7 @@ try:
         t.start()
     for t in threads:
         t.join()
-    check("three at once", all(replies), repr([(r or "")[:30] for r in replies]))
+    check("three at once", all(r and sane(r) for r in replies), repr([(r or "")[:30] for r in replies]))
 except Exception as e:
     check("requests to the server", False, repr(e))
 
