@@ -398,6 +398,7 @@ func TestDownloadConnectionsAreHTTP1(t *testing.T) {
 // says why it is waiting while it does.
 func TestDownloadWaitsOutAnOutage(t *testing.T) {
 	small(t)
+	retryBase = 4 * time.Millisecond // an outage outlasting the 200 ms between statuses
 	h := serve(t, 1<<20)
 	h.refuse.Store(40) // ten requests in a row on each of four connections
 

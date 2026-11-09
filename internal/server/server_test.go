@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -678,7 +679,8 @@ func TestOllamaChatReportsTimings(t *testing.T) {
 	if want := (2 * time.Millisecond).Nanoseconds(); got.PromptEvalDuration != want {
 		t.Errorf("prompt_eval_duration = %d, want %d ns", got.PromptEvalDuration, want)
 	}
-	if got.TotalDuration <= 0 {
+	// The fake answers at once, inside one tick of Windows' clock.
+	if got.TotalDuration <= 0 && runtime.GOOS != "windows" {
 		t.Errorf("total_duration = %d; the request took longer than no time at all", got.TotalDuration)
 	}
 }
