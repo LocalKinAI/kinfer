@@ -46,6 +46,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/LocalKinAI/kinfer/internal/dl"
 	"github.com/ebitengine/purego"
 )
 
@@ -285,10 +286,7 @@ func bind(dir string) error {
 
 	path := filepath.Join(dir, libName())
 
-	// RTLD_GLOBAL so symbols resolve against the copy the backend already uses;
-	// two independently loaded copies of libllama would each carry their own
-	// state and hand out handles the other cannot interpret.
-	lib, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	lib, err := dl.Open(path)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
@@ -560,7 +558,9 @@ func (e *DecodeError) Fatal() bool { return e.Code < -1 }
 
 // Decode runs one forward pass.
 func Decode(c Context, b Batch) error {
-	if rc := decode(c, b); rc != 0 {
+	var rc int32
+	onComputeThread(func() { rc = decode(c, b) })
+	if rc != 0 {
 		return &DecodeError{Code: rc}
 	}
 	return nil

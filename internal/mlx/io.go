@@ -3,6 +3,7 @@ package mlx
 import (
 	"fmt"
 
+	"github.com/LocalKinAI/kinfer/internal/dl"
 	"github.com/ebitengine/purego"
 )
 
@@ -35,7 +36,7 @@ func bindIO(lib uintptr) error {
 		{&mapIterNext, "mlx_map_string_to_array_iterator_next"},
 		{&loadST, "mlx_load_safetensors"},
 	} {
-		if _, err := purego.Dlsym(lib, b.name); err != nil {
+		if _, err := dl.Sym(lib, b.name); err != nil {
 			return fmt.Errorf("mlx-c has no %s: %w", b.name, err)
 		}
 		purego.RegisterLibFunc(b.fn, lib, b.name)

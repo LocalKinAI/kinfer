@@ -41,6 +41,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/LocalKinAI/kinfer/internal/dl"
 	"github.com/ebitengine/purego"
 )
 
@@ -144,7 +145,7 @@ func open(dir string) error {
 		return fmt.Errorf("mlx runs on Apple silicon only, not %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 	path := filepath.Join(dir, LibName)
-	lib, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	lib, err := dl.Open(path)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
@@ -177,7 +178,7 @@ func open(dir string) error {
 		{&opMatmul, "mlx_matmul"},
 		{&opAstype, "mlx_astype"},
 	} {
-		if _, err := purego.Dlsym(lib, b.name); err != nil {
+		if _, err := dl.Sym(lib, b.name); err != nil {
 			return fmt.Errorf("%s has no %s: %w", path, b.name, err)
 		}
 		purego.RegisterLibFunc(b.fn, lib, b.name)

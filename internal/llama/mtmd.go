@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/ebitengine/purego"
+	"github.com/LocalKinAI/kinfer/internal/dl"
 )
 
 // ─── pictures ────────────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ var (
 // bindMtmd loads libmtmd beside libllama, best-effort as libggml-rpc is: a
 // build without it serves text and refuses pictures.
 func bindMtmd(dir string) {
-	lib, err := purego.Dlopen(siblingLib(dir, "mtmd"), purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	lib, err := dl.Open(siblingLib(dir, "mtmd"))
 	if err != nil {
 		return
 	}
@@ -216,8 +216,9 @@ func (p *MediaPrompt) Free() {
 // the logits of its last token at index -1. It returns the position after it.
 // Not safe to call while anything else decodes on lctx.
 func EvalMedia(m Mtmd, lctx Context, p *MediaPrompt, seq int32, nBatch int) (int32, error) {
-	var next int32
-	if rc := mtmdHelperEvalChunks(m, lctx, p.chunks, 0, seq, int32(nBatch), true, &next); rc != 0 {
+	var next, rc int32
+	onComputeThread(func() { rc = mtmdHelperEvalChunks(m, lctx, p.chunks, 0, seq, int32(nBatch), true, &next) })
+	if rc != 0 {
 		return 0, &DecodeError{Code: rc}
 	}
 	return next, nil

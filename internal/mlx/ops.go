@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/LocalKinAI/kinfer/internal/dl"
 	"github.com/ebitengine/purego"
 )
 
@@ -122,7 +123,7 @@ func bindOps(lib uintptr) error {
 		{&vecAppend, "mlx_vector_array_append_value"}, {&vecSize, "mlx_vector_array_size"},
 		{&vecGet, "mlx_vector_array_get"},
 	} {
-		if _, err := purego.Dlsym(lib, b.name); err != nil {
+		if _, err := dl.Sym(lib, b.name); err != nil {
 			return fmt.Errorf("mlx-c has no %s: %w", b.name, err)
 		}
 		purego.RegisterLibFunc(b.fn, lib, b.name)
@@ -447,7 +448,7 @@ func bindQuant(lib uintptr) error {
 		{&opQuantizedMatmul, "mlx_quantized_matmul"}, {&opDequantize, "mlx_dequantize"},
 		{&opGatherQMM, "mlx_gather_qmm"}, {&opGatherMM, "mlx_gather_mm"},
 	} {
-		if _, err := purego.Dlsym(lib, b.name); err != nil {
+		if _, err := dl.Sym(lib, b.name); err != nil {
 			return fmt.Errorf("mlx-c has no %s: %w", b.name, err)
 		}
 		purego.RegisterLibFunc(b.fn, lib, b.name)

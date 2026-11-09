@@ -162,7 +162,9 @@ func (b ExtBatch) Add(tok Token, pos, seq int32, logits bool, state []float32) (
 
 // Process reads b into c.
 func Process(c Context, b ExtBatch) error {
-	if rc := processExt(c, processDecode, b); rc != 0 {
+	var rc int32
+	onComputeThread(func() { rc = processExt(c, processDecode, b) })
+	if rc != 0 {
 		return &DecodeError{Code: rc}
 	}
 	return nil

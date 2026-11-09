@@ -76,6 +76,8 @@ func totalRAM() int64 {
 			return 0
 		}
 		return n
+	case "windows":
+		return windowsRAM()
 	case "linux":
 		f, err := os.Open("/proc/meminfo")
 		if err != nil {

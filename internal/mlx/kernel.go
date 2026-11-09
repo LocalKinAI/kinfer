@@ -3,6 +3,7 @@ package mlx
 import (
 	"fmt"
 
+	"github.com/LocalKinAI/kinfer/internal/dl"
 	"github.com/ebitengine/purego"
 )
 
@@ -54,7 +55,7 @@ func bindKernels(lib uintptr) error {
 		{&kcfgTplDtype, "mlx_fast_metal_kernel_config_add_template_arg_dtype"},
 		{&kcfgTplInt, "mlx_fast_metal_kernel_config_add_template_arg_int"},
 	} {
-		if _, err := purego.Dlsym(lib, b.name); err != nil {
+		if _, err := dl.Sym(lib, b.name); err != nil {
 			return fmt.Errorf("mlx-c has no %s: %w", b.name, err)
 		}
 		purego.RegisterLibFunc(b.fn, lib, b.name)

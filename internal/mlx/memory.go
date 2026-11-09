@@ -3,6 +3,7 @@ package mlx
 import (
 	"fmt"
 
+	"github.com/LocalKinAI/kinfer/internal/dl"
 	"github.com/ebitengine/purego"
 )
 
@@ -23,7 +24,7 @@ func bindMemory(lib uintptr) error {
 		{&memPeak, "mlx_get_peak_memory"}, {&memClearCache, "mlx_clear_cache"},
 		{&memCacheLimit, "mlx_set_cache_limit"},
 	} {
-		if _, err := purego.Dlsym(lib, b.name); err != nil {
+		if _, err := dl.Sym(lib, b.name); err != nil {
 			return fmt.Errorf("mlx-c has no %s: %w", b.name, err)
 		}
 		purego.RegisterLibFunc(b.fn, lib, b.name)

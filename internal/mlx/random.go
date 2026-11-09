@@ -3,6 +3,7 @@ package mlx
 import (
 	"fmt"
 
+	"github.com/LocalKinAI/kinfer/internal/dl"
 	"github.com/ebitengine/purego"
 )
 
@@ -27,7 +28,7 @@ func bindRandom(lib uintptr) error {
 		{&opRandomKey, "mlx_random_key"}, {&opCategorical, "mlx_random_categorical"},
 		{&opCumsum, "mlx_cumsum_axis"},
 	} {
-		if _, err := purego.Dlsym(lib, b.name); err != nil {
+		if _, err := dl.Sym(lib, b.name); err != nil {
 			return fmt.Errorf("mlx-c has no %s: %w", b.name, err)
 		}
 		purego.RegisterLibFunc(b.fn, lib, b.name)

@@ -3,7 +3,7 @@ package llama
 import (
 	"os"
 
-	"github.com/ebitengine/purego"
+	"github.com/LocalKinAI/kinfer/internal/dl"
 )
 
 // ─── keeping the GPU's clock up ──────────────────────────────────────────────
@@ -26,7 +26,7 @@ var metalSetWarm func(windowMs int32)
 // bindWarm resolves the keep-warm switch in libggml-metal. It is kinfer's own
 // addition, so a build from a llama.cpp release lacks it and runs without.
 func bindWarm(dir string) {
-	lib, err := purego.Dlopen(siblingLib(dir, "ggml-metal"), purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	lib, err := dl.Open(siblingLib(dir, "ggml-metal"))
 	if err != nil {
 		return
 	}

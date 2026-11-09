@@ -2,7 +2,14 @@
 
 package main
 
-import "syscall"
+import (
+	"os"
+	"syscall"
+)
+
+// terminate asks a kinfer process to stop, which it does once its requests are
+// done.
+func terminate(p *os.Process) error { return p.Signal(syscall.SIGTERM) }
 
 // execAgent becomes the agent: its terminal, its signals and its exit status
 // are the agent's own, with no kinfer process left in between.

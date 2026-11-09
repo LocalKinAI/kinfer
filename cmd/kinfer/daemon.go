@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -155,6 +156,8 @@ func peersDoing(peers []string) string {
 	switch {
 	case len(peers) == 0:
 		return "serves on this machine alone"
+	case isAuto(peers) && runtime.GOOS != "darwin":
+		return "serves on this machine alone" // workers are found only between Macs
 	case isAuto(peers):
 		return "borrows a worker over the Thunderbolt cable for a model that does not fit here"
 	}
@@ -165,6 +168,8 @@ func peersDoing(peers []string) string {
 func peersWant(peers []string) string {
 	switch {
 	case len(peers) == 0:
+		return "this machine alone"
+	case isAuto(peers) && runtime.GOOS != "darwin":
 		return "this machine alone"
 	case isAuto(peers):
 		return "workers found over the Thunderbolt cable"

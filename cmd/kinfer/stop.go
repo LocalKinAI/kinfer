@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -50,7 +49,7 @@ func cmdStop(args []string) error {
 	}
 	// serve stops at SIGTERM once its requests are done; one still running
 	// after that long is not stopping.
-	if err := p.Signal(syscall.SIGTERM); err != nil {
+	if err := terminate(p); err != nil {
 		return fmt.Errorf("stop the daemon (pid %d): %w", pid, err)
 	}
 	deadline := time.Now().Add(20 * time.Second)

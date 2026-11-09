@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
-	"github.com/ebitengine/purego"
+	"github.com/LocalKinAI/kinfer/internal/dl"
 )
 
 // Device memory, from ggml's backend registry.
@@ -82,9 +83,19 @@ var (
 // Failure is not fatal: everything here is reporting, and a build that lacks
 // these symbols should still serve. Devices() returns nothing instead.
 func bindGGML(dir string) {
-	lib, err := purego.Dlopen(ggmlName(dir), purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	lib, err := dl.Open(ggmlName(dir))
 	if err != nil {
 		return
+	}
+	// llama.cpp's Apple builds link their backends in. Its Linux and Windows
+	// releases build each backend, and each CPU variant, as a library of its own
+	// (GGML_BACKEND_DL) that nothing opens until asked, and with none open no
+	// model can load.
+	if runtime.GOOS != "darwin" {
+		var loadAll func(string)
+		if err := register(&loadAll, lib, "ggml_backend_load_all_from_path"); err == nil {
+			loadAll(dir)
+		}
 	}
 	for _, b := range []struct {
 		fn   any

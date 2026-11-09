@@ -1,6 +1,6 @@
 package llama
 
-import "github.com/ebitengine/purego"
+import "github.com/LocalKinAI/kinfer/internal/dl"
 
 // ─── where weights live ─────────────────────────────────────────────────────
 
@@ -18,7 +18,7 @@ var cpuBufferType func() uintptr
 // a weight can be told to stay in instead of the GPU's. Best-effort, like the
 // rest of the device bindings.
 func bindCPU(dir string) {
-	lib, err := purego.Dlopen(siblingLib(dir, "ggml-cpu"), purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	lib, err := dl.Open(siblingLib(dir, "ggml-cpu"))
 	if err != nil {
 		return
 	}

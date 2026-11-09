@@ -1,0 +1,64 @@
+name: xplat
+
+# Linux and Windows on the CPU, on real machines of each. Only this branch and
+# manual runs: nothing from a fork reaches it.
+on:
+  push:
+    branches: [xplat]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, goos: linux, goarch: amd64, exe: "" }
+          - { runner: ubuntu-24.04-arm, goos: linux, goarch: arm64, exe: "" }
+          - { runner: windows-2025, goos: windows, goarch: amd64, exe: ".exe" }
+          - { runner: windows-11-arm, goos: windows, goarch: arm64, exe: ".exe" }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      CGO_ENABLED: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Take libgomp from Ubuntu 22.04
+        if: matrix.goos == 'linux'
+        run: |
+          docker run --rm -v "$PWD:/out" ubuntu:22.04 bash -c '
+            apt-get update -qq &&
+            apt-get install -y -qq --no-install-recommends libgomp1 &&
+            cp -L /usr/lib/*-linux-gnu/libgomp.so.1 /out/libgomp.so.1'
+
+      - name: Fetch llama.cpp's libraries
+        run: |
+          gomp=""
+          [ "${{ matrix.goos }}" = linux ] && gomp="$PWD/libgomp.so.1"
+          bash scripts/fetch-libs-other.sh ${{ matrix.goos }} ${{ matrix.goarch }} $gomp
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -ldflags "-s -w -X main.version=xplat-ci" -o kinfer-ci${{ matrix.exe }} ./cmd/kinfer
+
+      - name: Unit tests
+        run: go test ./... -count=1 -timeout 25m
+
+      - name: A real model
+        if: ${{ !cancelled() }}
+        run: python .github/ci/smoke.py ./kinfer-ci${{ matrix.exe }}

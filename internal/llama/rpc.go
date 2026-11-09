@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ebitengine/purego"
+	"github.com/LocalKinAI/kinfer/internal/dl"
 )
 
 // A model across machines, through ggml's RPC backend.
@@ -41,11 +41,11 @@ var (
 // (and the registry's in libggml-base). Like bindGGML it is best-effort: a
 // build without them serves one machine and says so when asked for more.
 func bindRPC(dir string) {
-	rpc, err := purego.Dlopen(siblingLib(dir, "ggml-rpc"), purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	rpc, err := dl.Open(siblingLib(dir, "ggml-rpc"))
 	if err != nil {
 		return
 	}
-	base, err := purego.Dlopen(siblingLib(dir, "ggml-base"), purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	base, err := dl.Open(siblingLib(dir, "ggml-base"))
 	if err != nil {
 		return
 	}
@@ -73,7 +73,10 @@ func siblingLib(dir, stem string) string {
 	case "llama.dll":
 		return filepath.Join(dir, stem+".dll")
 	case "libllama.so.0":
-		return filepath.Join(dir, "lib"+stem+".so.0")
+		if stem == "ggml-base" || stem == "mtmd" {
+			return filepath.Join(dir, "lib"+stem+".so.0")
+		}
+		return filepath.Join(dir, "lib"+stem+".so") // backends carry no version
 	default:
 		return filepath.Join(dir, "lib"+stem+".0.dylib")
 	}

@@ -949,6 +949,7 @@ func newContext(model llama.Model, slots, prefix, perSeq int, shared bool, ubatc
 // contextParams lays out a context as newContext describes.
 func contextParams(slots, prefix, perSeq int, shared bool, ubatch, moeCache int, q8 bool) llama.ContextParams {
 	cp := llama.DefaultContextParams()
+	useTheCores(&cp)
 	cp.MoeCacheSize = uint64(moeCache) << 20
 	if q8 {
 		// llama.cpp turns flash attention on for it, which a quantized V

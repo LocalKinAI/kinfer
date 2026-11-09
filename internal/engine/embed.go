@@ -79,6 +79,7 @@ func OpenEmbedder(path string, opts Options) (*Embedder, error) {
 	}
 
 	cp := llama.DefaultContextParams()
+	useTheCores(&cp)
 	cp.Embeddings = 1
 	cp.NCtx = uint32(limit)
 	cp.NBatch, cp.NUbatch = uint32(limit), uint32(limit)
