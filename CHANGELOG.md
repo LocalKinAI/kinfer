@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.4.1 — 2026-11-09
+
+### Fixed — a model with experts on the SSD answered wrongly after it was reloaded
+
+A model too big for the GPU keeps some of its experts in the file and reads them
+as they are needed, looking up where in the file a mapped address comes from. That
+table lasted as long as the process. The model unloads after five idle minutes,
+and when the next question loaded it again, in the same process, its files could
+land at other addresses, and the old entries sent every read to the wrong place
+in the file. The weights it read were wrong, and the reply came back garbled or
+empty. DeepSeek-V4.1 on a MacBook Pro did this after a pause; loading another model
+first did it as well. It has been there since v0.1.0, and went unseen because each
+test had started a new process for each model.
+
+Each new MoE cache now forgets the table and looks up what it reads again (patch
+0008, libraries b11998k8). On the MacBook Pro, V4.1 loaded three times in one
+process, then Flash-Next, then V4.1 again, gave the same reply word for word each
+time, where v0.4.0 gave an empty one from the second load on. A model that fits on
+the GPU never used this table.
+
+### Fixed — a Mac lending its GPU was given a layer too many
+
+A model split across two Macs keeps room on the peer for a pass of activations and
+2 GiB. A pass of DeepSeek-V4.1 took 4.6 GiB where the estimate said 2.7, so a
+MacBook Pro with nearly all of its 40 GiB free was given a layer more than it had
+room for, and paged its GPU on every token: V4.1 on the Mac Studio, borrowing the
+laptop with the Studio's other services running, decoded at 4 tok/s. The
+activations now count twice. Layers 0–9 go to the laptop rather than 0–10, and the
+same run decodes at 20–21 tok/s. With the laptop as the master, V4.1 and Flash-Next
+stay within a few percent of what they were.
+
 ## v0.4.0 — 2026-11-09
 
 ### Added — GPUs on Linux and Windows, as an experiment
