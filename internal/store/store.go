@@ -643,6 +643,30 @@ func readModelDir(dir string) modelDir {
 			d.modified = info.ModTime()
 		}
 	}
+	// A diffusion model as mflux saves one keeps its parts in folders — the
+	// transformer, the text encoder, the VAE, each its safetensors and index —
+	// and its tokenizer in another (mlximage).
+	if !d.config {
+		if fi, err := os.Stat(filepath.Join(dir, "transformer")); err == nil && fi.IsDir() {
+			whole := true
+			for _, part := range []string{"transformer", "text_encoder", "vae"} {
+				p := readModelDir(filepath.Join(dir, part))
+				whole = whole && p.weights > 0
+				d.weights += p.weights
+				d.missing += p.missing
+				d.arriving += p.arriving
+				d.size += p.size
+				if p.modified.After(d.modified) {
+					d.modified = p.modified
+				}
+			}
+			if fi, err := os.Stat(filepath.Join(dir, "tokenizer", "tokenizer.json")); err == nil {
+				d.tokenizer = true
+				d.size += fi.Size()
+			}
+			d.config = whole
+		}
+	}
 	// One piece missing and the model cannot load.
 	if b, err := os.ReadFile(filepath.Join(dir, "model.safetensors.index.json")); err == nil {
 		var index struct {

@@ -870,3 +870,22 @@ func sortedCopy(s []string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// A picture model as mflux saves one — its parts in folders, no config.json
+// at the top — is a model of the store, whole only when every part is.
+func TestListDiffusionDir(t *testing.T) {
+	s := newStore(t)
+	dir := filepath.Join(s.Root(), "z-image-turbo-mflux-q8")
+	for _, f := range []string{"transformer/0.safetensors", "text_encoder/0.safetensors", "vae/0.safetensors", "tokenizer/tokenizer.json"} {
+		os.MkdirAll(filepath.Dir(filepath.Join(dir, f)), 0o755)
+		os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644)
+	}
+	models, err := s.List()
+	if err != nil || len(models) != 1 || models[0].Name != "z-image-turbo-mflux-q8" || models[0].Format != "safetensors" {
+		t.Fatalf("%v %v", models, err)
+	}
+	os.WriteFile(filepath.Join(dir, "transformer", "model.safetensors.index.json"), []byte(`{"weight_map":{"a":"1.safetensors"}}`), 0o644)
+	if models, _ := s.List(); len(models) != 0 {
+		t.Errorf("a transformer missing a piece is listed: %v", models)
+	}
+}

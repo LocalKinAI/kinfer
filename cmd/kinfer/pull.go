@@ -16,6 +16,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/hub"
 	"github.com/LocalKinAI/kinfer/internal/mlxasr"
 	"github.com/LocalKinAI/kinfer/internal/mlxengine"
+	"github.com/LocalKinAI/kinfer/internal/mlximage"
 	"github.com/LocalKinAI/kinfer/internal/mlxmodel"
 	"github.com/LocalKinAI/kinfer/internal/mlxtts"
 	"github.com/LocalKinAI/kinfer/internal/server"
@@ -59,6 +60,9 @@ func cmdPull(args []string) error {
 	if len(files) == 0 {
 		if set, ok := hub.MLXFiles(all); ok {
 			return pullMLX(ctx, st, ref, set, *conns)
+		}
+		if set, ok := hub.ImageFiles(all); ok {
+			return pullImage(ctx, st, ref, set, *conns)
 		}
 		return fmt.Errorf("%s contains no .gguf files, nor safetensors kinfer can serve on MLX", ref.Repo)
 	}
@@ -150,7 +154,9 @@ func pullSpeech(conns int) error {
 		}
 	}
 	for _, m := range server.SpeechModels() {
-		if done[m.Kind] {
+		// The defaults of hearing and speaking; a voice told in words and a
+		// picture are fetched when first asked for, or by name.
+		if done[m.Kind] || m.Kind != "asr" && m.Kind != "tts" {
 			continue
 		}
 		done[m.Kind] = true
@@ -205,6 +211,31 @@ func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, 
 		return err
 	}
 
+	return pullDir(ctx, st, ref, set, conns, "served on MLX")
+}
+
+// pullImage fetches a picture model as mflux saves one (mlximage serves
+// Z-Image): its folders of safetensors and its tokenizer, then checks that
+// what arrived is a model it can load.
+func pullImage(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, conns int) error {
+	if ref.Quant != "" || ref.File != "" {
+		return fmt.Errorf("%s is safetensors, pulled whole: kinfer pull %s", ref.Repo, ref.Repo)
+	}
+	if err := mlxengine.Usable(); err != nil {
+		return err
+	}
+	if err := pullDir(ctx, st, ref, set, conns, "a picture model, served on MLX"); err != nil {
+		return err
+	}
+	if dir := filepath.Join(st.Root(), path.Base(ref.Repo)); !mlximage.IsModelDir(dir) {
+		return fmt.Errorf("%s arrived, but is not a picture model kinfer paints with: it serves Z-Image as mflux saves it (mflux-community/z-image-turbo-mflux-q8)", dir)
+	}
+	return nil
+}
+
+// pullDir fetches set, files of a model laid out in a directory, into a
+// directory of the store named for the repo.
+func pullDir(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, conns int, what string) error {
 	name := path.Base(ref.Repo)
 	dir := filepath.Join(st.Root(), name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -217,7 +248,7 @@ func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, 
 	for _, f := range set {
 		m.total += f.Size
 	}
-	fmt.Printf("pulling %s, %d files (%s), served on MLX\n", name, len(set), store.HumanSize(m.total))
+	fmt.Printf("pulling %s, %d files (%s), %s\n", name, len(set), store.HumanSize(m.total), what)
 	if err := hub.Room(dir, set); err != nil {
 		os.Remove(dir) // only if nothing is in it yet
 		return err

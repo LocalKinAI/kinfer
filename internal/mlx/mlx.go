@@ -202,6 +202,7 @@ func open(dir string) error {
 		return err
 	}
 	bindAudio(lib) // audio_ops.go: best-effort, a library without them serves text
+	bindImage(lib) // image_ops.go: the same
 	setErrorHandler(purego.NewCallback(func(msg *byte, _ uintptr) {
 		lastErr = goString(msg)
 	}), 0, 0)

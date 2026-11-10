@@ -35,7 +35,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer ps                    show which model is loaded right now
   kinfer stop                  stop the background daemon run started
   kinfer plan <model>          what -slots and -ctx to serve it with
-  kinfer serve                 serve models over HTTP: chat, and speech behind the same address
+  kinfer serve                 serve models over HTTP: chat, and speech and pictures behind the same address
   kinfer worker                lend this machine's GPU to the Mac at the other end of a Thunderbolt cable
   kinfer install [serve flags] keep serve running: at login, and after a crash (macOS)
   kinfer uninstall             stop it and remove the service
@@ -540,7 +540,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.StringVar(&o.kvCache, "kv-cache", "f16", "what the attention cache is kept in: f16, or q8_0 — about half the memory, so twice the context per conversation, and decode up to a seventh slower at long contexts (a model q8_0 does not suit stays f16: the DeepSeek family, and heads it does not divide)")
 	fs.BoolVar(&o.place, "place", true, "when a mixture of experts does not fit the GPU, keep as many layers' experts in host memory as it must, with a GPU cache for the ones in use, unless -host-experts or -moe-cache say otherwise; with -peers and no -split, give the peers only the layers that do not fit here (false = load it whole, and let llama.cpp split by free memory)")
 	fs.StringVar(&o.speech, "speech", server.SpeechAuto, "speech behind this address: auto = a speech model starts in a process of its own on the first request for it and stops once idle as long as -keepalive; keep = the default speech models start with the server and stay; off = speech is served in this process, one model at a time with the rest")
-	fs.BoolVar(&o.autoPull, "auto-pull", true, "fetch this machine's default speech model the first time one is asked for and is not here (Qwen3-ASR 2.5 GB, Qwen3-TTS 1.8 GB); the request is answered 503 with how far it has got (false = answer 404 saying what to pull)")
+	fs.BoolVar(&o.autoPull, "auto-pull", true, "fetch this machine's default speech or picture model the first time one is asked for and is not here (Qwen3-ASR 2.5 GB, Qwen3-TTS 1.8 GB, Qwen3-TTS VoiceDesign 2.9 GB, Z-Image-Turbo 11.0 GB); the request is answered 503 with how far it has got (false = answer 404 saying what to pull)")
 	fs.Func("speech-addr", "also answer one kind of speech at an address of its own, in the Python audio service's API (/transcribe, /synthesize, /voices) as well as OpenAI's, the model this server chooses for the kind: kind=address pairs, comma-separated, the kinds asr, tts and design (Qwen3-TTS VoiceDesign, a voice told in words) — asr=:8100,tts=:8101,design=:8102 takes the box's old ports (default none)", func(v string) (err error) {
 		o.speechAddrs, err = server.ParseSpeechAddrs(v)
 		return err
@@ -620,6 +620,7 @@ func cmdServe(args []string) error {
 	fmt.Printf("  Anthropic  : POST %s/v1/messages          (Claude Code)\n", o.addr)
 	fmt.Printf("  Responses  : POST %s/v1/responses         (Codex)\n", o.addr)
 	fmt.Printf("  Speech     : POST %s/v1/audio/transcriptions   %s/v1/audio/speech\n", o.addr, o.addr)
+	fmt.Printf("  Pictures   : POST %s/v1/images/generations\n", o.addr)
 	switch o.speech {
 	case server.SpeechAuto:
 		fmt.Printf("               each speech model in a process of its own, on first use, stopped once idle")
@@ -634,7 +635,8 @@ func cmdServe(args []string) error {
 	fmt.Printf("\n")
 	for _, kind := range []string{"asr", "tts", "design"} {
 		if a := o.speechAddrs[kind]; a != "" {
-			fmt.Printf("  %-11s: %s — the Python audio service's API too (/transcribe, /synthesize, /voices)\n", map[string]string{"asr": "Hearing", "tts": "Speaking", "design": "Voice design"}[kind], a)
+			api := map[string]string{"asr": "/transcribe", "tts": "/synthesize, /voices", "design": "/synthesize"}[kind]
+			fmt.Printf("  %-11s: %s — the Python audio service's API too (%s)\n", map[string]string{"asr": "Hearing", "tts": "Speaking", "design": "Voice design"}[kind], a, api)
 		}
 	}
 	fmt.Printf("\n")

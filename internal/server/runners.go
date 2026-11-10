@@ -26,6 +26,7 @@ import (
 
 	"github.com/LocalKinAI/kinfer/internal/mlxasr"
 	"github.com/LocalKinAI/kinfer/internal/mlxengine"
+	"github.com/LocalKinAI/kinfer/internal/mlximage"
 	"github.com/LocalKinAI/kinfer/internal/mlxtts"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
@@ -60,6 +61,7 @@ const (
 	kindASR    = "asr"    // /v1/audio/transcriptions and translations
 	kindTTS    = "tts"    // /v1/audio/speech and voices
 	kindDesign = "design" // the same, in a voice told in words (Qwen3-TTS VoiceDesign)
+	kindImage  = "image"  // /v1/images/generations (images.go)
 )
 
 // SpeechModel is a default speech model: what `kinfer pull` fetches, the
@@ -85,6 +87,7 @@ func SpeechModels() []SpeechModel {
 	if mlx {
 		out = append(out, SpeechModel{kindTTS, "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "1.8 GB"})
 		out = append(out, SpeechModel{kindDesign, "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit", "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit", "2.9 GB"})
+		out = append(out, SpeechModel{kindImage, "mflux-community/z-image-turbo-mflux-q8", "z-image-turbo-mflux-q8", "11.0 GB"})
 	}
 	return out
 }
@@ -96,6 +99,9 @@ func SpeechModels() []SpeechModel {
 func (s *Server) SetSpeech(mode string, autoPull bool, addr string) {
 	s.speech, s.autoPull = mode, autoPull
 	s.runners.keep = mode == SpeechKeep
+	if s.runners.kept == nil {
+		s.runners.kept = map[string]bool{}
+	}
 	s.selfURL = loopbackURL(addr)
 }
 
@@ -142,6 +148,8 @@ func (s *Server) fits(kind, path string) bool {
 			return mlxtts.IsModelDir(path)
 		case kindDesign:
 			return mlxtts.IsModelDir(path) && mlxtts.DesignsVoices(path)
+		case kindImage:
+			return mlximage.IsModelDir(path)
 		}
 		return false
 	}
@@ -183,7 +191,7 @@ func (s *Server) speechModelFor(kind, asked string) (path string, fetch *SpeechM
 }
 
 // kindNames say what a kind of speech model does, for messages.
-var kindNames = map[string]string{kindASR: "speech recognition", kindTTS: "text to speech", kindDesign: "text to speech in a voice told in words"}
+var kindNames = map[string]string{kindASR: "speech recognition", kindTTS: "text to speech", kindDesign: "text to speech in a voice told in words", kindImage: "text to image"}
 
 // proxySpeech answers a speech request in a runner: the model it names or
 // the default, fetched first if it must be. body is the request's, read.
@@ -205,7 +213,7 @@ func (s *Server) speechPath(w http.ResponseWriter, kind, asked string) (string, 
 	switch {
 	case fetch == nil:
 		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": map[string]string{
-			"message": fmt.Sprintf("%s runs on a Mac with Apple silicon here (Qwen3-TTS on MLX); this machine has no %s model", kindNames[kind], kindNames[kind]),
+			"message": fmt.Sprintf("%s runs on a Mac with Apple silicon here (on MLX); this machine has no %s model", kindNames[kind], kindNames[kind]),
 			"type":    "invalid_request_error"}})
 	case !s.autoPull:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{
@@ -352,7 +360,8 @@ type runnerSet struct {
 	mu        sync.Mutex
 	byPath    map[string]*runner
 	keepAlive time.Duration
-	keep      bool
+	keep      bool            // -speech keep: the models PrepareSpeech readied stay
+	kept      map[string]bool // those models; a picture's runner still stops once idle
 	closed    bool
 	start     func(path string) (*proc, error) // starts one and waits until it answers; tests replace it
 }
@@ -411,7 +420,7 @@ func (rs *runnerSet) release(r *runner) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	r.inflight--
-	if r.inflight > 0 || rs.keep || rs.keepAlive <= 0 || rs.byPath[r.path] != r {
+	if r.inflight > 0 || rs.keep && rs.kept[r.path] || rs.keepAlive <= 0 || rs.byPath[r.path] != r {
 		return
 	}
 	r.expiry = time.Now().Add(rs.keepAlive)
@@ -762,6 +771,12 @@ func (s *Server) PrepareSpeech() {
 		if path == "" {
 			continue
 		}
+		s.runners.mu.Lock()
+		if s.runners.kept == nil {
+			s.runners.kept = map[string]bool{}
+		}
+		s.runners.kept[path] = true
+		s.runners.mu.Unlock()
 		rn, release, err := s.runners.acquire(path)
 		if err != nil {
 			log.Printf("speech: %s could not be started: %v", modelName(path), err)

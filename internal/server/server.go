@@ -29,6 +29,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/engine"
 	"github.com/LocalKinAI/kinfer/internal/mlxasr"
 	"github.com/LocalKinAI/kinfer/internal/mlxengine"
+	"github.com/LocalKinAI/kinfer/internal/mlximage"
 	"github.com/LocalKinAI/kinfer/internal/mlxtts"
 	"github.com/LocalKinAI/kinfer/internal/store"
 	"github.com/LocalKinAI/kinfer/internal/tools"
@@ -139,6 +140,9 @@ type generator interface {
 func openEngine(path string, opts engine.Options) (generator, error) {
 	// A directory of safetensors is an MLX model — a speech recognition or a
 	// text to speech one of its own (mlxasr, mlxtts) — and a file is a GGUF.
+	if mlximage.IsModelDir(path) {
+		return mlximage.Open(path, opts)
+	}
 	if mlxasr.IsModelDir(path) {
 		return mlxasr.Open(path, opts)
 	}
@@ -204,6 +208,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/audio/translations", s.handleTranslation)     // transcribe.go
 	mux.HandleFunc("/v1/audio/speech", s.handleSpeech)                // speech.go
 	mux.HandleFunc("/v1/audio/voices", s.handleVoices)                // speech.go
+	mux.HandleFunc("/v1/images/generations", s.handleImages)          // images.go
 
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

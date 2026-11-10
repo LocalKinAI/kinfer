@@ -253,3 +253,25 @@ func TestMLXFilesTakeQwen3TTSsCodec(t *testing.T) {
 		t.Errorf("MLXFiles = %s\nwant          %s", s, want)
 	}
 }
+
+// A picture model as mflux saves one is its folders: the three parts'
+// safetensors and indexes and the tokenizer, not the README.
+func TestImageFiles(t *testing.T) {
+	files := []File{{Name: ".gitattributes"}, {Name: "README.md"},
+		{Name: "text_encoder/0.safetensors"}, {Name: "text_encoder/model.safetensors.index.json"},
+		{Name: "tokenizer/tokenizer.json"}, {Name: "tokenizer/tokenizer_config.json"}, {Name: "tokenizer/chat_template.jinja"},
+		{Name: "transformer/0.safetensors"}, {Name: "transformer/model.safetensors.index.json"},
+		{Name: "vae/0.safetensors"}, {Name: "vae/model.safetensors.index.json"}, {Name: "samples/cat.png"}}
+	set, ok := ImageFiles(files)
+	if !ok || len(set) != 9 {
+		t.Fatalf("%v %v", ok, set)
+	}
+	for _, f := range set {
+		if f.Name == "README.md" || f.Name == "samples/cat.png" {
+			t.Errorf("took %s", f.Name)
+		}
+	}
+	if _, ok := ImageFiles(files[:5]); ok {
+		t.Error("a repo without its transformer and VAE passed")
+	}
+}

@@ -226,6 +226,36 @@ func MLXFiles(files []File) ([]File, bool) {
 	return append(append(weights, rest...), config), true
 }
 
+// ImageFiles are the files of a picture model as mflux saves one, if files
+// are one: its transformer, text encoder and VAE, each a folder of
+// safetensors and their index, and its tokenizer's folder (mlximage).
+func ImageFiles(files []File) ([]File, bool) {
+	var set []File
+	have := map[string]bool{}
+	for _, f := range files {
+		dir, rest, ok := strings.Cut(f.Name, "/")
+		if !ok || strings.Contains(rest, "/") {
+			continue
+		}
+		switch dir {
+		case "transformer", "text_encoder", "vae":
+			if strings.HasSuffix(rest, ".safetensors") {
+				have[dir] = true
+				set = append(set, f)
+			} else if strings.HasSuffix(rest, ".json") {
+				set = append(set, f)
+			}
+		case "tokenizer":
+			have["tokenizer"] = have["tokenizer"] || rest == "tokenizer.json"
+			set = append(set, f)
+		}
+	}
+	if !have["transformer"] || !have["text_encoder"] || !have["vae"] || !have["tokenizer"] {
+		return nil, false
+	}
+	return set, true
+}
+
 // Pick chooses which file to download.
 //
 // An explicit file wins; then a quantisation match; otherwise Q4_K_M, the
