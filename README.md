@@ -269,8 +269,11 @@ several. How it works, and every measurement behind it:
   model loaded beside the chat model; pictures, for a model with a projector;
   speech to text (`/v1/audio/transcriptions`), for one that hears, such as
   Qwen3-ASR; text to speech (`/v1/audio/speech`), streamed, from Qwen3-TTS on a
-  Mac — both at the chat model's own address, each speech model in a process of
-  its own, fetched on first use; a
+  Mac, in voices by name or one told in words; pictures
+  (`/v1/images/generations`) from Z-Image-Turbo on a Mac — all at the chat
+  model's own address, each such model in a process of its own, fetched on
+  first use; `-speech-addr` answers the Python audio service's old ports and
+  API; a
   model with an MTP head drafts its next tokens (Qwen3.8-27B: 31.5 → 37–69 tok/s);
   every reply carries its timings; `/metrics`; a
   bounded queue that refuses rather than hangs; `fit`, `plan` and `can-run` size

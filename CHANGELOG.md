@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+### Added — pictures, behind the same address
+
+`POST /v1/images/generations`, as OpenAI has it, on a Mac: Z-Image-Turbo
+(Tongyi-MAI, Apache-2.0), a port of mflux's to Go on the MLX library
+(internal/mlximage) — the Qwen3-4B text encoder read to its second-to-last
+layer, the 6B single-stream transformer, nine flow-matching steps and Flux's
+VAE decoder — reading mflux's own saved weights
+(`kinfer pull mflux-community/z-image-turbo-mflux-q8`, 11.0 GB, 8-bit). Like
+speech it runs in a runner of its own behind the chat address, started on the
+first request and stopped once idle; the default is fetched on first use. The
+answer is PNG, base64 (`b64_json`, or a `data:` URL for `url`); `size` from
+256 to 2048 a side in multiples of 16, `n` up to 4, and kinfer's `seed` (the
+same seed, the same picture) and `steps`. Checked against mflux on the M3
+Ultra: the tokens, the caption's features, the schedule and the starting
+noise the same, the decoder within 1e-5 on mflux's latents, and the pictures at
+40.5–40.8 dB PSNR from mflux's own; 1024×1024 in 30.9 s (29.7 s of
+denoising, mflux's the same 29.7 s), 1024×768 in 22.5 s, 10.8 GB resident and
+an 18.4 GB peak. Each stage's intermediates are freed before it is evaluated:
+held, a 1024×1024 picture's attention took a runner to 84 GB.
+
+### Added — the Python audio service's addresses
+
+`-speech-addr asr=:8100,tts=:8101,design=:8102` has kinfer answer each kind of
+speech at an address of its own, in localkin-service-audio's API
+(`/transcribe`, `/synthesize`, `/voices`, `/health`) as well as OpenAI's, in
+the model this server chooses for the kind and whatever model a request names,
+as the Python service ignored it — so programs and devices written against
+those ports keep working once the Python services stop. On the box it replaced
+all three; Pixelle's and OpenMontage's calls, and a device's, answered as
+before.
+
+### Added — Qwen3-TTS VoiceDesign
+
+A voice told in words: `instructions` (`instruct` at `/synthesize`) describe
+the voice, with no voice by name (`Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit`,
+2.9 GB). Against mlx-audio: the prompt the same bits, the decoder within 1e-6,
+the talker's logits cos ≥ 0.99996 fed the same codes, one near tie in 73
+frames drawn otherwise (the two MLX builds' rounding); 4.3–4.6× real time
+against mlx-audio's 4.6×. A 104-character narration: 22.6 s of speech in 5.0 s,
+heard back word for word.
+
+### Changed
+
+With `-speech keep`, only the default speech models stay; a picture's runner
+and any other speech model's stop once idle as long as `-keepalive`.
+`kinfer pull speech` fetches hearing and speaking only.
+
 ## v0.6.0 — 2026-11-10
 
 ### Added — one address for chat and speech

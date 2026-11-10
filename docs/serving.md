@@ -731,6 +731,90 @@ of 2,048 — 622 MB — of which a sentence reads a few dozen, is read a row at 
 time from its file rather than held. The 1.7B models, VoiceDesign and Base's
 voice cloning are not served yet.
 
+### A voice told in words: VoiceDesign
+
+Qwen3-TTS's VoiceDesign models have no voices by name: the voice is the one
+`instructions` describe, a new one each time.
+
+```bash
+curl localhost:11500/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit","input":"孩子们，过来坐下。","instructions":"一位声音低沉的老爷爷，说话慢悠悠的"}' -o grandpa.wav
+```
+
+Against mlx-audio on the box: the prompt the same bits, the decoder within
+1e-6, the talker's logits cos ≥ 0.99996 fed the same codes and one near tie in
+73 frames drawn otherwise; 4.3–4.6× real time against mlx-audio's 4.6×.
+
+## The Python audio service's addresses
+
+Before kinfer heard and spoke, the box's speech was localkin-service-audio,
+one Python process a model at a port of its own, with an API of its own beside
+OpenAI's. `-speech-addr` has kinfer answer at those ports in its place:
+
+```bash
+kinfer serve -speech keep -speech-addr asr=:8100,tts=:8101,design=:8102
+```
+
+Each address answers one kind — `asr` speech recognition, `tts` Qwen3-TTS's
+voices by name, `design` VoiceDesign — in the model this server chooses for
+it, whatever model a request names, as the Python service did:
+
+- `POST /transcribe`: the recording in the form's `file`, `language` and
+  `response_format` (`json` or `text`) as query parameters or fields; the
+  answer `{"text", "language", "duration"}`, with `emotion` and
+  `audio_events` when there are any.
+- `POST /synthesize`: JSON with `text`, `speaker`, `language`, `speed` and
+  `instruct`; the answer WAV.
+- `GET /voices`: each voice's id, name, language and whose it is.
+- `GET /health`, `GET /`, and OpenAI's `/v1/audio/*` too.
+
+On the box, after the Python services stopped: Pixelle's `/transcribe` and
+`/synthesize`, OpenMontage's `/v1/audio/transcriptions` and `/synthesize` in
+both voices, and kinhome's OpenAI calls all answered; a 104-character
+narration in a designed voice came back heard word for word.
+
+## Pictures from words
+
+`POST /v1/images/generations`, as OpenAI has it, answered on a Mac by
+Z-Image-Turbo (Tongyi-MAI, Apache-2.0): a port of mflux's to Go on the MLX
+library (`internal/mlximage`), reading mflux's saved weights. Behind the chat
+address it runs in a runner of its own, as speech does, started on the first
+request and stopped once idle; the default is fetched on first use.
+
+```bash
+kinfer pull mflux-community/z-image-turbo-mflux-q8      # 11.0 GB, 8-bit
+curl localhost:11500/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt":"黄昏时的江南水乡，小船，灯笼，水墨画","size":"768x1024","seed":3}' \
+  | python3 -c 'import sys,json,base64; open("pic.png","wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
+```
+
+- `size` is 256 to 2048 a side in multiples of 16 (1024x1024 by default),
+  `n` up to 4, each with the next seed; the answer is PNG, `b64_json`, or a
+  `data:` URL when `response_format` is `url`. kinfer's `seed` gives the same
+  picture each time, and `steps` (9) the denoising steps.
+- The model is the one a request names if it paints, else the default —
+  OpenAI's `dall-e-3` and `gpt-image-1` get it.
+
+The pipeline is mflux's, op for op: the prompt in Qwen3's chat template, the
+Qwen3-4B text encoder's second-to-last hidden state, the 6B single-stream
+transformer (two refiner blocks for the picture's patches and for the caption,
+then thirty over both, each modulated by the timestep), nine Euler steps on a
+shifted linear schedule, and Flux's VAE decoder.
+
+Measured on the box (M3 Ultra) against mflux 0.22 run eagerly: the tokens,
+the caption's features (cos 1.0000000), the schedule and the noise the same;
+the first step's velocity cos 0.9997; the decoder on mflux's latents cos
+0.99999; the pictures at 40.5 dB (512²) and 40.8 dB (1024²) from mflux's own.
+1024×1024 in 30.9 s, 29.7 s of it denoising, as mflux's 29.7 s; 1024×768 in
+22.5 s; 512×512 in 7.5 s. The runner holds 10.8 GB and peaks at 18.4 GB for a
+1024² picture.
+
+One thing a port in Go has to do that Python does by itself: each stage's
+intermediates are let go before it is evaluated. A handle still held keeps its
+buffer to the end of the evaluation, and a 1024² picture's attention held so,
+step after step, took a runner to 84 GB and the box into swap; let go, MLX
+frees each as soon as the graph is done with it.
+
 ## `kinfer install` keeps the server up
 
 The daemon `run` starts is a plain background process: a reboot loses it, and
