@@ -22,9 +22,11 @@ import (
 // rising ramp, 2,400 samples each, one piece unless streamed.
 type fakeSpeaker struct {
 	fakeEngine
-	mu     sync.Mutex
-	last   mlxtts.Request
-	pieces int
+	mu      sync.Mutex
+	last    mlxtts.Request
+	pieces  int
+	calls   int
+	runaway int // the next this many answers talk on to the frame limit
 }
 
 func (f *fakeSpeaker) Speaks() bool        { return true }
@@ -35,8 +37,17 @@ func (f *fakeSpeaker) SampleRate() int     { return 24000 }
 func (f *fakeSpeaker) Speak(ctx context.Context, r mlxtts.Request, onAudio func([]float32) error) (mlxtts.Result, error) {
 	f.mu.Lock()
 	f.last = r
+	f.calls++
 	n := f.pieces
+	runaway := f.runaway > 0
+	if runaway {
+		f.runaway--
+	}
 	f.mu.Unlock()
+	if runaway {
+		onAudio(make([]float32, 24000))
+		return mlxtts.Result{Frames: r.MaxFrames, Stopped: true}, nil
+	}
 	if r.Stream == 0 {
 		n = 1
 	}
@@ -102,7 +113,7 @@ func TestSpeechIsAWav(t *testing.T) {
 		t.Errorf("sample 1200 is %d, want half of full scale", v)
 	}
 	r := sp.request()
-	if r.Voice != "serena" || r.Language != "chinese" || r.Temperature != 0.9 || r.Stream != 0 {
+	if r.Voice != "serena" || r.Language != "chinese" || r.Temperature != 0.9 || r.Stream != 0 || r.MaxFrames != speechFrames("你好，今天天气不错。") {
 		t.Errorf("asked the model for %+v", r)
 	}
 	if w.Header().Get("X-Kinfer-Voice") != "serena" || w.Header().Get("X-Kinfer-Language") != "chinese" {
@@ -242,5 +253,17 @@ func TestSpeechVoices(t *testing.T) {
 	var out struct{ Voices, Languages []string }
 	if json.Unmarshal(w.Body.Bytes(), &out); w.Code != http.StatusOK || len(out.Voices) != 3 || out.Languages[0] != "auto" {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+}
+
+// An answer that talks on to the end of its frames is said again, with the
+// next seed: the second, not the babble, is what goes back.
+func TestSpeechThatTalksOnIsSaidAgain(t *testing.T) {
+	srv, sp := newSpeechServer(t)
+	defer srv.Close()
+	sp.runaway = 1
+	w := speak(t, srv, `{"model":"tts","input":"hello","seed":41}`)
+	if w.Code != http.StatusOK || w.Body.Len() != 44+2*2400 || sp.calls != 2 || *sp.request().Seed != 42 {
+		t.Fatalf("%d, %d bytes, %d calls, seed %v", w.Code, w.Body.Len(), sp.calls, sp.request().Seed)
 	}
 }

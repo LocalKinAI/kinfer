@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/mlxengine"
 	"github.com/LocalKinAI/kinfer/internal/mlxmodel"
 	"github.com/LocalKinAI/kinfer/internal/mlxtts"
+	"github.com/LocalKinAI/kinfer/internal/server"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
 
@@ -27,7 +29,10 @@ func cmdPull(args []string) error {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: kinfer pull [-connections n] <repo>[:quant]   (a GGUF repo, or an MLX one of safetensors)")
+		return fmt.Errorf("usage: kinfer pull [-connections n] <repo>[:quant]   (a GGUF repo, or an MLX one of safetensors; speech for this machine's default speech models)")
+	}
+	if fs.Arg(0) == "speech" {
+		return pullSpeech(*conns)
 	}
 
 	ref, err := hub.ParseRef(fs.Arg(0))
@@ -64,7 +69,7 @@ func cmdPull(args []string) error {
 
 	// A split model is no model without every piece.
 	set := hub.Shards(files, pick)
-	m := &pullMeter{tty: isTerminal(int(os.Stdout.Fd()))}
+	m := &pullMeter{tty: isTerminal(int(os.Stdout.Fd())), json: os.Getenv("KINFER_PULL_PROGRESS") == "json"}
 	if m.tty {
 		m.width = termWidth(int(os.Stdout.Fd()))
 	}
@@ -124,6 +129,40 @@ func cmdPull(args []string) error {
 	return nil
 }
 
+// pullSpeech fetches this machine's default speech models, each kind's first
+// choice, unless a default of its kind is here already: what serve would
+// fetch on first use.
+func pullSpeech(conns int) error {
+	st, err := store.Open()
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	if models, err := st.List(); err == nil {
+		for _, m := range models {
+			have[m.Name] = true
+		}
+	}
+	done := map[string]bool{}
+	for _, m := range server.SpeechModels() {
+		if have[m.Name] {
+			done[m.Kind] = true
+		}
+	}
+	for _, m := range server.SpeechModels() {
+		if done[m.Kind] {
+			continue
+		}
+		done[m.Kind] = true
+		fmt.Printf("speech: %s (%s)\n", m.Repo, m.Size)
+		if err := cmdPull([]string{"-connections", strconv.Itoa(conns), m.Repo}); err != nil {
+			return err
+		}
+	}
+	fmt.Println("speech: ready — kinfer serve answers /v1/audio/transcriptions and /v1/audio/speech")
+	return nil
+}
+
 // servedOnMLX is a model_type kinfer serves on MLX: a chat model's
 // (mlxmodel), a speech recognition model's (mlxasr) or a text to speech
 // model's (mlxtts).
@@ -171,7 +210,7 @@ func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	m := &pullMeter{tty: isTerminal(int(os.Stdout.Fd()))}
+	m := &pullMeter{tty: isTerminal(int(os.Stdout.Fd())), json: os.Getenv("KINFER_PULL_PROGRESS") == "json"}
 	if m.tty {
 		m.width = termWidth(int(os.Stdout.Fd()))
 	}
@@ -230,6 +269,9 @@ type pullMeter struct {
 	drawn   bool      // whether a progress line waits for its newline
 	printed time.Time // when the line last went out, off a terminal
 	recent  []sample  // what this pull had fetched, over the last few seconds
+
+	json   bool // KINFER_PULL_PROGRESS=json: progress as JSON lines too
+	jsonAt time.Time
 }
 
 type sample struct {
@@ -254,6 +296,13 @@ func (m *pullMeter) end() {
 func (m *pullMeter) show(st hub.Status) {
 	prev := m.last
 	m.last = st
+	if m.json {
+		// For a server fetching a speech model with this pull: a line a second.
+		if now := time.Now(); now.Sub(m.jsonAt) >= time.Second || (st.Total > 0 && st.Done == st.Total) {
+			m.jsonAt = now
+			fmt.Printf("{\"done\":%d,\"total\":%d}\n", m.before+st.Done, max(m.total, m.before+st.Total))
+		}
+	}
 	if !m.told && st.Total > 0 {
 		m.told = true
 		switch {

@@ -82,6 +82,11 @@ type Shape struct {
 	// them only when asked to, and keeps their cache in a context of its own.
 	Nextn int
 
+	// HearsAudio is a projector's clip.has_audio_encoder: it takes sound, as
+	// Qwen3-ASR's does — a speech recognition model, where a vision model's
+	// projector takes only pictures.
+	HearsAudio bool
+
 	// ChatTemplate is the chat template the file carries
 	// (tokenizer.chat_template), or "" for none: what /api/show reads a
 	// model's tools and thinking from.
@@ -450,6 +455,8 @@ func ReadHeader(r io.Reader, fileSize int64) (Header, error) {
 			sh.Nextn = int(n)
 		case key == "tokenizer.chat_template":
 			sh.ChatTemplate, _ = v.(string)
+		case key == "clip.has_audio_encoder":
+			sh.HearsAudio, _ = v.(bool)
 		case key == "tokenizer.ggml.tokens":
 			if a, ok := v.(arrayLen); ok {
 				sh.Vocab = int(a)
@@ -561,8 +568,11 @@ func (g *ggufReader) value(typ uint32) (any, error) {
 		_, err := g.bytes(4)
 		return nil, err
 	case 7: // bool
-		_, err := g.bytes(1)
-		return nil, err
+		b, err := g.bytes(1)
+		if err != nil {
+			return nil, err
+		}
+		return b[0] != 0, nil
 	case 8: // string
 		return g.str()
 	case 9: // array

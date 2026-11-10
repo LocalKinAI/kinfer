@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -172,6 +174,7 @@ func TestAgainstMLXAudio(t *testing.T) {
 			t.Logf("%s: first logits max |Δ| %.3g cos %.7f; hidden max |Δ| %.3g cos %.7f", name, d, c, dh, ch)
 			tc := m.cfg.Talker
 			sf := newSampling(0, 50, 1.05, tc.CodecEOS, tc.Vocab, logits.Dtype())
+			sf.keys = newKeys(0)
 			defer sf.free()
 			first := sf.draw(sf.penalize(logits, mlx.Full(mlx.Int32, -1, recentCodes)))
 			pc := newCache(tc.CodePredictor.Layers)
@@ -221,9 +224,9 @@ func TestAgainstMLXAudio(t *testing.T) {
 		// Drawn with seed 7, the defaults.
 		sc, _ := readNpy(t, filepath.Join(rd, "seed7_codes.npy"))
 		sa, _ := readNpy(t, filepath.Join(rd, "seed7_audio.npy"))
-		mlx.Seed(7)
+		seven := uint64(7)
 		t1 := time.Now()
-		res, err = m.Speak(context.Background(), Request{Text: ref.Text, Voice: ref.Voice, Language: ref.Language, Temperature: 0.9, MaxFrames: 2048},
+		res, err = m.Speak(context.Background(), Request{Text: ref.Text, Voice: ref.Voice, Language: ref.Language, Temperature: 0.9, MaxFrames: 2048, Seed: &seven},
 			func(p []float32) error { got = p; return nil })
 		took := time.Since(t1)
 		if err != nil {
@@ -277,6 +280,7 @@ func TestTeacherForced(t *testing.T) {
 
 		outer := mlx.NewScope()
 		sf := newSampling(0, 50, 1.05, tc.CodecEOS, tc.Vocab, m.talker.main.dt)
+		sf.keys = newKeys(0)
 		prompt, trailing, pad, err := m.inputs(Request{Text: ref.Text, Voice: ref.Voice, Language: ref.Language}.withDefaults())
 		if err != nil {
 			t.Fatal(err)
@@ -369,5 +373,62 @@ func TestTeacherForced(t *testing.T) {
 		if worstT < 0.9999 || flipsT > 0 || worstC < 0.999 {
 			t.Errorf("%s: the logits are further from mlx-audio's than rounding", name)
 		}
+	}
+}
+
+// With KINFER_TTS_MODEL and KINFER_TTS_SEEDS set, prints each seed's codes'
+// hash and length for a sentence, to compare runs with KINFER_TTS_SYNC on
+// and off.
+func TestSeededRuns(t *testing.T) {
+	dir := os.Getenv("KINFER_TTS_MODEL")
+	if dir == "" || os.Getenv("KINFER_TTS_SEEDS") == "" {
+		t.Skip("KINFER_TTS_MODEL and KINFER_TTS_SEEDS not set")
+	}
+	libs, err := mlxengine.Libraries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mlx.Open(libs); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	if os.Getenv("KINFER_TTS_LOCK") != "" {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
+	temp, n, same := float32(0.9), 12, false
+	switch os.Getenv("KINFER_TTS_SEEDS") {
+	case "greedy":
+		temp, n, same = 0, 3, true
+	case "same":
+		n, same = 3, true
+	case "many":
+		n = 30
+	}
+	base := 1000
+	if n == 30 {
+		base = 2000
+	}
+	for seed := 0; seed < n; seed++ {
+		sd := uint64(base + seed)
+		if same {
+			sd = uint64(base)
+		}
+		res, err := m.Speak(context.Background(), Request{Text: "Hello there, this is kinfer speaking.", Voice: "ryan", Language: "english", Temperature: temp, MaxFrames: 150, Seed: &sd},
+			func([]float32) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		var h uint64 = 1469598103934665603
+		for _, f := range res.Codes {
+			for _, c := range f {
+				h = (h ^ uint64(c)) * 1099511628211
+			}
+		}
+		fmt.Printf("seed %d: %d frames (%.1f s) %016x\n", sd, res.Frames, float64(res.Frames)/12.5, h)
 	}
 }

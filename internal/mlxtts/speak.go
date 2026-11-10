@@ -11,8 +11,13 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/mlx"
 )
 
-// debug logs where a frame's time goes (KINFER_TTS_DEBUG).
-var debug = os.Getenv("KINFER_TTS_DEBUG") != ""
+// debug logs where a frame's time goes (KINFER_TTS_DEBUG); syncFrames
+// evaluates each frame before the next is built (KINFER_TTS_SYNC), to check
+// the pipeline against.
+var (
+	debug      = os.Getenv("KINFER_TTS_DEBUG") != ""
+	syncFrames = os.Getenv("KINFER_TTS_SYNC") != ""
+)
 
 // Request is one thing to say.
 type Request struct {
@@ -25,6 +30,7 @@ type Request struct {
 	TopK        int     // 50
 	Penalty     float32 // repetition penalty, 1.05
 	MaxFrames   int     // 4096 (5½ minutes)
+	Seed        *uint64 // the draws' seed, as mx.random.seed takes one; nil for a fresh one
 
 	// Stream is how many frames each piece of a streamed answer holds (12.5
 	// a second); 0 decodes the whole once it is made, as mlx-audio's
@@ -154,6 +160,13 @@ func (m *Model) Speak(ctx context.Context, r Request, onAudio func(pcm []float32
 	defer sFirst.free()
 	sRest := newSampling(r.Temperature, r.TopK, 1, 0, tc.CodePredictor.Vocab, dt)
 	defer sRest.free()
+	seed := uint64(time.Now().UnixNano())
+	if r.Seed != nil {
+		seed = *r.Seed
+	}
+	ks := newKeys(seed)
+	defer ks.free()
+	sFirst.keys, sRest.keys = ks, ks
 
 	var st *codecState
 	if r.Stream > 0 {
@@ -202,7 +215,11 @@ func (m *Model) Speak(ctx context.Context, r Request, onAudio func(pcm []float32
 		}
 		g := m.frame(in, L, win, text, cache, sFirst, sRest)
 		ta := time.Now()
-		mlx.AsyncEval(g.next, g.codes, g.window)
+		if syncFrames {
+			mlx.Eval(g.next, g.codes, g.window)
+		} else {
+			mlx.AsyncEval(g.next, g.codes, g.window)
+		}
 		buildT += ta.Sub(tb)
 		asyncT += time.Since(ta)
 		return g
@@ -292,6 +309,8 @@ func (m *Model) frame(in mlx.Array, L int, window, text mlx.Array, cache *kvCach
 	sc := mlx.NewScope()
 	defer sc.Close()
 	old := cache.arrays()
+	ks := sFirst.keys
+	keyIn, keyOwned := ks.key, ks.owned
 	logits, hidden := t.step(in, L, cache)
 	first := sFirst.draw(sFirst.penalize(logits, window))
 	codes := []mlx.Array{first}
@@ -315,6 +334,7 @@ func (m *Model) frame(in mlx.Array, L int, window, text mlx.Array, cache *kvCach
 	win := mlx.Concatenate(0, mlx.Slice(window, []int{1}, []int{recentCodes}), mlx.Reshape(mlx.Astype(first, mlx.Int32), 1))
 	sc.Escape(next, all, win)
 	sc.Escape(cache.arrays()...)
+	ks.carry(sc, keyIn, keyOwned)
 	for _, a := range old {
 		a.Free()
 	}

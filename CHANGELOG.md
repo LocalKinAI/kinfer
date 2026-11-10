@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Added — one address for chat and speech
+
+`kinfer serve` answers `/v1/audio/transcriptions`, `/v1/audio/translations`,
+`/v1/audio/speech` and `/v1/audio/voices` at the chat model's own address. Each
+speech model runs in a process of its own, a runner as Ollama runs each model,
+started on the first request for it and stopped once idle as long as
+`-keepalive`: the chat model stays loaded, the three can be used at once, and a
+speech model that crashes takes only its runner down. A request naming a speech
+model of the right kind gets it; any other name (whisper-1, tts-1, "tts") gets
+this machine's default, which is fetched on first use (`-auto-pull`, on): the
+request is answered 503 with how far the fetch has got and a Retry-After.
+`-speech keep` starts the defaults with the server, loaded; `-speech off` serves
+speech in the server's own process as v0.5.0 did. `kinfer pull speech` fetches
+the defaults. `/api/ps` lists the speech models. See docs/serving.md.
+
+### Fixed — the same seed gave different speech
+
+MLX keeps its global PRNG key for each thread, and Go moves work between
+threads, so the draws followed whichever thread's key they met. Each answer now
+keeps a key of its own, split before each draw as MLX's own sequence is, so
+`seed` (new, kinfer's) gives the same speech every time, and the draws follow
+it as mlx-audio's follow `mx.random.seed`.
+
+### Changed — an answer that talks on is bounded, and said again
+
+Qwen3-TTS 0.6B now and then talks on past its text, mlx-audio's as much as
+kinfer's, and would go on for minutes before its 4,096 frames ran out. An
+answer is now bounded by its text — 2 s and three times its ordinary reading —
+and one that reaches the bound is said again once with another seed (cut, if it
+is streamed). Over 30 seeds of an English sentence, 3–5 s to say, the longest
+came back at 9.7 s where three had run to the test's 12 s.
+
 ## v0.5.0 — 2026-11-09
 
 ### Added — text to speech

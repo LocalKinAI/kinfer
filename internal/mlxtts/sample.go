@@ -9,7 +9,7 @@ import (
 
 // Sampling as mlx-audio's _sample_token does it, step for step: the special
 // codes suppressed, a repetition penalty over the last 64 first codes, the
-// temperature, the top k, then a draw from the global key.
+// temperature, the top k, then a draw with the speech's next key.
 
 // recentCodes is how far back the repetition penalty looks.
 const recentCodes = 64
@@ -26,6 +26,44 @@ type sampling struct {
 	negInf, temp  mlx.Array
 	pen, eos      mlx.Array
 	penaltyLaunch *mlx.Launch
+	keys          *keys // the draws' keys, shared with the other codes'
+}
+
+// keys is a sequence of PRNG keys of the speech's own, as MLX's global one
+// goes on — split the key, draw with the second half, keep the first — so
+// that a seed gives the same draws mx.random.seed gives mlx-audio, whichever
+// thread the Go code runs on: MLX keeps its global key for each thread.
+type keys struct {
+	key   mlx.Array
+	owned bool // key was carried out of a frame's scope, and is ours to free
+}
+
+func newKeys(seed uint64) *keys { return &keys{key: mlx.RandomKey(seed)} }
+
+func (k *keys) next() mlx.Array {
+	a, b := mlx.SplitKey(k.key)
+	k.key = a
+	return b
+}
+
+// carry keeps the key a frame's draws ended on past its scope, freeing the
+// one the frame started from if that was carried in.
+func (k *keys) carry(sc *mlx.Scope, before mlx.Array, beforeOwned bool) {
+	if k.key == before {
+		return // nothing drawn
+	}
+	sc.Escape(k.key)
+	if beforeOwned {
+		before.Free()
+	}
+	k.owned = true
+}
+
+func (k *keys) free() {
+	if k.owned {
+		k.key.Free()
+		k.owned = false
+	}
 }
 
 func newSampling(temperature float32, topK int, penalty float32, eos int32, V int, dt mlx.Dtype) *sampling {
@@ -53,7 +91,7 @@ func (s *sampling) draw(logits mlx.Array) mlx.Array {
 		drop := mlx.Slice(mlx.Argpartition(mlx.Negative(logits), s.TopK-1, -1), []int{0, s.TopK}, []int{1, s.V})
 		logits = mlx.PutAlongAxis(logits, drop, s.negInf, -1)
 	}
-	return mlx.Reshape(mlx.Categorical(logits, -1, 0), 1, 1)
+	return mlx.Reshape(mlx.Categorical(logits, -1, s.keys.next()), 1, 1)
 }
 
 // penaltySource is the first code's suppression and repetition penalty in

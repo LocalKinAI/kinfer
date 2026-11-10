@@ -452,13 +452,14 @@ heard, and a translation is not streamed. On the box, with ornith-1.5:35b
 translating: "There will be a project progress meeting in Conference Room No. 2
 this afternoon. Please prepare this week's data in advance."
 
-Run it as a process of its own, as above, rather than in the chat server. One
-kinfer serves one chat model at a time, so asking a chat server for the speech
-model would unload the chat model; and a recording that crashed libmtmd would
-take only the speech server down. Size it by hand: left to itself, `serve`
-gave the 1.7B model four slots of 32768 tokens and a prefix pool, 22.5 GB, where
-one slot of 16384 without a pool is 2.6 GB. The pool never helps here, since a
-prompt with sound is read whole.
+`kinfer serve` answers it at its own address (see [One address for chat and
+speech](#one-address-for-chat-and-speech)): the speech model runs in a process
+of its own, so the chat model stays loaded and a recording that crashed libmtmd
+takes only that process down, sized as a speech model on llama.cpp wants — one
+slot of 16384 tokens and no prefix pool, 2.6 GB, where `serve` left to itself
+gave the 1.7B model four slots of 32768 and a pool, 22.5 GB. The pool never
+helps here, since a prompt with sound is read whole. A server of its own for
+speech alone is `kinfer serve -speech off -slots 1 -ctx 16384 -prefix off`.
 
 ### On MLX, on a Mac
 
@@ -567,6 +568,58 @@ computed as the token needs it. A short reply now decodes as fast as
 mlx-audio's, 219–223 tokens a second against 222; a long one is 4% slower. llama.cpp's own server is as fast as kinfer on it, so kinfer
 adds nothing there: the difference between the two engines is their kernels.
 
+## One address for chat and speech
+
+`kinfer serve` answers chat and speech at one address. The chat model is
+loaded here as ever; a request to `/v1/audio/transcriptions`,
+`/v1/audio/translations`, `/v1/audio/speech` or `/v1/audio/voices` goes to a
+speech model in a process of its own — a runner, as Ollama runs each model: this
+binary's `serve -speech off` on the loopback, started on the first request for
+its model and stopped once idle as long as `-keepalive`. So the chat model stays
+loaded, the three can be used at once, and a speech model that crashes takes
+only its runner down, to be started again by the next request. A runner reads
+the server's stdin and ends with it, however the server ends.
+
+```bash
+kinfer serve                                        # chat, hearing and speaking at :11500
+curl localhost:11500/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"model":"tts-1","input":"一个地址，什么都能做。"}' -o one.wav
+curl -F file=@one.wav -F model=whisper-1 localhost:11500/v1/audio/transcriptions
+{"text":"一个地址，什么都能做。"}
+```
+
+- The model is the one a request names, if that is a speech model of the right
+  kind here (an MLX Qwen3-ASR, SenseVoice or Qwen3-TTS, or a GGUF whose
+  projector hears); any other name — OpenAI's `whisper-1` and `tts-1`, the
+  Python service's `tts` — is this machine's default of the kind: Qwen3-ASR
+  1.7B and Qwen3-TTS 0.6B CustomVoice on MLX on a Mac, Qwen3-ASR's GGUF
+  elsewhere (no text to speech there: 501). A default this store has of
+  another form is taken before one fetched: Qwen3-ASR's GGUF on a Mac without
+  the MLX one.
+- A default that is not here is fetched the first time it is asked for
+  (`-auto-pull`, on unless set false): the request is answered 503 at once,
+  with how far the fetch has got and a Retry-After, and asked again. On the box,
+  from an empty store: 503 with 21%, 46%, 65%, 84%, the Retry-After falling 58 →
+  11 s, and at 78 s the speech. `-auto-pull=false` answers 404 saying what to
+  pull; `kinfer pull speech` fetches the defaults beforehand.
+- `-speech keep` starts the default speech models with the server and keeps
+  them, loaded: the first answer then takes what any other does (0.13 s for a
+  transcript). `-speech off` serves speech in this process, one model at a time
+  with the rest, as before; a runner is that.
+- `/api/ps` lists the speech models beside the chat model.
+- Translations go to this server's own chat model address
+  (`KINFER_TRANSLATE_URL` unset), the model still `KINFER_TRANSLATE_MODEL`.
+  `KINFER_EMOTION_MODEL` reaches the runners as it is.
+
+Measured on the box (11-09): a runner up in 105 ms; the first speech 2.1 s
+with the model's loading, then 0.7 s; a transcript 0.14 s; chat, speech and a
+transcript at once 0.6 s; streamed speech's first audio 0.15 s through the
+front server; a runner killed with -9, started again by the next request in
+1.2 s; idle runners stopped after `-keepalive`; the server's SIGTERM and its
+SIGKILL each ending its runners within 4 s. Not yet: the speech models are not
+counted in the memory a chat model is sized against when they start after it,
+and chat models are still loaded in the server itself.
+
 ## Text to speech, for a model that speaks
 
 `POST /v1/audio/speech`, as OpenAI has it, answered on a Mac by Qwen3-TTS
@@ -615,9 +668,28 @@ The pull was run on the box into an empty store (11-09): twelve files, 1.8 GB,
 in 94 s, the weights' sha256 checked against Hugging Face's, `speech_tokenizer/`
 kept as a folder beside the talker, then served and speaking.
 
-Run it as a process of its own, as the speech recognition server is: one
-kinfer holds one model besides its embedders, and a home assistant hearing and
-answering in turn would swap the two at every turn.
+`kinfer serve` answers it at its own address, the model in a process of its
+own as a speech recognition model is (see [One address for chat and
+speech](#one-address-for-chat-and-speech)): one kinfer process holds one model
+besides its embedders, and a home assistant hearing and answering in turn would
+otherwise swap the two at every turn.
+
+An answer is bounded by its text: 2 s and three times what it takes read at an
+ordinary pace (a quarter second a Han character, kana or hangul, 0.08 s
+anything else). Qwen3-TTS 0.6B now and then talks on past its text, mlx-audio's
+as much as kinfer's — on "Hello there, this is kinfer speaking.", normally 3–5
+s, one seed in six on either side ran to the 12 s a test allowed, pausing,
+saying it twice or babbling — and would have gone on for minutes before its
+4,096 frames ran out. An answer that reaches the bound is said again, once,
+with another seed; a streamed one, already on its way, is cut there. Over 30
+seeds of that sentence, every answer now came back in 3.1–9.7 s, three of them
+said again; over 30 of a Chinese one, 7.0–10.2 s, none.
+
+`seed` (kinfer's) makes an answer the same each time it is asked for. The
+draws follow it as mlx-audio's follow `mx.random.seed` — the key split before
+each, its second half drawn with — from a key of the answer's own rather than
+MLX's global one, which MLX keeps for each thread while Go moves the work
+between threads: before, the same seed gave different speech run to run.
 
 How close it is to mlx-audio's: the prompt it builds, the talker's first
 logits and the code predictor's are the same bits; the decoder on mlx-audio's

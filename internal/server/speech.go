@@ -187,6 +187,26 @@ type speechRequest struct {
 	StreamFormat   string   `json:"stream_format"`
 	Language       string   `json:"language"`    // kinfer's: the language to speak in
 	Temperature    *float32 `json:"temperature"` // kinfer's: 0.9 by default, 0 for the most likely speech
+	Seed           *uint64  `json:"seed"`        // kinfer's: the same seed, the same speech
+}
+
+// speechFrames is the most frames an answer may take: 2 s and three times
+// what the text takes read at an ordinary pace — a quarter second a Han
+// character, kana or hangul, 0.08 s anything else. Qwen3-TTS 0.6B now and
+// then talks on past its text, mlx-audio's as much as kinfer's: on "Hello
+// there, this is kinfer speaking." (3–5 s) one time in six here or there it
+// went to the 12 s a test allowed, pausing, saying it twice, or babbling, and
+// would have gone on for minutes before its 4,096 frames ran out.
+func speechFrames(text string) int {
+	secs := 0.0
+	for _, r := range text {
+		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
+			secs += 0.25
+		} else {
+			secs += 0.08
+		}
+	}
+	return min(4096, int(12.5*(2+3*secs)))
 }
 
 func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
@@ -194,11 +214,18 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.speech != SpeechOff { // answered in a speech model's runner (runners.go)
+		if body, asked, ok := speechBody(w, r, 1<<20); ok {
+			s.proxySpeech(w, r, kindTTS, asked, body)
+		}
+		return
+	}
 	var req speechRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		speechError(w, http.StatusBadRequest, "send JSON with what to say in \"input\" and the model in \"model\": "+err.Error())
 		return
 	}
+	req.Model = s.runnerModel(r, req.Model)
 	text := strings.TrimSpace(req.Input)
 	switch {
 	case req.Model == "":
@@ -255,6 +282,8 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	if stream != "" {
 		mr.Stream = streamFrames
 	}
+	mr.MaxFrames = speechFrames(text)
+	mr.Seed = req.Seed
 	rate := sp.SampleRate()
 	w.Header().Set("X-Kinfer-Voice", mr.Voice)
 	w.Header().Set("X-Kinfer-Language", mr.Language)
@@ -263,6 +292,18 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	if stream == "" {
 		var pcm []float32
 		res, err := sp.Speak(r.Context(), mr, func(p []float32) error { pcm = append(pcm, p...); return nil })
+		if err == nil && res.Stopped {
+			// It talked on to the end of its frames: said again, it most
+			// likely says what it was given (another seed, the next one if
+			// the request named one).
+			log.Printf("speech: %q ran to %d frames, saying it again", text, res.Frames)
+			if mr.Seed != nil {
+				next := *mr.Seed + 1
+				mr.Seed = &next
+			}
+			pcm = nil
+			res, err = sp.Speak(r.Context(), mr, func(p []float32) error { pcm = append(pcm, p...); return nil })
+		}
 		if err != nil {
 			speechFailed(w, err)
 			return
@@ -352,7 +393,11 @@ func logSpeech(r mlxtts.Request, res mlxtts.Result, samples, rate int, start tim
 // handleVoices is GET /v1/audio/voices?model=: the voices and languages a
 // text to speech model speaks.
 func (s *Server) handleVoices(w http.ResponseWriter, r *http.Request) {
-	model := r.URL.Query().Get("model")
+	if s.speech != SpeechOff {
+		s.proxySpeech(w, r, kindTTS, r.URL.Query().Get("model"), nil)
+		return
+	}
+	model := s.runnerModel(r, r.URL.Query().Get("model"))
 	if model == "" {
 		speechError(w, http.StatusBadRequest, "name the model: /v1/audio/voices?model=...")
 		return

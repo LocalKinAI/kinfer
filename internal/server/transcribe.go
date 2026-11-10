@@ -183,6 +183,12 @@ func (s *Server) audioText(w http.ResponseWriter, r *http.Request, translate boo
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.speech != SpeechOff { // answered in a speech model's runner (runners.go)
+		if body, asked, ok := speechBody(w, r, maxRecording+1<<20); ok {
+			s.proxySpeech(w, r, kindASR, asked, body)
+		}
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxRecording+1<<20)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		var big *http.MaxBytesError
@@ -214,7 +220,7 @@ func (s *Server) audioText(w http.ResponseWriter, r *http.Request, translate boo
 		return
 	}
 
-	model := r.FormValue("model")
+	model := s.runnerModel(r, r.FormValue("model"))
 	if model == "" {
 		transcriptionError(w, http.StatusBadRequest, "no model in \"model\"")
 		return

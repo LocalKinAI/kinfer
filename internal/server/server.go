@@ -74,6 +74,16 @@ type Server struct {
 	embIdle    *time.Timer
 	embExpiry  time.Time
 	openEmbed  func(path string, opts engine.Options) (embedder, error)
+
+	// Speech behind the same address (runners.go): how it is served, the
+	// runners holding speech models, the default models and their fetches.
+	speech         string
+	autoPull       bool
+	runnerMode     bool
+	selfURL        string
+	speechDefaults []SpeechModel
+	runners        *runnerSet
+	pulls          *pullSet
 }
 
 // Version is reported by /api/version.
@@ -142,13 +152,18 @@ func openEngine(path string, opts engine.Options) (generator, error) {
 
 // New creates a server over the given store.
 func New(s *store.Store, opts engine.Options) *Server {
-	srv := &Server{store: s, opts: opts, open: openEngine, openEmbed: openEmbedder}
+	srv := &Server{store: s, opts: opts, open: openEngine, openEmbed: openEmbedder,
+		speech: SpeechOff, speechDefaults: SpeechModels()}
 	srv.cond = sync.NewCond(&srv.mu)
+	srv.runners = &runnerSet{byPath: map[string]*runner{}, keepAlive: 5 * time.Minute, start: srv.startRunner}
+	srv.pulls = &pullSet{byRepo: map[string]*pull{}}
+	srv.pulls.start = srv.pulls.runPull
 	return srv
 }
 
-// SetKeepAlive sets how long an idle model stays loaded. Call before serving.
-func (s *Server) SetKeepAlive(d time.Duration) { s.keepAlive = d }
+// SetKeepAlive sets how long an idle model stays loaded, a speech model's
+// runner too. Call before serving.
+func (s *Server) SetKeepAlive(d time.Duration) { s.keepAlive, s.runners.keepAlive = d, d }
 
 // Handler returns the HTTP routes.
 func (s *Server) Handler() http.Handler {
@@ -211,6 +226,8 @@ func (s *Server) Handler() http.Handler {
 
 // Close releases the resident models.
 func (s *Server) Close() {
+	s.runners.close()
+	s.pulls.stop()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.retireLocked()
@@ -854,6 +871,9 @@ func (s *Server) handlePS(w http.ResponseWriter, r *http.Request) {
 		held = append(held, resident{s.emb.path, s.embExpiry, 0, 0, 0})
 	}
 	s.mu.Unlock()
+	for _, r := range s.runners.loaded() { // speech models, each in its runner
+		held = append(held, resident{path: r.path, expiry: r.expiry})
+	}
 
 	loaded := []entry{}
 	for _, h := range held {

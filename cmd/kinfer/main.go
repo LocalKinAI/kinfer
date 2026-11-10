@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -26,6 +27,7 @@ import (
 const usage = `kinfer — a single-file local inference runtime
 
   kinfer pull <repo>[:quant]   download a model from Hugging Face: a GGUF, or an MLX repo of safetensors
+  kinfer pull speech           download this machine's default speech models (Qwen3-ASR; Qwen3-TTS on a Mac)
   kinfer list                  show models kinfer can load, including Ollama's
   kinfer rm <model>            delete a model
   kinfer run <model> [prompt]  chat with a model (no prompt = interactive)
@@ -33,7 +35,7 @@ const usage = `kinfer — a single-file local inference runtime
   kinfer ps                    show which model is loaded right now
   kinfer stop                  stop the background daemon run started
   kinfer plan <model>          what -slots and -ctx to serve it with
-  kinfer serve                 serve models over HTTP
+  kinfer serve                 serve models over HTTP: chat, and speech behind the same address
   kinfer worker                lend this machine's GPU to the Mac at the other end of a Thunderbolt cable
   kinfer install [serve flags] keep serve running: at login, and after a crash (macOS)
   kinfer uninstall             stop it and remove the service
@@ -419,6 +421,8 @@ type serveOpts struct {
 	place           bool
 	kvCache         string
 	draft           int
+	speech          string
+	autoPull        bool
 }
 
 // prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
@@ -493,6 +497,11 @@ func isAuto(peers []string) bool { return len(peers) == 1 && peers[0] == "auto" 
 
 // check is what serve refuses among flags that parse one by one.
 func (o *serveOpts) check() error {
+	switch o.speech {
+	case server.SpeechAuto, server.SpeechKeep, server.SpeechOff:
+	default:
+		return fmt.Errorf("-speech is auto, keep or off, not %q", o.speech)
+	}
 	if isAuto(o.peers) && len(o.split) > 0 {
 		return fmt.Errorf("-split shares the layers among peers named by hand, not -peers auto")
 	}
@@ -526,6 +535,8 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.IntVar(&o.draft, "draft", 0, "tokens drafted a step with a model's MTP head, for one pass to check — the model's own reply, sooner (0 = 4 for a dense model with a head, 1 for a mixture of experts, none when its experts are in host memory; on MLX 5 while a reply writes alone, none under 4 GB of weights; -1 = none)")
 	fs.StringVar(&o.kvCache, "kv-cache", "f16", "what the attention cache is kept in: f16, or q8_0 — about half the memory, so twice the context per conversation, and decode up to a seventh slower at long contexts (a model q8_0 does not suit stays f16: the DeepSeek family, and heads it does not divide)")
 	fs.BoolVar(&o.place, "place", true, "when a mixture of experts does not fit the GPU, keep as many layers' experts in host memory as it must, with a GPU cache for the ones in use, unless -host-experts or -moe-cache say otherwise; with -peers and no -split, give the peers only the layers that do not fit here (false = load it whole, and let llama.cpp split by free memory)")
+	fs.StringVar(&o.speech, "speech", server.SpeechAuto, "speech behind this address: auto = a speech model starts in a process of its own on the first request for it and stops once idle as long as -keepalive; keep = the default speech models start with the server and stay; off = speech is served in this process, one model at a time with the rest")
+	fs.BoolVar(&o.autoPull, "auto-pull", true, "fetch this machine's default speech model the first time one is asked for and is not here (Qwen3-ASR 2.5 GB, Qwen3-TTS 1.8 GB); the request is answered 503 with how far it has got (false = answer 404 saying what to pull)")
 	fs.Func("peers", "kinfer workers on other machines (host:port, comma-separated) whose GPUs take the first layers of each model; auto = those that answer over the Thunderbolt cable, for a model that does not fit here (default none)", func(v string) (err error) {
 		o.peers, err = parsePeers(v)
 		return err
@@ -572,6 +583,11 @@ func cmdServe(args []string) error {
 		Draft: o.draft,
 	})
 	srv.SetKeepAlive(o.keepAlive)
+	srv.SetSpeech(o.speech, o.autoPull, o.addr)
+	runner := os.Getenv("KINFER_RUNNER") != ""
+	if runner {
+		srv.SetRunner()
+	}
 	defer srv.Close()
 
 	models, _ := st.List()
@@ -593,7 +609,20 @@ func cmdServe(args []string) error {
 	fmt.Printf("  Ollama API : POST %s/api/chat        GET %s/api/tags\n", o.addr, o.addr)
 	fmt.Printf("  OpenAI API : POST %s/v1/chat/completions\n", o.addr)
 	fmt.Printf("  Anthropic  : POST %s/v1/messages          (Claude Code)\n", o.addr)
-	fmt.Printf("  Responses  : POST %s/v1/responses         (Codex)\n\n", o.addr)
+	fmt.Printf("  Responses  : POST %s/v1/responses         (Codex)\n", o.addr)
+	fmt.Printf("  Speech     : POST %s/v1/audio/transcriptions   %s/v1/audio/speech\n", o.addr, o.addr)
+	switch o.speech {
+	case server.SpeechAuto:
+		fmt.Printf("               each speech model in a process of its own, on first use, stopped once idle")
+	case server.SpeechKeep:
+		fmt.Printf("               the default speech models in processes of their own, started now and kept")
+	default:
+		fmt.Printf("               in this process, one model at a time with the rest")
+	}
+	if o.speech != server.SpeechOff && o.autoPull {
+		fmt.Printf("; a default one missing is fetched (-auto-pull=false stops that)")
+	}
+	fmt.Printf("\n\n")
 	fmt.Printf("  point LocalKin at it by setting a soul's brain.endpoint to %s\n\n", o.addr)
 
 	httpSrv := &http.Server{
@@ -606,6 +635,11 @@ func cmdServe(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if runner {
+		// A runner ends with the server that started it, however that ends:
+		// its stdin is that server's, and closes with it.
+		go func() { io.Copy(io.Discard, os.Stdin); stop() }()
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -613,6 +647,9 @@ func cmdServe(args []string) error {
 			errCh <- err
 		}
 	}()
+	if o.speech == server.SpeechKeep {
+		go srv.PrepareSpeech()
+	}
 
 	select {
 	case err := <-errCh:

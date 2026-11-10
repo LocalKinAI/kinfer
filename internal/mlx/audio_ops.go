@@ -30,6 +30,7 @@ var (
 	opConvTranspose1d func(res *Array, in, w Array, stride, padding, dilation, outputPadding, groups int32, s Stream) int32
 	opRandomSeed      func(seed uint64) int32
 	opAddmm           func(res *Array, c, a, b Array, alpha, beta float32, s Stream) int32
+	opRandomSplit     func(res0, res1 *Array, key Array, s Stream) int32
 
 	audioErr error = fmt.Errorf("mlx: audio ops not bound")
 )
@@ -42,7 +43,7 @@ func bindAudio(lib uintptr) {
 		{&opConv2d, "mlx_conv2d"}, {&opLayerNorm, "mlx_fast_layer_norm"}, {&opErf, "mlx_erf"},
 		{&opLog10, "mlx_log10"}, {&opRFFT, "mlx_fft_rfft"}, {&opReal, "mlx_real"}, {&opImag, "mlx_imag"},
 		{&opSin, "mlx_sin"}, {&opCos, "mlx_cos"}, {&opConvTranspose1d, "mlx_conv_transpose1d"},
-		{&opRandomSeed, "mlx_random_seed"}, {&opAddmm, "mlx_addmm"},
+		{&opRandomSeed, "mlx_random_seed"}, {&opAddmm, "mlx_addmm"}, {&opRandomSplit, "mlx_random_split"},
 	} {
 		if _, err := dl.Sym(lib, b.name); err != nil {
 			audioErr = fmt.Errorf("mlx-c has no %s: %w", b.name, err)
@@ -105,8 +106,21 @@ func Addmm(c, a, b Array) Array {
 	return out(opAddmm(&r, c, a, b, 1, 1, gpu), r)
 }
 
+// SplitKey is a key's two halves, as mx.random.split(key) gives them: drawing
+// with the second and keeping the first is how MLX's own sequence of keys
+// goes on (KeySequence::next).
+func SplitKey(key Array) (Array, Array) {
+	a, b := arrayNew(), arrayNew()
+	check(opRandomSplit(&a, &b, key, gpu))
+	track(a)
+	track(b)
+	return a, b
+}
+
 // Seed seeds the global key that Categorical draws from when it is given
-// none, as mx.random.seed does.
+// none, as mx.random.seed does. MLX keeps that key for each thread, and Go
+// moves goroutines between threads: code that wants its draws to follow a
+// seed keeps a key of its own (RandomKey, SplitKey).
 func Seed(seed uint64) {
 	check(opRandomSeed(seed))
 }
