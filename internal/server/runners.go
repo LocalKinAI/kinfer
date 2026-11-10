@@ -430,16 +430,26 @@ func (rs *runnerSet) watch(r *runner) {
 	}
 }
 
+// runnerUp is a runner up, as /api/ps reports it.
+type runnerUp struct {
+	path   string
+	expiry time.Time // zero while it is in use
+}
+
 // loaded are the runners up, for /api/ps.
-func (rs *runnerSet) loaded() []*runner {
+func (rs *runnerSet) loaded() []runnerUp {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	var out []*runner
+	var out []runnerUp
 	for _, r := range rs.byPath {
 		select {
 		case <-r.ready:
 			if r.err == nil && !r.p.exited() {
-				out = append(out, r)
+				up := runnerUp{path: r.path}
+				if r.inflight == 0 && r.idle != nil {
+					up.expiry = r.expiry
+				}
+				out = append(out, up)
 			}
 		default:
 		}
