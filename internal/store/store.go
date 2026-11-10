@@ -584,6 +584,8 @@ func readRecord(path string) (done, size int64, ok bool) {
 // model.safetensors.index.json lists.
 type modelDir struct {
 	config, tokenizer bool
+	vocab, merges     bool  // the slow tokenizer's files, which some releases ship instead (Qwen3-ASR)
+	spm               bool  // a SentencePiece model, a CTC model's vocabulary (SenseVoice)
 	weights           int   // safetensors files here
 	missing           int   // pieces the index names that are not here
 	arriving          int   // files still name.part
@@ -592,7 +594,7 @@ type modelDir struct {
 }
 
 func (d modelDir) complete() bool {
-	return d.config && d.tokenizer && d.weights > 0 && d.missing == 0 && d.arriving == 0
+	return d.config && (d.tokenizer || d.vocab && d.merges || d.spm) && d.weights > 0 && d.missing == 0 && d.arriving == 0
 }
 
 // unfinished is a directory a pull is filling or stopped filling; any other
@@ -627,6 +629,12 @@ func readModelDir(dir string) modelDir {
 				d.config = true
 			case name == "tokenizer.json":
 				d.tokenizer = true
+			case name == "vocab.json":
+				d.vocab = true
+			case name == "merges.txt":
+				d.merges = true
+			case strings.HasSuffix(name, ".model"):
+				d.spm = true
 			case strings.HasSuffix(name, ".safetensors"):
 				d.weights++
 			}

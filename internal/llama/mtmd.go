@@ -71,6 +71,7 @@ var (
 	mtmdInitFromFile         func(fname *byte, model Model, p mtmdContextParams) Mtmd
 	mtmdFree                 func(m Mtmd)
 	mtmdSupportVision        func(m Mtmd) bool
+	mtmdSupportAudio         func(m Mtmd) bool
 	mtmdInputChunksInit      func() uintptr
 	mtmdInputChunksFree      func(chunks uintptr)
 	mtmdTokenize             func(m Mtmd, out uintptr, text *mtmdInputText, bitmaps *uintptr, n uint64) int32
@@ -97,6 +98,7 @@ func bindMtmd(dir string) {
 		{&mtmdInitFromFile, "mtmd_init_from_file"},
 		{&mtmdFree, "mtmd_free"},
 		{&mtmdSupportVision, "mtmd_support_vision"},
+		{&mtmdSupportAudio, "mtmd_support_audio"},
 		{&mtmdInputChunksInit, "mtmd_input_chunks_init"},
 		{&mtmdInputChunksFree, "mtmd_input_chunks_free"},
 		{&mtmdTokenize, "mtmd_tokenize"},
@@ -117,10 +119,10 @@ func bindMtmd(dir string) {
 // SeesPictures says whether this build has libmtmd to read pictures with.
 func SeesPictures() bool { return mtmdInitFromFile != nil }
 
-// LoadProjector loads a vision model's projector over model, its compute
-// buffers warmed up so that they are counted with the model's memory. Zero
-// when it cannot be loaded, or encodes no pictures; llama.cpp says why on
-// stderr.
+// LoadProjector loads a vision or audio model's projector over model, its
+// compute buffers warmed up so that they are counted with the model's memory.
+// Zero when it cannot be loaded, or encodes neither pictures nor sound;
+// llama.cpp says why on stderr.
 func LoadProjector(path string, model Model, threads int) Mtmd {
 	if !SeesPictures() {
 		return 0
@@ -135,11 +137,27 @@ func LoadProjector(path string, model Model, threads int) Mtmd {
 	name := append([]byte(path), 0)
 	m := mtmdInitFromFile(&name[0], model, p)
 	runtime.KeepAlive(name)
-	if m != 0 && !mtmdSupportVision(m) {
+	if m != 0 && !mtmdSupportVision(m) && !mtmdSupportAudio(m) {
 		mtmdFree(m)
 		return 0
 	}
 	return m
+}
+
+// HearsAudio says whether a projector encodes sound: a speech recognition
+// model's, such as Qwen3-ASR's, whose audio goes where a picture would.
+func HearsAudio(m Mtmd) bool { return m != 0 && mtmdSupportAudio(m) }
+
+// Takes says what a projector reads: "pictures", "sound" or both.
+func Takes(m Mtmd) string {
+	switch v, a := m != 0 && mtmdSupportVision(m), HearsAudio(m); {
+	case v && a:
+		return "pictures and sound"
+	case a:
+		return "sound"
+	default:
+		return "pictures"
+	}
 }
 
 // FreeProjector releases a projector.
@@ -160,7 +178,8 @@ type MediaPrompt struct {
 }
 
 // TokenizeMedia cuts text into chunks, a picture — any image llama.cpp reads:
-// jpg, png, bmp, gif — at each MediaMarker in it, in order.
+// jpg, png, bmp, gif — or, for a projector that hears, a sound — wav, mp3,
+// flac — at each MediaMarker in it, in order.
 func TokenizeMedia(m Mtmd, text string, pictures [][]byte) (*MediaPrompt, error) {
 	bitmaps := make([]uintptr, 0, len(pictures))
 	defer func() {
@@ -176,6 +195,9 @@ func TokenizeMedia(m Mtmd, text string, pictures [][]byte) (*MediaPrompt, error)
 		w := mtmdHelperBitmapFromBuf(m, &pic[0], uint64(len(pic)), false, opt)
 		runtime.KeepAlive(pic)
 		if w.bitmap == 0 {
+			if HearsAudio(m) {
+				return nil, fmt.Errorf("input %d is not sound llama.cpp reads (wav, mp3, flac) or an image (jpg, png, bmp, gif)", i)
+			}
 			return nil, fmt.Errorf("picture %d is not an image llama.cpp reads (jpg, png, bmp, gif)", i)
 		}
 		bitmaps = append(bitmaps, w.bitmap)

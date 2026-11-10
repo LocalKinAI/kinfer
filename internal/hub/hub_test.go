@@ -234,3 +234,22 @@ func TestMLXFiles(t *testing.T) {
 		t.Error("an MLX repo has GGUFs")
 	}
 }
+
+// Qwen3-TTS keeps its codec in speech_tokenizer/, a model of its own beside
+// the talker: its files come too, before config.json; another folder's not.
+func TestMLXFilesTakeQwen3TTSsCodec(t *testing.T) {
+	repo := []File{
+		{Name: "config.json"}, {Name: "generation_config.json"}, {Name: "merges.txt"}, {Name: "vocab.json"},
+		{Name: "model.safetensors", Size: 9}, {Name: "speech_tokenizer/config.json"},
+		{Name: "speech_tokenizer/model.safetensors", Size: 7}, {Name: "speech_tokenizer/old/model.safetensors"},
+		{Name: "samples/voice.wav"},
+	}
+	got, ok := MLXFiles(repo)
+	if !ok {
+		t.Fatal("Qwen3-TTS is no MLX model")
+	}
+	want := "model.safetensors generation_config.json merges.txt vocab.json speech_tokenizer/config.json speech_tokenizer/model.safetensors config.json"
+	if s := strings.ReplaceAll(strings.TrimSpace(join(got)), ", ", " "); s != want {
+		t.Errorf("MLXFiles = %s\nwant          %s", s, want)
+	}
+}

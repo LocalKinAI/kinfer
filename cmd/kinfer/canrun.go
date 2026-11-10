@@ -13,7 +13,6 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/hub"
 	"github.com/LocalKinAI/kinfer/internal/llama"
 	"github.com/LocalKinAI/kinfer/internal/mlxengine"
-	"github.com/LocalKinAI/kinfer/internal/mlxmodel"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
@@ -90,7 +89,7 @@ func cmdCanRun(args []string) error {
 	case arch == "":
 		fmt.Printf("  architecture   unknown — no GGUF metadata and no config.json\n")
 
-	case archFrom == "config.json" && len(quants) == 0 && mlxmodel.Serves(arch):
+	case archFrom == "config.json" && len(quants) == 0 && servedOnMLX(arch):
 		if err := mlxExperts(ctx, repo, arch); err != nil {
 			fmt.Printf("  architecture   %-16s ✗ on MLX: %v\n", arch, err)
 			return nil
@@ -125,7 +124,7 @@ func cmdCanRun(args []string) error {
 	}
 
 	// ── where the weights are ────────────────────────────────────────────────
-	if set, ok := hub.MLXFiles(files); len(quants) == 0 && ok && mlxmodel.Serves(arch) {
+	if set, ok := hub.MLXFiles(files); len(quants) == 0 && ok && servedOnMLX(arch) {
 		// What a model on MLX holds in memory is its weights as they are.
 		var size int64
 		for _, f := range set {

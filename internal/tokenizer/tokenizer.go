@@ -70,6 +70,10 @@ func Load(path string) (*Tokenizer, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parse(raw, path)
+}
+
+func parse(raw []byte, path string) (*Tokenizer, error) {
 	var f fileFormat
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)

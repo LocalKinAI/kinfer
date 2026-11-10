@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+### Added — text to speech
+
+`POST /v1/audio/speech`, as OpenAI has it, on a Mac: Qwen3-TTS CustomVoice
+(`kinfer pull mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit`), a port of
+mlx-audio's to Go on the MLX library (internal/mlxtts) — the talker, its code
+predictor and the speech tokenizer's decoder. Nine voices, ten languages,
+`instructions` for the tone; wav or pcm; `speed` by time-stretching; streamed
+(`stream_format` audio or sse) with the first audio out in 0.09 s. Answers the
+Python service's clients as it does: a voice it lacks in the nearest or the
+default, the language told from the script. Checked against mlx-audio: the
+prompt and the first logits the same bits, the decoder within 1.5e-6, then the
+two MLX builds' rounding (cos 0.9997 fed the same codes); four sentences six
+times each, heard back by Qwen3-ASR, word for word on both. On the M3 Ultra
+5.2× real time against Python's 5.1×, 1.5 GB against 2.4. `GET
+/v1/audio/voices?model=` lists the voices. `kinfer pull` fetches the
+speech_tokenizer/ folder beside the model. See docs/serving.md.
+
+### Added — speech to text
+
+`POST /v1/audio/transcriptions`, as OpenAI has it, for a model whose projector
+hears: Qwen3-ASR's GGUF with its audio mmproj (`kinfer pull
+ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0`). The recording goes where a picture would,
+through libmtmd, and the reply is the transcript; the chat path is unchanged.
+wav, mp3 and flac; `language` (a code or a name) starts the reply as Qwen3-ASR
+is told one, `prompt` is its context, and `response_format` is `json`, `text` or
+`verbose_json`. Run it as its own server, sized by hand (`kinfer serve -addr
+:11591 -slots 1 -ctx 16384 -prefix off`, 2.6 GB). On the M3 Ultra, against the
+box's Python service with the same model at 8 bits: the same words in six
+recordings of seven, the same time on short ones, 5–20% slower on long ones
+(3.20 s against 2.65 s for 163 s of Chinese), 1 GB less memory.
+
+On a Mac the same model also runs on MLX (`kinfer pull
+mlx-community/Qwen3-ASR-1.7B-8bit`): a port of mlx-audio's Qwen3-ASR to Go on
+the MLX library (internal/mlxasr), checked against it step by step — the
+features within 1.4e-4, the encoder within 1.3e-6, the transcripts word for
+word. 163 s of Chinese in 2.88 s against Python's 2.64, 54 s in 0.96 against
+0.91, short ones the same; 2.6 GB against 3.4. A 16 kHz WAV is read in Go, other
+recordings through macOS's afconvert. `kinfer pull` and `kinfer can-run` know
+the MLX conversion, which ships vocab.json and merges.txt in place of
+tokenizer.json.
+
+`stream=true` streams a transcript as OpenAI does, without the language the
+model opens with. `POST /v1/audio/translations` gives it in English: Qwen3-ASR
+does not translate, so the transcript goes to a chat model on another server
+(`KINFER_TRANSLATE_URL`, `KINFER_TRANSLATE_MODEL`).
+
+SenseVoice Small runs on MLX too (`kinfer pull mlx-community/SenseVoiceSmall`),
+on its own or beside Qwen3-ASR (`KINFER_EMOTION_MODEL=SenseVoiceSmall`), adding
+`emotion` and `audio_events` to the transcript as the Python service's
+`--emotion` does. Checked against mlx-audio — the same token at every position
+of nine recordings — with the model's am.mvn applied, which mlx-audio leaves
+out; on six recordings spoken happily, sadly and angrily it told five, and gave
+the same emotion as FunASR on all six. See docs/serving.md.
+
 ## v0.4.1 — 2026-11-09
 
 ### Fixed — a model with experts on the SSD answered wrongly after it was reloaded

@@ -124,5 +124,48 @@ func (k *Kernel) Run(inputs []Array, outputs []KernelOutput, tpl []KernelTemplat
 	return fromVector(res)
 }
 
+// A Launch is a kernel with its outputs, template arguments and grid set up
+// once, for a kernel run many times over the same shapes: Run then only
+// hands MLX the inputs.
+type Launch struct {
+	k   *Kernel
+	cfg kcfg
+}
+
+// Prepare sets a launch up; it lives as long as the caller keeps it.
+func (k *Kernel) Prepare(outputs []KernelOutput, tpl []KernelTemplate, grid, group [3]int) *Launch {
+	cfg := kcfgNew()
+	for _, o := range outputs {
+		p, n := ints(o.Shape)
+		check(kcfgAddOutput(cfg, p, n, o.Dtype))
+	}
+	for _, t := range tpl {
+		if t.IsInt {
+			check(kcfgTplInt(cfg, t.Name, int32(t.Int)))
+		} else {
+			check(kcfgTplDtype(cfg, t.Name, t.Dtype))
+		}
+	}
+	check(kcfgGrid(cfg, int32(grid[0]), int32(grid[1]), int32(grid[2])))
+	check(kcfgGroup(cfg, int32(group[0]), int32(group[1]), int32(group[2])))
+	return &Launch{k: k, cfg: cfg}
+}
+
+// Run launches the kernel on inputs.
+func (l *Launch) Run(inputs ...Array) []Array {
+	if len(inputs) != len(l.k.inputs) {
+		panic(&Error{fmt.Sprintf("kernel wants %d inputs, got %d", len(l.k.inputs), len(inputs))})
+	}
+	in := toVector(inputs)
+	defer vecFree(in)
+	res := vecNew()
+	defer vecFree(res)
+	check(kernelApply(&res, l.k.k, in, l.cfg, gpu))
+	return fromVector(res)
+}
+
+// Free releases the launch's setup.
+func (l *Launch) Free() { kcfgFree(l.cfg) }
+
 // Int makes a 0-d int32 array, which a kernel receives as a scalar.
 func Int(v int) Array { a := arrayNewInt(int32(v)); track(a); return a }

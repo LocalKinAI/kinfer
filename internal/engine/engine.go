@@ -355,6 +355,10 @@ type Engine struct {
 // OnGPU reports whether the model runs on a GPU rather than the CPU.
 func (e *Engine) OnGPU() bool { return e.onGPU }
 
+// HearsAudio says whether the model takes sound through its projector, as a
+// speech recognition model does (the server's /v1/audio/transcriptions).
+func (e *Engine) HearsAudio() bool { return llama.HearsAudio(e.mtmd) }
+
 // Open loads a GGUF file.
 func Open(path string, opts Options) (*Engine, error) {
 	e, err := open(path, opts)
@@ -500,7 +504,7 @@ func open(path string, opts Options) (*Engine, error) {
 		if mtmd = llama.LoadProjector(opts.Projector, model, 0); mtmd == 0 {
 			log.Printf("pictures: %s could not be loaded; the model reads text only", opts.Projector)
 		} else {
-			log.Printf("pictures: read through %s", filepath.Base(opts.Projector))
+			log.Printf("%s: read through %s", llama.Takes(mtmd), filepath.Base(opts.Projector))
 		}
 	}
 	bud.afterModel = bud.sample()

@@ -33,6 +33,9 @@ type fakeEngine struct {
 	tools     bool
 	truncated bool
 	broken    bool
+	audio     bool     // a projector that hears (HearsAudio)
+	feel      string   // what Feelings hears, when audio: an emotion
+	events    []string // and sounds
 
 	// What ChatFull reports as measurements. The eval count is not among them:
 	// it is counted from the fragments actually emitted, so a handler that
@@ -92,6 +95,24 @@ func (f *fakeEngine) Chat(ctx context.Context, msgs []chat.Message, p engine.Gen
 		out.WriteString(frag)
 	}
 	return out.String(), f.err
+}
+
+func (f *fakeEngine) FeelsAudio() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.feel != "" || len(f.events) > 0
+}
+
+func (f *fakeEngine) Feelings(ctx context.Context, sound []byte) (string, []string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.feel, f.events, nil
+}
+
+func (f *fakeEngine) HearsAudio() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.audio
 }
 
 func (f *fakeEngine) Broken() bool {

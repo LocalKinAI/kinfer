@@ -400,6 +400,261 @@ refused (413), as a text one too long by itself is. A picture for a model
 without a projector is refused (400), as Ollama refuses it. It used to be said in
 words where it was; told so, a 4B model described a picture it had not seen.
 
+## Speech to text, for a model that hears
+
+A speech recognition model hears through a projector too: Qwen3-ASR's GGUF
+ships an audio encoder as its mmproj, and libmtmd takes a recording where it
+would take a picture. So `POST /v1/audio/transcriptions`, as OpenAI has it,
+goes down the pictures' path — the recording in the user's turn, the reply the
+transcript — and nothing on the chat path changed for it.
+
+```bash
+kinfer pull ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0          # 2.2 GB, and its projector
+kinfer serve -addr :11591 -slots 1 -ctx 16384 -prefix off
+curl -F file=@meeting.wav -F model=Qwen3-ASR-1.7B-Q8_0 localhost:11591/v1/audio/transcriptions
+{"text":"今天下午在二号会议室开项目进度会，请大家提前准备好本周的数据。"}
+```
+
+- `file`: wav, mp3 or flac, what llama.cpp decodes; on MLX also m4a, aiff and
+  whatever else macOS's afconvert reads. Anything else is a 400.
+  Up to 64 MiB, and as long as the slot holds: a second of speech is about 13
+  tokens of sound and 3 of transcript, so 16384 tokens hold some fifteen
+  minutes. A longer one is a 413.
+- `language`: an ISO 639-1 code (`zh`, `en`, `yue`…) or the English name of
+  one of Qwen3-ASR's 30 languages. The model's reply is started with it, as
+  Qwen3-ASR is told a language; without it the model says which it heard. One
+  it cannot name is a 400.
+- `prompt`: what is known about the recording — names, terms — which Qwen3-ASR
+  takes as its system message.
+- `response_format`: `json` (the default), `text` or `verbose_json`, which adds
+  the language heard and, for a WAV, the duration. `temperature` defaults to 0.
+- `stream=true` sends the transcript as it is written, as OpenAI streams one:
+  server-sent events of `{"type":"transcript.text.delta","delta":…}`, then
+  `{"type":"transcript.text.done","text":…,"usage":…}`. The "language
+  Chinese<asr_text>" the model opens with is held back, not sent. json and text
+  only.
+- Not yet: `srt` and `vtt`, timestamps.
+- A model whose projector hears nothing is a 400.
+
+Both pulls were run on the box into an empty store (11-09): the GGUF and its
+projector, kept as `Qwen3-ASR-1.7B-Q8_0.mmproj.gguf`, 2.6 GB in 134 s, and the
+MLX conversion, 2.3 GB in 117 s, each with its sha256 checked against Hugging
+Face's, then served and transcribing.
+
+`POST /v1/audio/translations`, as OpenAI has it, gives the recording's words in
+English. Qwen3-ASR does not translate — told to in its prompt, or started with
+English, it still writes Chinese down in Chinese — so the transcript is
+translated by a chat model on a chat server, since the speech server is a
+process of its own: start it with `KINFER_TRANSLATE_URL` (that server's address,
+such as `http://127.0.0.1:11590`) and `KINFER_TRANSLATE_MODEL`. Without them a
+translation is a 400 saying so. A recording heard in English goes back as
+heard, and a translation is not streamed. On the box, with ornith-1.5:35b
+translating: "There will be a project progress meeting in Conference Room No. 2
+this afternoon. Please prepare this week's data in advance."
+
+Run it as a process of its own, as above, rather than in the chat server. One
+kinfer serves one chat model at a time, so asking a chat server for the speech
+model would unload the chat model; and a recording that crashed libmtmd would
+take only the speech server down. Size it by hand: left to itself, `serve`
+gave the 1.7B model four slots of 32768 tokens and a prefix pool, 22.5 GB, where
+one slot of 16384 without a pool is 2.6 GB. The pool never helps here, since a
+prompt with sound is read whole.
+
+### On MLX, on a Mac
+
+On Apple silicon the same model runs on MLX too, from mlx-community's 8-bit
+conversion, which mlx-audio — the box's Python service — runs as well. A
+directory whose config.json names `qwen3_asr` is served by `internal/mlxasr`,
+a port of mlx-audio's Qwen3-ASR to Go on the MLX library kinfer's MLX engine
+uses: Whisper's log-mel features (the FFT on the GPU), the convolutional front
+end and 24 encoder layers attending within windows of eight seconds, and the
+Qwen3 decoder reading the prompt with the sound in it. Checked against
+mlx-audio step by step on the same recordings: the features within 1.4e-4, the
+encoder's output within 1.3e-6, the prompt token for token, the transcripts word
+for word.
+
+```bash
+kinfer pull mlx-community/Qwen3-ASR-1.7B-8bit          # 2.5 GB
+kinfer serve -addr :11591
+curl -F file=@meeting.wav -F model=Qwen3-ASR-1.7B-8bit localhost:11591/v1/audio/transcriptions
+```
+
+It takes the same fields. A 16 kHz WAV is read in Go; any other recording —
+another rate, mp3, m4a, flac — goes through macOS's `afconvert` first. One
+recording is transcribed at a time, and the MLX buffers it used are let go
+after each.
+
+Two things had to differ from mlx-audio for the memory to. Its GELU is compiled
+into one kernel; here its five ops each make an intermediate as large as the
+convolution's output, so the convolutions take sixteen seconds of sound at a
+time. And an MLX array lives as long as a handle to it does, so each encoder
+layer runs in a scope of its own: with one scope for the encoder, 163 s of sound
+peaked at 21.7 GB, against 4.4 GB now, the 2.5 GB of weights included.
+
+### The emotion and the sounds: SenseVoice
+
+SenseVoice Small, FunAudioLLM's, hears more than words: the first positions of
+its output name the language, the emotion (happy, sad, angry, neutral,
+fearful, disgusted, surprised) and the sound besides speech (BGM, laughter,
+applause…). It runs on MLX here, ported from mlx-audio as Qwen3-ASR is
+(`internal/mlxasr/sensevoice.go`): Kaldi's filterbank, seven frames stacked
+every six, the model's am.mvn, 70 SANM layers and a CTC head, read whole —
+nothing is generated a token at a time, so a recording takes 23–33 ms, 76 ms for
+54 s. Checked against mlx-audio on nine recordings in five languages: the
+features within 0.0008, the head's log-probabilities within 5e-4, the most
+likely token the same at every one of 1,035 positions.
+
+```bash
+kinfer pull mlx-community/SenseVoiceSmall               # 893 MB, with am.mvn and its vocabulary
+KINFER_EMOTION_MODEL=SenseVoiceSmall kinfer serve -addr :11591
+curl -F file=@angry.wav -F model=Qwen3-ASR-1.7B-8bit -F response_format=verbose_json localhost:11591/v1/audio/transcriptions
+{"emotion":"angry","language":"chinese","task":"transcribe","text":"你到底有没有在听我说话？…"}
+```
+
+- Beside Qwen3-ASR, named by `KINFER_EMOTION_MODEL` (a model in the same
+  store, or a path), it adds `emotion` and `audio_events` to the transcript,
+  as the Python service's `--emotion sensevoice:small` does: in json and
+  verbose_json, and the streamed transcript's last event, each only when there
+  is one — an emotion it cannot tell, and speech alone, add nothing.
+- On its own (`model=SenseVoiceSmall`) it writes the transcript too, in zh, en,
+  yue, ja or ko, with the same fields.
+
+Two things differ from the two Python implementations on purpose. mlx-audio
+does not fetch am.mvn with the MLX conversion and so runs without the model's
+normalization (CMVN); this applies it, as FunASR does. And FunASR dithers the
+samples (noise of σ 1 on the 16-bit scale, seeded), which this does not, so its
+words can differ from the Python service's: "开放时间早上9点" where FunASR writes
+"开饭时间", "持っていけない" where it writes "持っていきない", but also a Korean
+sentence spaced worse and an mp3's "July 21, 1969" read as "July 1". On six
+recordings spoken happily, sadly and angrily in Chinese and English (made with
+Qwen3-TTS VoiceDesign), it told five, the English angry one not — and neither
+did FunASR: the emotion was the same as FunASR's on all six. MLX only; on Linux
+and Windows there is no SenseVoice yet.
+
+### Measured
+
+On the M3 Ultra (11-09), against the Python service the box runs (mlx-audio,
+the 8-bit MLX conversion), each a fresh process, the median of six runs in
+rotating order. kinfer on llama.cpp ran the GGUF at Q8_0 with `-slots 1 -ctx
+16384 -prefix off`:
+
+| recording | kinfer, llama.cpp | kinfer, MLX | Python, MLX |
+|---|---|---|---|
+| 5 s English | 0.18 s | 0.18 s | 0.17 s |
+| 7 s Chinese | 0.18 s | 0.19 s | 0.18 s |
+| 44 s English | 1.09 s | 1.00 s | 0.93 s |
+| 53 s English, 24 kHz | 1.25 s | 1.19 s | 1.21 s |
+| 54 s Chinese | 1.07 s | 0.96 s | 0.91 s |
+| 163 s Chinese | 3.21 s | 2.88 s | 2.64 s |
+| four 54 s recordings at once | 4.22 s | 3.73 s | 3.52 s |
+| memory (whole process) | 2.4 GB | 2.6 GB | 3.4 GB |
+
+The words were the same in six recordings of seven, and none wrong in the five
+whose text is known. The seventh, an mp3 of a newspaper read aloud, came out
+three ways: "July twenty one, one thousand, nine hundred and sixty nine"
+(llama.cpp), "July twenty first, nineteen sixty nine" (kinfer on MLX), "July
+21st, 1969" (Python). kinfer's MLX path computes what mlx-audio does from the
+same samples, so the difference there is the mp3's decoding and resampling,
+afconvert's against Python's.
+
+Where the time goes, for the 163 s: llama.cpp spends 0.91 s on the encoder and
+the prompt and 2.15 s decoding at 185–189 tokens a second; mlx-audio 0.70 s and
+1.92 s at 209; kinfer on MLX 0.63 s and 2.01 s at 201, in all 2.64 s against
+mlx-audio's 2.62 (the table above was measured before the next fix). It had
+been 2.19 s at 185: each decoding step asked MLX for the KV cache's arrays as
+well as the token, where mlx-lm asks for the token alone and lets the cache be
+computed as the token needs it. A short reply now decodes as fast as
+mlx-audio's, 219–223 tokens a second against 222; a long one is 4% slower. llama.cpp's own server is as fast as kinfer on it, so kinfer
+adds nothing there: the difference between the two engines is their kernels.
+
+## Text to speech, for a model that speaks
+
+`POST /v1/audio/speech`, as OpenAI has it, answered on a Mac by Qwen3-TTS
+CustomVoice: nine voices by name, ten languages, a tone told in words. A
+directory whose config.json names `qwen3_tts` is served by `internal/mlxtts`, a
+port of mlx-audio's Qwen3-TTS — what the box's Python service runs — to Go on
+the MLX library. Speech is made 12.5 frames a second: the talker, a Qwen3 model
+reading the text and the voice, writes each frame's first code, the code
+predictor its other fifteen, and the speech tokenizer's decoder turns the codes
+into 24 kHz audio, 1,920 samples a frame.
+
+```bash
+kinfer pull mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit   # 2 GB, with its speech_tokenizer/
+kinfer serve -addr :11592
+curl localhost:11592/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit","input":"明天上午九点记得去复查。","voice":"serena"}' -o reminder.wav
+```
+
+- `input`: up to 4,096 characters. `voice`: aiden, dylan (Beijing), eric
+  (Sichuan), ono_anna, ryan, serena, sohee, uncle_fu, vivian. As the Python
+  service does, a Kokoro voice is spoken in the nearest (`zf_…` vivian, `af_…`
+  serena, …) and any other name, OpenAI's alloy among them, in the default:
+  vivian, or `KINFER_TTS_VOICE`. The answer's `X-Kinfer-Voice` says which.
+- `language` (kinfer's): a code (`zh`, `en`, `ja`…) or the model's name for it;
+  without one it is told from the text's script as the Python service tells it
+  — kana Japanese, hangul Korean, Han Chinese, the rest English.
+  `X-Kinfer-Language` says which.
+- `instructions`: the tone, "用特别开心的语气说", passed to the model as mlx-audio
+  passes it.
+- `response_format`: `wav` (the default, 16-bit, as the Python service answers;
+  OpenAI's is mp3) or `pcm` (16-bit little-endian, 24 kHz, no header). Not yet:
+  mp3, opus, aac, flac.
+- `speed`: 0.5 to 2, by time-stretching the speech with its pitch kept (WSOLA,
+  the Python service's), since Qwen3-TTS takes no speed of its own. Not with a
+  stream.
+- `stream_format`: `audio` sends the speech as it is made — pcm does by default,
+  as OpenAI's does; a WAV starts with a header of unknown length — and `sse`
+  sends OpenAI's `{"type":"speech.audio.delta","audio":…}` events, then
+  `speech.audio.done` with the usage. The first piece is 4 frames (0.32 s), the
+  rest 7, as the Python service's 0.6 s.
+- `temperature` (kinfer's): 0.9 by default, mlx-audio's; top-k 50 and a
+  repetition penalty of 1.05 on the first code, as there.
+- `GET /v1/audio/voices?model=` lists the voices and the languages.
+
+Run it as a process of its own, as the speech recognition server is: one
+kinfer holds one model besides its embedders, and a home assistant hearing and
+answering in turn would swap the two at every turn.
+
+How close it is to mlx-audio's: the prompt it builds, the talker's first
+logits and the code predictor's are the same bits; the decoder on mlx-audio's
+codes within 1.5e-6. After that the two drift by rounding: kinfer's MLX is not
+the Python service's (0.32.5-0f4740d against 0.32.2), and fed mlx-audio's own
+codes frame after frame, the talker's logits stay within cos 0.99992 (no first
+code drawn otherwise) and the code predictor's within cos 0.9997 — one
+bfloat16 step on a logit now and then, which turns a near tie the other way in
+about one code in thirty. So the same seed does not give the same speech, and
+the speech is as good: four sentences six times each from both, heard back by
+Qwen3-ASR, every one word for word, the durations alike.
+
+The decoder streams exactly: it is causal, and carries from piece to piece
+each convolution's last inputs, each upsampling block's overlap and the
+transformer's keys and values, so speech made a piece at a time is the speech
+made at once (within 2e-6). mlx-audio's streaming adds the transposed
+convolutions' bias twice where pieces meet; this does not. A whole answer is
+decoded 50 frames at a time the same way, where mlx-audio decodes 300 at a time
+and reads each after only 25 frames of the last, so beyond 24 seconds the two
+differ there too, kinfer's being the one pass.
+
+Measured on the M3 Ultra (11-09), each in its own process, two rounds of the
+same four sentences three times each, alternating:
+
+| | kinfer | Python (mlx-audio) |
+|---|---|---|
+| speed | 5.15–5.21× real time | 5.03–5.14× |
+| first audio, streamed | 0.09 s | 0.12–0.17 s |
+| memory (whole process) | 1.5 GB | 2.4 GB |
+
+Three things made it so. Frames are pipelined: while the GPU works one out, the
+next one's graph is built on the codes it will have drawn — the repetition
+penalty's recent codes stay on the GPU for that — so building costs no waiting.
+The rotation of queries and keys and the SwiGLU are each one kernel, rounding
+as mlx-audio's compiled ones do, and q, k, v and gate, up are each one product,
+which leaves the same bits; a frame is some 1,750 kernels, and handing them to
+MLX is most of a frame's 14 ms. And the talker's text embedding, 151,936 rows
+of 2,048 — 622 MB — of which a sentence reads a few dozen, is read a row at a
+time from its file rather than held. The 1.7B models, VoiceDesign and Base's
+voice cloning are not served yet.
+
 ## `kinfer install` keeps the server up
 
 The daemon `run` starts is a plain background process: a reboot loses it, and

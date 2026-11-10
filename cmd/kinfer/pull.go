@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/hub"
+	"github.com/LocalKinAI/kinfer/internal/mlxasr"
 	"github.com/LocalKinAI/kinfer/internal/mlxengine"
 	"github.com/LocalKinAI/kinfer/internal/mlxmodel"
+	"github.com/LocalKinAI/kinfer/internal/mlxtts"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
 
@@ -122,6 +124,13 @@ func cmdPull(args []string) error {
 	return nil
 }
 
+// servedOnMLX is a model_type kinfer serves on MLX: a chat model's
+// (mlxmodel), a speech recognition model's (mlxasr) or a text to speech
+// model's (mlxtts).
+func servedOnMLX(arch string) bool {
+	return mlxmodel.Serves(arch) || mlxasr.Serves(arch) || mlxtts.Serves(arch)
+}
+
 // mlxExperts checks that an MoE repo keeps its experts as the MLX engine
 // reads them: caught before a pull, a layout it refuses costs a small JSON
 // file instead of the whole download.
@@ -146,8 +155,8 @@ func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, 
 	if err != nil {
 		return err
 	}
-	if !mlxmodel.Serves(arch) {
-		return fmt.Errorf("%s is safetensors of model_type %q, which kinfer does not serve on MLX (Qwen3.5 and Qwen3.8, qwen3_5 and qwen3_5_moe, it does); a GGUF of it may run on llama.cpp: kinfer can-run %s",
+	if !servedOnMLX(arch) {
+		return fmt.Errorf("%s is safetensors of model_type %q, which kinfer does not serve on MLX (Qwen3.5 and Qwen3.8, qwen3_5 and qwen3_5_moe, the speech models Qwen3-ASR and SenseVoice, qwen3_asr and sensevoice, and Qwen3-TTS CustomVoice, qwen3_tts, it does); a GGUF of it may run on llama.cpp: kinfer can-run %s",
 			ref.Repo, arch, ref.Repo)
 	}
 	if err := mlxExperts(ctx, ref.Repo, arch); err != nil {
@@ -180,7 +189,13 @@ func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, 
 	checked := true
 	for _, f := range set {
 		m.start(f.Name)
-		_, err := hub.Download(ctx, ref.Repo, f.Name, dir, conns, m.show)
+		// A file in a folder keeps it: Qwen3-TTS's speech_tokenizer/ holds a
+		// model.safetensors of its own.
+		dest := filepath.Join(dir, filepath.FromSlash(f.Name))
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return err
+		}
+		_, err := hub.DownloadAs(ctx, ref.Repo, f.Name, dest, conns, m.show)
 		m.end()
 		if err != nil {
 			return err

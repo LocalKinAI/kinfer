@@ -195,22 +195,32 @@ func Files(ctx context.Context, repo string) ([]File, error) {
 func MLXFiles(files []File) ([]File, bool) {
 	var weights, rest []File
 	var config File
-	tokenizer := false
+	tokenizer, vocab, merges, spm := false, false, false, false
 	for _, f := range files {
 		if strings.Contains(f.Name, "/") {
-			continue // another copy, another framework's weights, a picture
+			// Qwen3-TTS's codec is a model of its own beside the talker, in a
+			// folder; anything else in one is another copy, another
+			// framework's weights, a picture.
+			if strings.HasPrefix(f.Name, "speech_tokenizer/") && !strings.Contains(f.Name[len("speech_tokenizer/"):], "/") {
+				rest = append(rest, f)
+			}
+			continue
 		}
 		switch ext := strings.ToLower(filepath.Ext(f.Name)); {
 		case f.Name == "config.json":
 			config = f
 		case ext == ".safetensors":
 			weights = append(weights, f)
+		case ext == ".model" || ext == ".mvn": // a SentencePiece vocabulary, CMVN statistics (SenseVoice)
+			spm = spm || ext == ".model"
+			rest = append(rest, f)
 		case ext == ".json" || ext == ".jinja" || ext == ".txt":
 			tokenizer = tokenizer || f.Name == "tokenizer.json"
+			vocab, merges = vocab || f.Name == "vocab.json", merges || f.Name == "merges.txt" // the slow tokenizer's, as Qwen3-ASR ships
 			rest = append(rest, f)
 		}
 	}
-	if config.Name == "" || !tokenizer || len(weights) == 0 {
+	if config.Name == "" || !(tokenizer || vocab && merges || spm) || len(weights) == 0 {
 		return nil, false
 	}
 	return append(append(weights, rest...), config), true

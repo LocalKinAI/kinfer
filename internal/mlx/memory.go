@@ -13,6 +13,7 @@ var (
 	memPeak       func(res *uintptr) int32
 	memClearCache func() int32
 	memCacheLimit func(res *uintptr, limit uintptr) int32
+	memResetPeak  func() int32
 )
 
 func bindMemory(lib uintptr) error {
@@ -22,7 +23,7 @@ func bindMemory(lib uintptr) error {
 	}{
 		{&memActive, "mlx_get_active_memory"}, {&memCache, "mlx_get_cache_memory"},
 		{&memPeak, "mlx_get_peak_memory"}, {&memClearCache, "mlx_clear_cache"},
-		{&memCacheLimit, "mlx_set_cache_limit"},
+		{&memCacheLimit, "mlx_set_cache_limit"}, {&memResetPeak, "mlx_reset_peak_memory"},
 	} {
 		if _, err := dl.Sym(lib, b.name); err != nil {
 			return fmt.Errorf("mlx-c has no %s: %w", b.name, err)
@@ -55,6 +56,9 @@ func SetCacheLimit(bytes int64) int64 {
 	memCacheLimit(&prev, uintptr(bytes))
 	return int64(prev)
 }
+
+// ResetPeak starts Peak over from what is active now.
+func ResetPeak() { memResetPeak() }
 
 // ClearCache returns MLX's cached buffers to the system.
 func ClearCache() { memClearCache() }
