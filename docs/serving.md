@@ -611,6 +611,10 @@ curl localhost:11592/v1/audio/speech -H 'Content-Type: application/json' \
   repetition penalty of 1.05 on the first code, as there.
 - `GET /v1/audio/voices?model=` lists the voices and the languages.
 
+The pull was run on the box into an empty store (11-09): twelve files, 1.8 GB,
+in 94 s, the weights' sha256 checked against Hugging Face's, `speech_tokenizer/`
+kept as a folder beside the talker, then served and speaking.
+
 Run it as a process of its own, as the speech recognition server is: one
 kinfer holds one model besides its embedders, and a home assistant hearing and
 answering in turn would swap the two at every turn.

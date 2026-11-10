@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 — 2026-11-09
 
 ### Added — text to speech
 
@@ -17,7 +17,9 @@ two MLX builds' rounding (cos 0.9997 fed the same codes); four sentences six
 times each, heard back by Qwen3-ASR, word for word on both. On the M3 Ultra
 5.2× real time against Python's 5.1×, 1.5 GB against 2.4. `GET
 /v1/audio/voices?model=` lists the voices. `kinfer pull` fetches the
-speech_tokenizer/ folder beside the model. See docs/serving.md.
+speech_tokenizer/ folder beside the model (1.8 GB in 94 s on the box, checked).
+Speech is MLX only: on Linux and Windows there is no text to speech yet. See
+docs/serving.md.
 
 ### Added — speech to text
 
