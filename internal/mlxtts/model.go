@@ -214,6 +214,13 @@ type Model struct {
 	all    []mlx.Array
 }
 
+// DesignsVoices reports a VoiceDesign directory: one whose answers are in a
+// voice told in words rather than one by name.
+func DesignsVoices(dir string) bool {
+	cfg, err := readConfig(dir)
+	return err == nil && cfg.TTSType == "voice_design"
+}
+
 // Load reads a Qwen3-TTS directory. mlx.Open must have been called.
 func Load(dir string) (m *Model, err error) {
 	defer mlx.Recover(&err)
@@ -224,8 +231,8 @@ func Load(dir string) (m *Model, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.TTSType != "custom_voice" {
-		return nil, fmt.Errorf("%s is Qwen3-TTS %s; kinfer serves the CustomVoice models (voices by name)", dir, cfg.TTSType)
+	if cfg.TTSType != "custom_voice" && cfg.TTSType != "voice_design" {
+		return nil, fmt.Errorf("%s is Qwen3-TTS %s; kinfer serves the CustomVoice models (voices by name) and the VoiceDesign ones (a voice told in words)", dir, cfg.TTSType)
 	}
 	tok, err := tokenizer.LoadDir(dir)
 	if err != nil {
@@ -277,6 +284,10 @@ func (m *Model) Voices() []string {
 	sort.Strings(v)
 	return v
 }
+
+// Designs reports a VoiceDesign model: it has no voices by name, and each
+// answer is in a voice its instructions describe.
+func (m *Model) Designs() bool { return m.cfg.TTSType == "voice_design" }
 
 // Languages are the languages it can be told to speak, sorted; "auto" lets
 // it tell from the text.

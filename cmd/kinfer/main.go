@@ -423,6 +423,7 @@ type serveOpts struct {
 	draft           int
 	speech          string
 	autoPull        bool
+	speechAddrs     map[string]string
 }
 
 // prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
@@ -502,6 +503,9 @@ func (o *serveOpts) check() error {
 	default:
 		return fmt.Errorf("-speech is auto, keep or off, not %q", o.speech)
 	}
+	if len(o.speechAddrs) > 0 && o.speech == server.SpeechOff {
+		return fmt.Errorf("-speech-addr answers speech in runners, which -speech off has none of")
+	}
 	if isAuto(o.peers) && len(o.split) > 0 {
 		return fmt.Errorf("-split shares the layers among peers named by hand, not -peers auto")
 	}
@@ -537,6 +541,10 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.BoolVar(&o.place, "place", true, "when a mixture of experts does not fit the GPU, keep as many layers' experts in host memory as it must, with a GPU cache for the ones in use, unless -host-experts or -moe-cache say otherwise; with -peers and no -split, give the peers only the layers that do not fit here (false = load it whole, and let llama.cpp split by free memory)")
 	fs.StringVar(&o.speech, "speech", server.SpeechAuto, "speech behind this address: auto = a speech model starts in a process of its own on the first request for it and stops once idle as long as -keepalive; keep = the default speech models start with the server and stay; off = speech is served in this process, one model at a time with the rest")
 	fs.BoolVar(&o.autoPull, "auto-pull", true, "fetch this machine's default speech model the first time one is asked for and is not here (Qwen3-ASR 2.5 GB, Qwen3-TTS 1.8 GB); the request is answered 503 with how far it has got (false = answer 404 saying what to pull)")
+	fs.Func("speech-addr", "also answer one kind of speech at an address of its own, in the Python audio service's API (/transcribe, /synthesize, /voices) as well as OpenAI's, the model this server chooses for the kind: kind=address pairs, comma-separated, the kinds asr, tts and design (Qwen3-TTS VoiceDesign, a voice told in words) — asr=:8100,tts=:8101,design=:8102 takes the box's old ports (default none)", func(v string) (err error) {
+		o.speechAddrs, err = server.ParseSpeechAddrs(v)
+		return err
+	})
 	fs.Func("peers", "kinfer workers on other machines (host:port, comma-separated) whose GPUs take the first layers of each model; auto = those that answer over the Thunderbolt cable, for a model that does not fit here (default none)", func(v string) (err error) {
 		o.peers, err = parsePeers(v)
 		return err
@@ -584,6 +592,7 @@ func cmdServe(args []string) error {
 	})
 	srv.SetKeepAlive(o.keepAlive)
 	srv.SetSpeech(o.speech, o.autoPull, o.addr)
+	srv.SetSpeechAddrs(o.speechAddrs)
 	runner := os.Getenv("KINFER_RUNNER") != ""
 	if runner {
 		srv.SetRunner()
@@ -622,7 +631,13 @@ func cmdServe(args []string) error {
 	if o.speech != server.SpeechOff && o.autoPull {
 		fmt.Printf("; a default one missing is fetched (-auto-pull=false stops that)")
 	}
-	fmt.Printf("\n\n")
+	fmt.Printf("\n")
+	for _, kind := range []string{"asr", "tts", "design"} {
+		if a := o.speechAddrs[kind]; a != "" {
+			fmt.Printf("  %-11s: %s — the Python audio service's API too (/transcribe, /synthesize, /voices)\n", map[string]string{"asr": "Hearing", "tts": "Speaking", "design": "Voice design"}[kind], a)
+		}
+	}
+	fmt.Printf("\n")
 	fmt.Printf("  point LocalKin at it by setting a soul's brain.endpoint to %s\n\n", o.addr)
 
 	httpSrv := &http.Server{
@@ -647,6 +662,7 @@ func cmdServe(args []string) error {
 			errCh <- err
 		}
 	}()
+	srv.ServeSpeechAddrs()
 	if o.speech == server.SpeechKeep {
 		go srv.PrepareSpeech()
 	}

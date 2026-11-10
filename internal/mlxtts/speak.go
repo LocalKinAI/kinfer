@@ -90,10 +90,22 @@ func (m *Model) inputs(r Request) (prompt, trailing, pad mlx.Array, err error) {
 	bos, eos := part(tts, 0, 1), part(tts, 1, 2)
 	pad = part(tts, 2, 3)
 
+	// A CustomVoice model speaks in a voice by name, its embedding in the
+	// codec prompt; a VoiceDesign one in the voice its instructions describe,
+	// with none (mlx-audio's speaker=None).
 	voice := strings.ToLower(r.Voice)
-	spk, ok := tc.Speakers[voice]
-	if !ok {
-		return 0, 0, 0, fmt.Errorf("voice %q: this model speaks in %s", r.Voice, strings.Join(m.Voices(), ", "))
+	var spkCodes []int32
+	if m.Designs() {
+		voice = ""
+		if strings.TrimSpace(r.Instruct) == "" {
+			return 0, 0, 0, fmt.Errorf("a VoiceDesign model speaks in a voice its instructions describe, and none were given")
+		}
+	} else {
+		spk, ok := tc.Speakers[voice]
+		if !ok {
+			return 0, 0, 0, fmt.Errorf("voice %q: this model speaks in %s", r.Voice, strings.Join(m.Voices(), ", "))
+		}
+		spkCodes = []int32{spk}
 	}
 	lang := strings.ToLower(r.Language)
 	langID, haveLang := int32(0), false
@@ -111,10 +123,12 @@ func (m *Model) inputs(r Request) (prompt, trailing, pad mlx.Array, err error) {
 	if haveLang {
 		prefill = []int32{tc.Think, tc.ThinkBOS, langID, tc.ThinkEOS}
 	}
-	codec := mlx.Concatenate(1,
-		t.codec(mlx.FromInt32(prefill, 1, len(prefill))),
-		t.codec(mlx.FromInt32([]int32{spk}, 1, 1)),
-		t.codec(mlx.FromInt32([]int32{tc.CodecPad, tc.CodecBOS}, 1, 2)))
+	codecParts := []mlx.Array{t.codec(mlx.FromInt32(prefill, 1, len(prefill)))}
+	if len(spkCodes) > 0 {
+		codecParts = append(codecParts, t.codec(mlx.FromInt32(spkCodes, 1, 1)))
+	}
+	codecParts = append(codecParts, t.codec(mlx.FromInt32([]int32{tc.CodecPad, tc.CodecBOS}, 1, 2)))
+	codec := mlx.Concatenate(1, codecParts...)
 	n := codec.Shape()[1]
 
 	pads := mlx.BroadcastTo(pad, 1, n-2, hid)

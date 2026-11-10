@@ -57,8 +57,9 @@ const runnerHeader = "X-Kinfer-Model"
 
 // The kinds of speech model.
 const (
-	kindASR = "asr" // /v1/audio/transcriptions and translations
-	kindTTS = "tts" // /v1/audio/speech and voices
+	kindASR    = "asr"    // /v1/audio/transcriptions and translations
+	kindTTS    = "tts"    // /v1/audio/speech and voices
+	kindDesign = "design" // the same, in a voice told in words (Qwen3-TTS VoiceDesign)
 )
 
 // SpeechModel is a default speech model: what `kinfer pull` fetches, the
@@ -83,6 +84,7 @@ func SpeechModels() []SpeechModel {
 	out = append(out, SpeechModel{kindASR, "ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0", "Qwen3-ASR-1.7B-Q8_0", "2.6 GB"})
 	if mlx {
 		out = append(out, SpeechModel{kindTTS, "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "1.8 GB"})
+		out = append(out, SpeechModel{kindDesign, "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit", "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit", "2.9 GB"})
 	}
 	return out
 }
@@ -138,6 +140,8 @@ func (s *Server) fits(kind, path string) bool {
 			return mlxasr.IsModelDir(path)
 		case kindTTS:
 			return mlxtts.IsModelDir(path)
+		case kindDesign:
+			return mlxtts.IsModelDir(path) && mlxtts.DesignsVoices(path)
 		}
 		return false
 	}
@@ -179,27 +183,42 @@ func (s *Server) speechModelFor(kind, asked string) (path string, fetch *SpeechM
 }
 
 // kindNames say what a kind of speech model does, for messages.
-var kindNames = map[string]string{kindASR: "speech recognition", kindTTS: "text to speech"}
+var kindNames = map[string]string{kindASR: "speech recognition", kindTTS: "text to speech", kindDesign: "text to speech in a voice told in words"}
 
 // proxySpeech answers a speech request in a runner: the model it names or
 // the default, fetched first if it must be. body is the request's, read.
 func (s *Server) proxySpeech(w http.ResponseWriter, r *http.Request, kind, asked string, body []byte) {
-	path, fetch := s.speechModelFor(kind, asked)
-	if path == "" {
-		switch {
-		case fetch == nil:
-			writeJSON(w, http.StatusNotImplemented, map[string]any{"error": map[string]string{
-				"message": fmt.Sprintf("%s runs on a Mac with Apple silicon here (Qwen3-TTS on MLX); this machine has no %s model", kindNames[kind], kindNames[kind]),
-				"type":    "invalid_request_error"}})
-		case !s.autoPull:
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{
-				"message": fmt.Sprintf("%s needs a model: kinfer pull %s (%s), or kinfer pull speech for the defaults", kindNames[kind], fetch.Repo, fetch.Size),
-				"type":    "invalid_request_error"}})
-		default:
-			s.fetching(w, s.pulls.get(*fetch), kind)
-		}
-		return
+	if path, ok := s.speechPath(w, kind, asked); ok {
+		s.proxySpeechTo(w, r, kind, path, body)
 	}
+}
+
+// speechPath is the model a speech request of kind goes to, as
+// speechModelFor has it; with none here, it answers the request itself —
+// the fetch under way, what to pull, or that this machine has none — and
+// returns false.
+func (s *Server) speechPath(w http.ResponseWriter, kind, asked string) (string, bool) {
+	path, fetch := s.speechModelFor(kind, asked)
+	if path != "" {
+		return path, true
+	}
+	switch {
+	case fetch == nil:
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": map[string]string{
+			"message": fmt.Sprintf("%s runs on a Mac with Apple silicon here (Qwen3-TTS on MLX); this machine has no %s model", kindNames[kind], kindNames[kind]),
+			"type":    "invalid_request_error"}})
+	case !s.autoPull:
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{
+			"message": fmt.Sprintf("%s needs a model: kinfer pull %s (%s), or kinfer pull speech for the defaults", kindNames[kind], fetch.Repo, fetch.Size),
+			"type":    "invalid_request_error"}})
+	default:
+		s.fetching(w, s.pulls.get(*fetch), kind)
+	}
+	return "", false
+}
+
+// proxySpeechTo answers a speech request in the runner of the model at path.
+func (s *Server) proxySpeechTo(w http.ResponseWriter, r *http.Request, kind, path string, body []byte) {
 	rn, release, err := s.runners.acquire(path)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{
@@ -427,6 +446,22 @@ func (rs *runnerSet) watch(r *runner) {
 	rs.mu.Unlock()
 	if gone {
 		log.Printf("speech: %s's runner exited; the next request starts it again", modelName(r.path))
+	}
+}
+
+// up reports a runner up for path.
+func (rs *runnerSet) up(path string) bool {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	r := rs.byPath[path]
+	if r == nil {
+		return false
+	}
+	select {
+	case <-r.ready:
+		return r.err == nil && !r.p.exited()
+	default:
+		return false
 	}
 }
 
@@ -713,7 +748,11 @@ func (ps *pullSet) stop() {
 // PrepareSpeech readies the default speech models with -speech keep: each
 // fetched if it must be and may be, then started in its runner, to stay.
 func (s *Server) PrepareSpeech() {
-	for _, kind := range []string{kindASR, kindTTS} {
+	kinds := []string{kindASR, kindTTS}
+	if s.speechAddrs[kindDesign] != "" {
+		kinds = append(kinds, kindDesign)
+	}
+	for _, kind := range kinds {
 		path, fetch := s.speechModelFor(kind, "")
 		if path == "" && fetch != nil && s.autoPull {
 			p := s.pulls.get(*fetch)
@@ -744,7 +783,7 @@ func (s *Server) PrepareSpeech() {
 func warm(base, kind, path string) error {
 	var req *http.Request
 	var err error
-	if kind == kindTTS {
+	if kind == kindTTS || kind == kindDesign {
 		req, err = http.NewRequest("GET", base+"/v1/audio/voices?model=x", nil)
 	} else {
 		var b bytes.Buffer

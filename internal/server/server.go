@@ -82,6 +82,7 @@ type Server struct {
 	runnerMode     bool
 	selfURL        string
 	speechDefaults []SpeechModel
+	speechAddrs    map[string]string // kind → the extra address answering it (legacy.go)
 	runners        *runnerSet
 	pulls          *pullSet
 }
