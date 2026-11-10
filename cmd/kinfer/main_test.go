@@ -1,6 +1,8 @@
 package main
 
 import (
+	"flag"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,5 +27,17 @@ func TestNoLimitTranslatesZero(t *testing.T) {
 	// A negative typed with a unit is already the API's own way of saying off.
 	if got := noLimit(-time.Second); got != -time.Second {
 		t.Errorf("noLimit(-1s) = %v, want it left alone", got)
+	}
+}
+
+func TestRunnerFlags(t *testing.T) {
+	fs, _ := serveFlags(flag.ContinueOnError)
+	args := []string{"-addr", ":11590", "-keepalive", "10m", "-slots", "4", "-prefix", "auto", "-max-gen=15m",
+		"-speech", "keep", "-speech-addr", "asr=:8100", "-auto-pull=false", "-place", "-runners", "-peers", "auto", "--ctx", "8192"}
+	fs.Parse(args)
+	got := strings.Join(runnerFlags(fs, args), " ")
+	want := "-slots 4 -prefix auto -max-gen=15m -place -peers auto --ctx 8192"
+	if got != want {
+		t.Errorf("runnerFlags = %q\nwant          %q", got, want)
 	}
 }

@@ -25,7 +25,7 @@ type audioAsk struct {
 	json         map[string]any
 }
 
-func (a *audioRunners) start(path string) (*proc, error) {
+func (a *audioRunners) start(path string, chat bool) (*proc, error) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ask := audioAsk{runner: filepath.Base(path), path: r.URL.Path, form: map[string]string{}}
 		switch r.URL.Path {

@@ -346,12 +346,15 @@ func (p *proc) exited() bool {
 
 type runner struct {
 	path     string
+	chat     bool // a chat or embedding model's (chatrunners.go), not speech's or a picture's
 	p        *proc
 	ready    chan struct{} // closed once it is up, or could not start
 	err      error
 	inflight int
 	idle     *time.Timer
 	expiry   time.Time
+	used     time.Time      // when a request last let go of it
+	ask      *time.Duration // the keep_alive the last request asked for; nil, the set's
 }
 
 // runnerSet is the runners, one a model, each started on the first request
@@ -363,12 +366,28 @@ type runnerSet struct {
 	keep      bool            // -speech keep: the models PrepareSpeech readied stay
 	kept      map[string]bool // those models; a picture's runner still stops once idle
 	closed    bool
-	start     func(path string) (*proc, error) // starts one and waits until it answers; tests replace it
+	start     func(path string, chat bool) (*proc, error) // starts one, its model loaded; tests replace it
+
+	// room makes room on the GPU for path before its runner starts
+	// (chatrunners.go); nil makes none. starting lets one runner start at a
+	// time, so that each finds the memory the one before it took.
+	room     func(path string)
+	starting sync.Mutex
 }
 
 // acquire is the runner for path, started if it must be; release ends the
 // request's hold on it.
 func (rs *runnerSet) acquire(path string) (*runner, func(), error) {
+	r, release, err := rs.acquireAs(path, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return r, func() { release(nil) }, nil
+}
+
+// acquireAs is acquire for a runner of a chat or embedding model (chat) or
+// not; its release takes the keep_alive the request asked for, or nil.
+func (rs *runnerSet) acquireAs(path string, chat bool) (*runner, func(ask *time.Duration), error) {
 	rs.mu.Lock()
 	for {
 		if rs.closed {
@@ -377,10 +396,15 @@ func (rs *runnerSet) acquire(path string) (*runner, func(), error) {
 		}
 		r := rs.byPath[path]
 		if r == nil {
-			r = &runner{path: path, ready: make(chan struct{})}
+			r = &runner{path: path, chat: chat, ready: make(chan struct{})}
 			rs.byPath[path] = r
 			rs.mu.Unlock()
-			p, err := rs.start(path)
+			rs.starting.Lock()
+			if rs.room != nil {
+				rs.room(path)
+			}
+			p, err := rs.start(path, chat)
+			rs.starting.Unlock()
 			rs.mu.Lock()
 			r.p, r.err = p, err
 			close(r.ready)
@@ -412,19 +436,38 @@ func (rs *runnerSet) acquire(path string) (*runner, func(), error) {
 		}
 		rs.mu.Unlock()
 		var once sync.Once
-		return r, func() { once.Do(func() { rs.release(r) }) }, nil
+		return r, func(ask *time.Duration) { once.Do(func() { rs.release(r, ask) }) }, nil
 	}
 }
 
-func (rs *runnerSet) release(r *runner) {
+// release ends a request's hold on r. Once nothing holds it, it stops after
+// the keep_alive its last request asked for, or the set's: never with
+// -speech keep for the models kept, nor with a keep_alive below zero or a
+// -keepalive of 0; at once with a keep_alive of 0.
+func (rs *runnerSet) release(r *runner, ask *time.Duration) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	r.inflight--
-	if r.inflight > 0 || rs.keep && rs.kept[r.path] || rs.keepAlive <= 0 || rs.byPath[r.path] != r {
+	r.used = time.Now()
+	if ask != nil {
+		r.ask = ask
+	}
+	if r.inflight > 0 || rs.keep && rs.kept[r.path] || rs.byPath[r.path] != r {
 		return
 	}
-	r.expiry = time.Now().Add(rs.keepAlive)
-	r.idle = time.AfterFunc(rs.keepAlive, func() { rs.retire(r) })
+	d := rs.keepAlive
+	if r.ask != nil {
+		d = *r.ask
+		if d == 0 {
+			go rs.retire(r)
+			return
+		}
+	}
+	if d <= 0 {
+		return
+	}
+	r.expiry = time.Now().Add(d)
+	r.idle = time.AfterFunc(d, func() { rs.retire(r) })
 }
 
 // retire stops r if it is still idle.
@@ -436,7 +479,11 @@ func (rs *runnerSet) retire(r *runner) {
 	}
 	delete(rs.byPath, r.path)
 	rs.mu.Unlock()
-	log.Printf("speech: %s idle for %v, its runner stopped", modelName(r.path), rs.keepAlive)
+	if r.ask != nil && *r.ask == 0 {
+		log.Printf("runner: %s stopped as asked (keep_alive 0)", modelName(r.path))
+	} else {
+		log.Printf("runner: %s idle, its runner stopped", modelName(r.path))
+	}
 	r.p.stop()
 }
 
@@ -477,6 +524,7 @@ func (rs *runnerSet) up(path string) bool {
 // runnerUp is a runner up, as /api/ps reports it.
 type runnerUp struct {
 	path   string
+	chat   bool
 	expiry time.Time // zero while it is in use
 }
 
@@ -489,7 +537,7 @@ func (rs *runnerSet) loaded() []runnerUp {
 		select {
 		case <-r.ready:
 			if r.err == nil && !r.p.exited() {
-				up := runnerUp{path: r.path}
+				up := runnerUp{path: r.path, chat: r.chat}
 				if r.inflight == 0 && r.idle != nil {
 					up.expiry = r.expiry
 				}
@@ -535,17 +583,21 @@ func logLine(line string) bool {
 // runnerArgs are a runner's serve flags: speech in its own process, the model
 // kept until the front server stops it, and the hand sizing a speech model on
 // llama.cpp wants (one slot of 16384 tokens, no prefix pool) — MLX's ignore
-// them.
-func runnerArgs(port string) []string {
-	return []string{"serve", "-addr", "127.0.0.1:" + port, "-speech", SpeechOff, "-keepalive", "0",
-		"-slots", "1", "-ctx", "16384", "-prefix", "off"}
+// them. A chat model's runner takes the front server's own sizing flags
+// instead (SetChatRunners).
+func (s *Server) runnerArgs(port string, chat bool) []string {
+	args := []string{"serve", "-addr", "127.0.0.1:" + port, "-speech", SpeechOff, "-keepalive", "0", "-runners=false"}
+	if chat {
+		return append(args, s.chatArgs...)
+	}
+	return append(args, "-slots", "1", "-ctx", "16384", "-prefix", "off")
 }
 
 // startRunner starts this binary as a runner for the model at path and waits
 // until it answers. It reads its stdin and exits when that closes, so it ends
 // with the front server however that ends. Its log goes to the front
 // server's, each line marked, once it is up.
-func (s *Server) startRunner(path string) (*proc, error) {
+func (s *Server) startRunner(path string, chat bool) (*proc, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -557,7 +609,7 @@ func (s *Server) startRunner(path string) (*proc, error) {
 	_, port, _ := net.SplitHostPort(l.Addr().String())
 	l.Close()
 
-	cmd := exec.Command(exe, runnerArgs(port)...)
+	cmd := exec.Command(exe, s.runnerArgs(port, chat)...)
 	cmd.Env = append(os.Environ(), "KINFER_RUNNER=1")
 	if os.Getenv("KINFER_TRANSLATE_URL") == "" && s.selfURL != "" {
 		cmd.Env = append(cmd.Env, "KINFER_TRANSLATE_URL="+s.selfURL) // translations by this server's chat model
@@ -595,7 +647,7 @@ func (s *Server) startRunner(path string) (*proc, error) {
 			}
 			tailMu.Unlock()
 			if up.Load() && logLine(line) {
-				log.Printf("speech %s: %s", name, line[len("2006/01/02 15:04:05 "):])
+				log.Printf("%s: %s", name, line[len("2006/01/02 15:04:05 "):])
 			}
 		}
 	}()
@@ -610,7 +662,7 @@ func (s *Server) startRunner(path string) (*proc, error) {
 		pw.Close()
 		<-lines
 		if up.Load() && !stopping.Load() {
-			log.Printf("speech: %s's runner ended (%v); what it said last:\n  %s", name, err, last())
+			log.Printf("runner: %s ended (%v); what it said last:\n  %s", name, err, last())
 		}
 		close(done)
 	}()
@@ -632,7 +684,8 @@ func (s *Server) startRunner(path string) (*proc, error) {
 		if resp, err := client.Get(p.base + "/api/version"); err == nil {
 			resp.Body.Close()
 			up.Store(true)
-			log.Printf("speech: %s's runner up on %s in %v", name, p.base, time.Since(t0).Round(time.Millisecond))
+			log.Printf("runner: %s up on %s in %v", name, p.base, time.Since(t0).Round(time.Millisecond))
+			s.load(p, path)
 			return p, nil
 		}
 		select {

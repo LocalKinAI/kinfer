@@ -620,6 +620,42 @@ SIGKILL each ending its runners within 4 s. Not yet: the speech models are not
 counted in the memory a chat model is sized against when they start after it,
 and chat models are still loaded in the server itself.
 
+## Every model in a process of its own
+
+`kinfer serve` loads no model itself. A chat or embedding request goes, by the
+model it names, to a runner of that model — this binary's `serve -runners=false`
+on a port of the loopback, with the sizing flags this server was given — as
+speech and pictures do. So:
+
+- A model that crashes takes only its runner down. A reply it was writing ends
+  with an error in its own format (`{"error": …, "done": true}` in Ollama's
+  stream, `data: {"error": …}` in OpenAI's), and the next request starts the
+  model again.
+- A model unloaded is a process ended: all its memory goes back, and none of a
+  model's state outlives it into the next load.
+- Before a runner starts, this server makes room on the GPU for its model,
+  from what the whole GPU has free (other programs' allocations included):
+  about the model's weights plus what it needs beside them. While that is
+  short it stops the runner unused longest that nothing is using — the default
+  speech models kept by `-speech keep` stay — and once none is left, waits up to
+  five minutes for one in use to finish. What it cannot free, the model's own
+  sizing makes do with. Two models that fit stay side by side; a chat model
+  sizes its context and prefix pool to the memory it finds, so a second one
+  usually stops the first, as one model at a time did before.
+- A request's `keep_alive` is kept here; 0 stops the runner once the request is
+  done, and a request with nothing in it and `keep_alive` 0 stops it at once.
+- `/api/ps` lists each runner's model as it reports itself, its context too;
+  `/metrics` gathers the runners', each line labelled with its model.
+
+`-runners=false` serves chat in this process, one model at a time, as v0.6.0
+did. Measured on the box: decode through a runner 94.6–104.1 tok/s against
+95.7–99.1 in-process (ornith-1.5, 200 tokens, three each); a runner killed
+with -9 mid-reply, the next request answered 2.3 s later; ten unloads and
+reloads, every reply right and no runner left behind. Making room, with the
+budget pretended at 45 GB (`KINFER_RUNNER_BUDGET`, for testing on a machine
+with room): ornith loaded; qwen3.8-27B stopped it; ornith asked for while
+qwen3.8 wrote a long reply waited, then stopped it; a picture stopped ornith.
+
 ## Text to speech, for a model that speaks
 
 `POST /v1/audio/speech`, as OpenAI has it, answered on a Mac by Qwen3-TTS

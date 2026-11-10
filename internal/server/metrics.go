@@ -97,7 +97,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	cur := s.cur
 	s.mu.Unlock()
 
-	if cur != nil {
+	if s.chatRunners {
+		b.WriteString(s.runnerMetrics())
+	} else if cur != nil {
 		waiting, busy, slots := cur.eng.Load()
 		metric("queue_depth", "Requests waiting for a slot.", "gauge", waiting, "")
 		metric("slots_busy", "Slots currently generating.", "gauge", busy, "")

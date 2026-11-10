@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Changed — every model in a process of its own
+
+`kinfer serve` now loads no model itself: a chat or embedding request goes, by
+the model it names, to a runner of that model — this binary's serve on the
+loopback, taking this server's own sizing flags — as speech and pictures
+already did. A model that crashes takes only its runner down, and the next
+request starts it again; one unloaded is a process ended, so all its memory
+comes back; and before a runner starts, this server makes room on the GPU for
+it, from what the whole GPU has free: it stops the runner unused longest that
+nothing is using (the default speech models kept with `-speech keep` stay),
+and once none is left waits up to five minutes for one in use to finish. A
+request's keep_alive is kept here; `keep_alive` 0 stops the runner. `/api/ps`
+and `/metrics` gather the runners'; a stream cut short by a runner's end ends
+with an error in its own format. `-runners=false` serves chat in this process,
+one model at a time, as v0.6.0 did.
+
+Measured on the box: the release regression through runners passed as
+v0.6.0's did, at the same speeds (ornith 98.7 tok/s, 0.5B 289.8); decode
+through a runner 94.6–104.1 tok/s against 95.7–99.1 in-process; a runner
+killed with -9 mid-reply answered by the next request 2.3 s later; ten unloads
+and reloads, every reply right and no runner left. With the budget pretended
+at 45 GB (`KINFER_RUNNER_BUDGET`, for testing): ornith in, then qwen3.8-27B
+stopping it; ornith asked for while qwen3.8 wrote a long reply waited for it,
+then stopped it; a picture stopped ornith. A chat model sizes its context and
+prefix pool to the memory it finds, so a second one usually stops the first,
+as one model at a time did before.
+
 ### Added — pictures, behind the same address
 
 `POST /v1/images/generations`, as OpenAI has it, on a Mac: Z-Image-Turbo

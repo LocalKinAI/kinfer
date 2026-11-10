@@ -39,7 +39,7 @@ type fakeRunners struct {
 	live    map[string]*proc
 }
 
-func (f *fakeRunners) start(path string) (*proc, error) {
+func (f *fakeRunners) start(path string, chat bool) (*proc, error) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		writeJSON(w, http.StatusOK, map[string]any{"runner": filepath.Base(path), "model": r.Header.Get(runnerHeader),

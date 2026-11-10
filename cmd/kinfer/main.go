@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +21,8 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/engine"
 	"github.com/LocalKinAI/kinfer/internal/hardware"
+	"github.com/LocalKinAI/kinfer/internal/llama"
+	"github.com/LocalKinAI/kinfer/internal/nativelib"
 	"github.com/LocalKinAI/kinfer/internal/server"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
@@ -424,6 +427,7 @@ type serveOpts struct {
 	speech          string
 	autoPull        bool
 	speechAddrs     map[string]string
+	runners         bool
 }
 
 // prefixFlag is -prefix: "auto", "off", or a number of pool entries. Its value
@@ -512,6 +516,40 @@ func (o *serveOpts) check() error {
 	return checkCacheType(o.kvCache)
 }
 
+// runnerFlags are the serve flags a chat model's runner takes from this
+// server's: all but the address, speech, keep-alive and runner ones, which
+// are this server's own.
+func runnerFlags(fs *flag.FlagSet, args []string) []string {
+	own := map[string]bool{"addr": true, "speech": true, "speech-addr": true, "auto-pull": true, "keepalive": true, "runners": true}
+	var out []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") || a == "-" || a == "--" {
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		inline := false
+		if k, _, ok := strings.Cut(name, "="); ok {
+			name, inline = k, true
+		}
+		takesNext := false
+		if f := fs.Lookup(name); f != nil && !inline {
+			b, isBool := f.Value.(interface{ IsBoolFlag() bool })
+			takesNext = !isBool || !b.IsBoolFlag()
+		}
+		if !own[name] {
+			out = append(out, a)
+			if takesNext && i+1 < len(args) {
+				out = append(out, args[i+1])
+			}
+		}
+		if takesNext {
+			i++
+		}
+	}
+	return out
+}
+
 // checkCacheType refuses a -kv-cache other than the two kinfer sizes for.
 func checkCacheType(v string) error {
 	if v != "q8_0" && v != "f16" {
@@ -541,6 +579,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.BoolVar(&o.place, "place", true, "when a mixture of experts does not fit the GPU, keep as many layers' experts in host memory as it must, with a GPU cache for the ones in use, unless -host-experts or -moe-cache say otherwise; with -peers and no -split, give the peers only the layers that do not fit here (false = load it whole, and let llama.cpp split by free memory)")
 	fs.StringVar(&o.speech, "speech", server.SpeechAuto, "speech behind this address: auto = a speech model starts in a process of its own on the first request for it and stops once idle as long as -keepalive; keep = the default speech models start with the server and stay; off = speech is served in this process, one model at a time with the rest")
 	fs.BoolVar(&o.autoPull, "auto-pull", true, "fetch this machine's default speech or picture model the first time one is asked for and is not here (Qwen3-ASR 2.5 GB, Qwen3-TTS 1.8 GB, Qwen3-TTS VoiceDesign 2.9 GB, Z-Image-Turbo 11.0 GB); the request is answered 503 with how far it has got (false = answer 404 saying what to pull)")
+	fs.BoolVar(&o.runners, "runners", true, "each model in a process of its own, as Ollama runs them: a model that crashes takes only its own down, one unloaded gives back all its memory, and before one starts the others nothing is using make room for it (false = chat models in this process, one at a time, as v0.6.0)")
 	fs.Func("speech-addr", "also answer one kind of speech at an address of its own, in the Python audio service's API (/transcribe, /synthesize, /voices) as well as OpenAI's, the model this server chooses for the kind: kind=address pairs, comma-separated, the kinds asr, tts and design (Qwen3-TTS VoiceDesign, a voice told in words) — asr=:8100,tts=:8101,design=:8102 takes the box's old ports (default none)", func(v string) (err error) {
 		o.speechAddrs, err = server.ParseSpeechAddrs(v)
 		return err
@@ -597,6 +636,16 @@ func cmdServe(args []string) error {
 	if runner {
 		srv.SetRunner()
 	}
+	if o.runners && !runner {
+		srv.SetChatRunners(runnerFlags(fs, args))
+		// This server loads no model, but reads what the GPU has free to make
+		// room for the ones its runners load: llama.cpp's devices tell it.
+		if dir, err := nativelib.Prepare(); err != nil {
+			log.Printf("runners: llama.cpp is not here (%v); runners start without room made for them", err)
+		} else if err := llama.Bind(dir); err != nil {
+			log.Printf("runners: llama.cpp did not bind (%v); runners start without room made for them", err)
+		}
+	}
 	defer srv.Close()
 
 	models, _ := st.List()
@@ -621,6 +670,9 @@ func cmdServe(args []string) error {
 	fmt.Printf("  Responses  : POST %s/v1/responses         (Codex)\n", o.addr)
 	fmt.Printf("  Speech     : POST %s/v1/audio/transcriptions   %s/v1/audio/speech\n", o.addr, o.addr)
 	fmt.Printf("  Pictures   : POST %s/v1/images/generations\n", o.addr)
+	if o.runners && !runner {
+		fmt.Printf("  Models     : each in a process of its own, room made for each as it loads (-runners=false: chat in this one)\n")
+	}
 	switch o.speech {
 	case server.SpeechAuto:
 		fmt.Printf("               each speech model in a process of its own, on first use, stopped once idle")

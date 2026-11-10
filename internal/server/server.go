@@ -85,6 +85,8 @@ type Server struct {
 	speechDefaults []SpeechModel
 	speechAddrs    map[string]string // kind → the extra address answering it (legacy.go)
 	runners        *runnerSet
+	chatRunners    bool     // chat and embedding models in runners too (chatrunners.go)
+	chatArgs       []string // the serve flags a chat model's runner takes
 	pulls          *pullSet
 }
 
@@ -174,36 +176,49 @@ func (s *Server) SetKeepAlive(d time.Duration) { s.keepAlive, s.runners.keepAliv
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	// With chat runners, the chat dialects' endpoints go to the runner of the
+	// model a request names (chatrunners.go); this server loads none itself.
+	chat := func(endpoint string, here http.HandlerFunc) http.HandlerFunc {
+		if s.chatRunners {
+			return s.proxyChat(endpoint)
+		}
+		return here
+	}
+	show, props := s.handleShow, s.handleProps
+	if s.chatRunners {
+		show, props = s.handleShowRunners, s.handlePropsRunners
+	}
+
 	// Ollama dialect.
-	mux.HandleFunc("/api/chat", s.handleOllamaChat)
-	mux.HandleFunc("/api/generate", s.handleOllamaGenerate)
+	mux.HandleFunc("/api/chat", chat("/api/chat", s.handleOllamaChat))
+	mux.HandleFunc("/api/generate", chat("/api/generate", s.handleOllamaGenerate))
 	mux.HandleFunc("/api/tags", s.handleOllamaTags)
 	mux.HandleFunc("/api/ps", s.handlePS)
-	mux.HandleFunc("/api/show", s.handleShow)
-	mux.HandleFunc("/props", s.handleProps)
+	mux.HandleFunc("/api/show", show)
+	mux.HandleFunc("/props", props)
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"version": Version})
 	})
 
 	// OpenAI dialect.
-	mux.HandleFunc("/api/embed", s.handleOllamaEmbed)
-	mux.HandleFunc("/api/embeddings", s.handleOllamaEmbeddings)
-	mux.HandleFunc("/v1/embeddings", s.handleOpenAIEmbeddings)
-	mux.HandleFunc("/v1/chat/completions", s.handleOpenAIChat)
+	mux.HandleFunc("/api/embed", chat("/api/embed", s.handleOllamaEmbed))
+	mux.HandleFunc("/api/embeddings", chat("/api/embeddings", s.handleOllamaEmbeddings))
+	mux.HandleFunc("/v1/embeddings", chat("/v1/embeddings", s.handleOpenAIEmbeddings))
+	mux.HandleFunc("/v1/chat/completions", chat("/v1/chat/completions", s.handleOpenAIChat))
 	mux.HandleFunc("/v1/models", s.handleOpenAIModels)
 
 	// The dialects coding agents speak: Anthropic's Messages API for Claude
 	// Code, OpenAI's Responses API for Codex. Same engine, same split of thinking
 	// from prose from calls — two more ways of writing it down.
-	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
-	mux.HandleFunc("/v1/messages/count_tokens", s.handleAnthropicCountTokens)
+	mux.HandleFunc("/v1/messages", chat("/v1/messages", s.handleAnthropicMessages))
+	mux.HandleFunc("/v1/messages/count_tokens", chat("/v1/messages/count_tokens", s.handleAnthropicCountTokens))
 	// Claude Code's first request to a server: HEAD /api/hello, to see that
 	// one answers. It was a 404, counted as a rejected request every session.
 	mux.HandleFunc("/api/hello", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("/v1/models/", s.handleModel)
-	mux.HandleFunc("/v1/responses", s.handleResponses)
+	mux.HandleFunc("/v1/responses", chat("/v1/responses", s.handleResponses))
 	mux.HandleFunc("/v1/audio/transcriptions", s.handleTranscription) // transcribe.go
 	mux.HandleFunc("/v1/audio/translations", s.handleTranslation)     // transcribe.go
 	mux.HandleFunc("/v1/audio/speech", s.handleSpeech)                // speech.go
@@ -877,11 +892,16 @@ func (s *Server) handlePS(w http.ResponseWriter, r *http.Request) {
 		held = append(held, resident{s.emb.path, s.embExpiry, 0, 0, 0})
 	}
 	s.mu.Unlock()
-	for _, r := range s.runners.loaded() { // speech models, each in its runner
-		held = append(held, resident{path: r.path, expiry: r.expiry})
+	for _, r := range s.runners.loaded() { // speech and picture models, each in its runner
+		if !r.chat {
+			held = append(held, resident{path: r.path, expiry: r.expiry})
+		}
 	}
 
-	loaded := []entry{}
+	loaded := []any{}
+	for _, m := range s.runnerPS() { // chat models, each in its runner
+		loaded = append(loaded, m)
+	}
 	for _, h := range held {
 		path, expiry, lazy := h.path, h.expiry, h.lazy
 		e := entry{Name: modelName(path), Model: modelName(path), ContextLength: h.ctx, ContextMax: h.most}
