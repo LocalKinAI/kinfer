@@ -283,9 +283,12 @@ func (d DevicePlacement) Split(n int) []float32 {
 
 // peerReserve is what placement keeps free on a peer: the activations of a
 // pass of ubatch tokens (the logits are computed here) and the headroom —
-// a peer is someone's machine.
+// a peer is someone's machine. The activations count twice: a pass of 4096
+// tokens of DeepSeek-V4.1 took 4.6 GiB on a peer where once says 2.7, and a
+// MacBook Pro given the layer that left it short paged its GPU every token,
+// 4 tok/s against 20.
 func peerReserve(sh store.Shape, ubatch int) uint64 {
-	return uint64(ubatch)*4*uint64(32*sh.EmbedDim) + thinHeadroom
+	return 2*uint64(ubatch)*4*uint64(32*sh.EmbedDim) + thinHeadroom
 }
 
 // placeAcross is the placement Open loads a model with across devs — the

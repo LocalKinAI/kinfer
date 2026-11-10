@@ -257,3 +257,13 @@ func TestPlaceDevicesPutsTheRestInHostMemoryHere(t *testing.T) {
 }
 
 func gibOf(f float64) int64 { return int64(f * float64(gibi)) }
+
+// A pass of 4096 tokens of DeepSeek-V4.1 took 4,628 MiB of a peer's GPU. A
+// MacBook Pro given a layer more than left room for that paged its GPU every
+// token.
+func TestPeerReserveHoldsAMeasuredPass(t *testing.T) {
+	got := peerReserve(store.Shape{EmbedDim: 5120}, 4096)
+	if need := uint64(4628)<<20 + thinHeadroom; got < need {
+		t.Errorf("a peer keeps %s, and a pass and the headroom took %s", gib(got), gib(need))
+	}
+}

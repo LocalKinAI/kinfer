@@ -32,7 +32,7 @@
 # given the memory its machine's other apps hold. Metal compiles the kernels at
 # the language version a current SDK gets, also for a kinfer built without cgo,
 # which would otherwise get Metal 2.4 and lose the bfloat kernels. The libraries
-# land in internal/nativelib/libs/darwin_arm64_${VERSION}k7, which replaces the
+# land in internal/nativelib/libs/darwin_arm64_${VERSION}k8, which replaces the
 # release set the way one release replaces another (see fetch-libs.sh).
 #
 # Needs cmake, ninja and Xcode's command line tools; about two minutes on an M4.
@@ -41,7 +41,7 @@
 set -euo pipefail
 
 VERSION=b11998 # the release the patches are made against
-LEVEL=k7       # bumped when the patches change, so a cached copy is not reused
+LEVEL=k8       # bumped when the patches change, so a cached copy is not reused
 SRC=""
 for arg in "$@"; do
   case "$arg" in

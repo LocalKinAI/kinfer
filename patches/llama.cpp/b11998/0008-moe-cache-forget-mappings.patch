@@ -1,0 +1,25 @@
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -59,6 +59,14 @@
+         return *res;
+     }
+ 
++    // a model that was unloaded took its mappings with it, and the next load's files land at other addresses, where
++    // a region kept from the last one would send a read to the wrong place in the file; every new cache starts over
++    // and looks up what it reads, and a read under way keeps the region it found and the files, which stay open
++    void forget() {
++        std::lock_guard<std::mutex> lock(mutex);
++        regions.clear();
++    }
++
+     // the region of p, or one of size bytes that is not read from a file if p is in none
+     region find(const void * p, size_t size) {
+         const uintptr_t a = (uintptr_t) p;
+@@ -762,6 +770,7 @@
+ 
+     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
++        moe_cache_files::get().forget();
+         for (size_t i = 0; i < backends.size(); ++i) {
+             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
