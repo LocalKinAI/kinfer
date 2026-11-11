@@ -10,11 +10,13 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -88,6 +90,16 @@ type Store struct {
 	// who asked about a path, and would make a test depend on whatever the
 	// machine running it happens to have installed.
 	borrow bool
+
+	// listed is All's last answer, kept for as long as what it was read
+	// from is as it was (print). Reading it again means every Ollama manifest
+	// and every model directory: 11 ms on the box, asked on every request —
+	// twice when the request goes through the front server to a runner.
+	mu     sync.Mutex
+	listed []Model
+	parts  []Unfinished // what Unfinished found, read with listed
+	print  uint64
+	ollama string // Ollama's store, as last found
 }
 
 // Open returns the store at ~/.kinfer/models, creating it if needed.
@@ -202,6 +214,106 @@ func (s *Store) List() ([]Model, error) {
 // on this machine. A name present in both belongs to kinfer's copy — that is
 // the one someone put there deliberately.
 func (s *Store) All() ([]Model, error) {
+	models, _, err := s.snapshot()
+	return models, err
+}
+
+// snapshot is All's answer and the pulls left unfinished, read afresh only
+// when the fingerprint of what they are read from has changed.
+func (s *Store) snapshot() ([]Model, []Unfinished, error) {
+	print := s.fingerprint() // before reading: a change made meanwhile shows next time
+	s.mu.Lock()
+	if s.listed != nil && s.print == print {
+		models, parts := append([]Model(nil), s.listed...), append([]Unfinished(nil), s.parts...)
+		s.mu.Unlock()
+		return models, parts, nil
+	}
+	s.mu.Unlock()
+	models, err := s.all()
+	if err != nil {
+		return nil, nil, err
+	}
+	parts, _ := s.Unfinished()
+	s.mu.Lock()
+	s.listed, s.parts, s.print = append([]Model(nil), models...), append([]Unfinished(nil), parts...), print
+	listings++
+	s.mu.Unlock()
+	return models, parts, nil
+}
+
+// listings counts the times All read the models afresh, for its tests; it is
+// written with a store's mu held.
+var listings int
+
+// forget drops All's kept answer; it reports whether there was one.
+func (s *Store) forget() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	had := s.listed != nil
+	s.listed = nil
+	return had
+}
+
+// fingerprint is a hash of what All reads the models from, without reading
+// inside any file: the name, size and modification time of the store, of each
+// thing in it and in each of its model directories, and of every directory and
+// manifest under Ollama's manifests. A model added, removed, replaced or pulled
+// again changes one of them.
+func (s *Store) fingerprint() uint64 {
+	h := fnv.New64a()
+	add := func(path string) os.FileInfo {
+		fi, err := os.Stat(path) // through a link, as List reads it
+		if err != nil {
+			fmt.Fprintf(h, "%s|-\n", path)
+			return nil
+		}
+		fmt.Fprintf(h, "%s|%d|%d\n", path, fi.Size(), fi.ModTime().UnixNano())
+		return fi
+	}
+	add(s.root)
+	if entries, err := os.ReadDir(s.root); err == nil {
+		for _, e := range entries {
+			p := filepath.Join(s.root, e.Name())
+			if fi := add(p); fi != nil && fi.IsDir() {
+				if inside, err := os.ReadDir(p); err == nil { // whether it is complete
+					for _, f := range inside {
+						add(filepath.Join(p, f.Name()))
+					}
+				}
+			}
+		}
+	}
+	if s.borrow {
+		if root := s.ollamaRoot(); root != "" {
+			fmt.Fprintf(h, "ollama %s\n", root)
+			filepath.WalkDir(filepath.Join(root, "manifests"), func(p string, d os.DirEntry, err error) error {
+				if err == nil {
+					add(p)
+				}
+				return nil
+			})
+		}
+	}
+	return h.Sum64()
+}
+
+// ollamaRoot is Ollama's store as last found, while it is still there:
+// finding it counts the blobs of each candidate.
+func (s *Store) ollamaRoot() string {
+	s.mu.Lock()
+	root := s.ollama
+	s.mu.Unlock()
+	if root != "" && hasBlobs(root) {
+		return root
+	}
+	root = ollamaRoot()
+	s.mu.Lock()
+	s.ollama = root
+	s.mu.Unlock()
+	return root
+}
+
+func (s *Store) all() ([]Model, error) {
 	own, err := s.List()
 	if err != nil {
 		return nil, err
@@ -269,6 +381,19 @@ func (s *Store) Lookup(name string) (Model, error) {
 }
 
 func (s *Store) Resolve(name string) (string, error) {
+	path, err := s.resolve(name)
+	if err == nil && path != name {
+		// A listing kept from before, of a file gone since without a sign
+		// in what the fingerprint looks at (a blob of Ollama's pruned): read
+		// the models again.
+		if _, serr := os.Stat(path); serr != nil && s.forget() {
+			return s.resolve(name)
+		}
+	}
+	return path, err
+}
+
+func (s *Store) resolve(name string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("no model specified")
 	}
@@ -280,7 +405,7 @@ func (s *Store) Resolve(name string) (string, error) {
 		}
 	}
 
-	models, err := s.All()
+	models, parts, err := s.snapshot()
 	if err != nil {
 		return "", err
 	}
@@ -292,7 +417,7 @@ func (s *Store) Resolve(name string) (string, error) {
 			return m.Path, nil
 		}
 	}
-	if u, ok := s.unfinished(name); ok && u.Name == name {
+	if u, ok := findUnfinished(parts, name); ok && u.Name == name {
 		return "", fmt.Errorf("%s has not finished arriving — the kinfer pull that fetched it goes on when run again", u.Name)
 	}
 	lower := strings.ToLower(name)
@@ -320,7 +445,7 @@ func (s *Store) Resolve(name string) (string, error) {
 
 	// The exact name of a model a pull has not finished means that model, not
 	// another the name is the start of.
-	if u, ok := s.unfinished(name); ok {
+	if u, ok := findUnfinished(parts, name); ok {
 		return "", fmt.Errorf("%s has not finished arriving — the kinfer pull that fetched it goes on when run again", u.Name)
 	}
 
@@ -545,6 +670,12 @@ func (s *Store) Unfinished() ([]Unfinished, error) {
 // unfinished finds an unfinished model by its name, exactly that name first.
 func (s *Store) unfinished(name string) (Unfinished, bool) {
 	all, _ := s.Unfinished()
+	return findUnfinished(all, name)
+}
+
+// findUnfinished is the unfinished pull of name in all: exactly the name, or
+// the name but for case.
+func findUnfinished(all []Unfinished, name string) (Unfinished, bool) {
 	for _, u := range all {
 		if u.Name == name {
 			return u, true

@@ -889,3 +889,89 @@ func TestListDiffusionDir(t *testing.T) {
 		t.Errorf("a transformer missing a piece is listed: %v", models)
 	}
 }
+
+// All reads the models once and answers from what it read until the store
+// changes: a model added, replaced or removed, here or in Ollama's manifests.
+func TestAllKeepsItsListingUntilSomethingChanges(t *testing.T) {
+	s := newStore(t, "a.gguf")
+	ollama := t.TempDir()
+	t.Setenv("OLLAMA_MODELS", ollama)
+	s.borrow = true
+	write := func(path string, b []byte) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blob := func(name string) { // a weight file, as Ollama's store is told by: over 1 MiB
+		t.Helper()
+		write(filepath.Join(ollama, "blobs", name), []byte("GGUF"))
+		if err := os.Truncate(filepath.Join(ollama, "blobs", name), 2<<20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := func(digest string) []byte {
+		return []byte(`{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"` + digest + `","size":4}]}`)
+	}
+	blob("sha256-aa")
+	write(filepath.Join(ollama, "manifests", "registry.ollama.ai", "library", "foo", "latest"), manifest("sha256:aa"))
+	names := func() string {
+		t.Helper()
+		ms, err := s.All()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n []string
+		for _, m := range ms {
+			n = append(n, m.Name)
+		}
+		sort.Strings(n)
+		return strings.Join(n, " ")
+	}
+	step := func(what, want string, read bool) {
+		t.Helper()
+		before := listings
+		if got := names(); got != want {
+			t.Errorf("%s: %q, want %q", what, got, want)
+		}
+		if again := listings != before; again != read {
+			t.Errorf("%s: read afresh %v, want %v", what, again, read)
+		}
+	}
+	step("first", "a foo:latest", true)
+	step("nothing changed", "a foo:latest", false)
+	if p, err := s.Resolve("foo"); err != nil || filepath.Base(p) != "sha256-aa" {
+		t.Errorf("foo resolved to %q, %v", p, err)
+	}
+	step("after Resolve", "a foo:latest", false)
+
+	write(filepath.Join(s.Root(), "b.gguf"), []byte("GGUF"))
+	step("a model added", "a b foo:latest", true)
+	write(filepath.Join(s.Root(), "a.gguf"), []byte("GGUF, longer now"))
+	step("a model replaced", "a b foo:latest", true)
+	os.Remove(filepath.Join(s.Root(), "b.gguf"))
+	step("a model removed", "a foo:latest", true)
+
+	blob("sha256-bb")
+	write(filepath.Join(ollama, "manifests", "registry.ollama.ai", "library", "bar", "1b"), manifest("sha256:bb"))
+	step("pulled into Ollama", "a bar:1b foo:latest", true)
+	write(filepath.Join(ollama, "manifests", "registry.ollama.ai", "library", "foo", "latest"), manifest("sha256:bb"))
+	if p, _ := s.Resolve("foo:latest"); filepath.Base(p) != "sha256-bb" {
+		t.Errorf("foo pulled again resolved to %q", p)
+	}
+	os.RemoveAll(filepath.Join(ollama, "manifests", "registry.ollama.ai", "library", "bar"))
+	step("removed from Ollama", "a foo:latest", true)
+
+	// A blob gone with its manifest left as it was: what Resolve finds is
+	// looked at, and the models read again.
+	names()
+	os.Remove(filepath.Join(ollama, "blobs", "sha256-bb"))
+	before := listings
+	s.Resolve("foo:latest")
+	if listings == before {
+		t.Error("a resolved file gone: the models were not read again")
+	}
+}

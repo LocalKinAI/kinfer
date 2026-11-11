@@ -2,6 +2,21 @@
 
 ## v0.8.0 — unreleased
 
+### Faster — a model's name is found once
+
+Every request looked its model up by listing every model there is: kinfer's
+own and every manifest of Ollama's, 11 ms on the box. With every model in a
+runner since v0.7.0 it was done twice, by the front and by the runner, and a
+short question took 30 ms where v0.6.0 took 18.
+
+- The list is kept, with a hash of what it was read from: the name, size and
+  time of each file and folder of kinfer's store and of Ollama's manifests,
+  nothing read inside them. When the hash is the same, the list is used as it
+  is; when anything was added, replaced or removed, it is read again.
+- A name is found in 0.6 ms. On the box, a short question through the front
+  now takes 6.6 ms to its first word (it took 29.8), and one embedding 14 ms
+  (it took 39).
+
 ### Added — the machine's other programs, under one manager
 
 On the box, beside kinfer, ComfyUI, a talking face and a navigation model held
