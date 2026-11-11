@@ -203,6 +203,13 @@ func linear(x mlx.Array, w Linear) mlx.Array {
 	return mlx.Matmul(x, mlx.T(w.W))
 }
 
+// Apply is x @ l.T, for a package that loads weights of its own
+// (mlxembed): plain, MLX-quantized or NVFP4 alike.
+func (l Linear) Apply(x mlx.Array) mlx.Array { return linear(x, l) }
+
+// Rows is rows, for the same.
+func (l Linear) Rows(ids mlx.Array) mlx.Array { return l.rows(ids) }
+
 // rows looks up rows of w, as an embedding: ids [B, L] → [B, L, in].
 func (l Linear) rows(ids mlx.Array) mlx.Array {
 	if !l.quantized() {

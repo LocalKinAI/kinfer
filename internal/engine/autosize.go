@@ -47,6 +47,12 @@ import (
 // was refused. A model trained for less is floored at what it was trained for.
 const ctxFloor = 32768
 
+// poolCtxMin is as far as a slot's context is halved to keep the prefix pool's
+// last entry (see the sizing loop in Open). Half of ctxFloor: a longer prompt
+// still gets a longer slot from flex while it runs, at the cost of the slots it
+// takes from the others.
+const poolCtxMin = ctxFloor / 2
+
 // Plan is what serve runs with.
 type Plan struct {
 	Slots, Prefix, PerSeq int

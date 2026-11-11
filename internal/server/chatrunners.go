@@ -21,6 +21,7 @@ import (
 
 	"github.com/LocalKinAI/kinfer/internal/llama"
 	"github.com/LocalKinAI/kinfer/internal/mlxasr"
+	"github.com/LocalKinAI/kinfer/internal/mlxembed"
 	"github.com/LocalKinAI/kinfer/internal/mlximage"
 	"github.com/LocalKinAI/kinfer/internal/mlxtts"
 )
@@ -135,7 +136,7 @@ func (s *Server) need(path string) uint64 {
 	switch {
 	case mlximage.IsModelDir(path):
 		extra = 8 << 30
-	case mlxtts.IsModelDir(path), mlxasr.IsModelDir(path):
+	case mlxtts.IsModelDir(path), mlxasr.IsModelDir(path), mlxembed.IsModelDir(path):
 		extra = 1 << 30
 	}
 	return uint64(weights + extra)
@@ -258,6 +259,7 @@ func (rs *runnerSet) stopNow(r *runner) {
 // with nothing to say — and reports whether there was one.
 func (rs *runnerSet) stopPath(path string) bool {
 	rs.mu.Lock()
+	path = rs.same(path)
 	r := rs.byPath[path]
 	rs.mu.Unlock()
 	if r == nil {
@@ -291,7 +293,7 @@ func (rs *runnerSet) stopPath(path string) bool {
 func (rs *runnerSet) upRunner(path string) *runner {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	r := rs.byPath[path]
+	r := rs.byPath[rs.same(path)]
 	if r == nil {
 		return nil
 	}

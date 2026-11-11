@@ -375,6 +375,32 @@ type runnerSet struct {
 	starting sync.Mutex
 }
 
+// same is the path of a runner already there for the file path names, under
+// another name, or path. One file has more than one name: Ollama's
+// ornith-1.5:35b is a blob in its store, and kinfer's ornith-1.5-35b a link to
+// that blob; the swarm asked for one and kinhome for the other, and two
+// runners of one file hold its weights and caches twice. Called with rs.mu.
+func (rs *runnerSet) same(path string) string {
+	if _, ok := rs.byPath[path]; ok {
+		return path
+	}
+	real := realPath(path)
+	for k := range rs.byPath {
+		if realPath(k) == real {
+			return k
+		}
+	}
+	return path
+}
+
+// realPath is path with its links followed, or path when they cannot be.
+func realPath(path string) string {
+	if r, err := filepath.EvalSymlinks(path); err == nil {
+		return r
+	}
+	return path
+}
+
 // acquire is the runner for path, started if it must be; release ends the
 // request's hold on it.
 func (rs *runnerSet) acquire(path string) (*runner, func(), error) {
@@ -389,6 +415,7 @@ func (rs *runnerSet) acquire(path string) (*runner, func(), error) {
 // not; its release takes the keep_alive the request asked for, or nil.
 func (rs *runnerSet) acquireAs(path string, chat bool) (*runner, func(ask *time.Duration), error) {
 	rs.mu.Lock()
+	path = rs.same(path)
 	for {
 		if rs.closed {
 			rs.mu.Unlock()
@@ -509,7 +536,7 @@ func (rs *runnerSet) watch(r *runner) {
 func (rs *runnerSet) up(path string) bool {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	r := rs.byPath[path]
+	r := rs.byPath[rs.same(path)]
 	if r == nil {
 		return false
 	}

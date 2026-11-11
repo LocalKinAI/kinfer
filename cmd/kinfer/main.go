@@ -83,6 +83,10 @@ func main() {
 		os.Setenv("GGML_METAL_FREE_DEVICE", "1")
 	}
 
+	if v := strings.TrimPrefix(version, "v"); v != "dev" {
+		server.Version = v
+	}
+
 	var err error
 	switch os.Args[1] {
 	case "version", "-version", "--version":
@@ -710,9 +714,15 @@ func cmdServe(args []string) error {
 		go func() { io.Copy(io.Discard, os.Stdin); stop() }()
 	}
 
+	// Closed the orderly way: see server.OrderlyListener for the replies the
+	// box lost when they were not.
+	l, err := net.Listen("tcp", o.addr)
+	if err != nil {
+		return err
+	}
 	errCh := make(chan error, 1)
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(server.OrderlyListener(l)); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 	}()

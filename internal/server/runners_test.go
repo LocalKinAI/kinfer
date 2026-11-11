@@ -241,3 +241,55 @@ func TestRunnerTakesTheChosenModel(t *testing.T) {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
 }
+
+// Two names of one file — Ollama's blob and kinfer's link to it — share one
+// runner: started once, stopped by either name.
+func TestOneRunnerForOneFileUnderTwoNames(t *testing.T) {
+	dir := t.TempDir()
+	blob := filepath.Join(dir, "sha256-aaeb")
+	if err := os.WriteFile(blob, []byte("gguf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "ornith-1.5-35b.gguf")
+	if err := os.Symlink(blob, link); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	started := 0
+	rs := &runnerSet{byPath: map[string]*runner{}, keepAlive: time.Hour, start: func(path string, chat bool) (*proc, error) {
+		mu.Lock()
+		started++
+		mu.Unlock()
+		done := make(chan struct{})
+		var once sync.Once
+		return &proc{base: "http://127.0.0.1:1", done: done, stop: func() { once.Do(func() { close(done) }) }}, nil
+	}}
+	a, releaseA, err := rs.acquireAs(link, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, releaseB, err := rs.acquireAs(blob, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b || started != 1 {
+		t.Fatalf("two runners (%p, %p), started %d times; want one", a, b, started)
+	}
+	if !rs.up(blob) || rs.upRunner(blob) != a {
+		t.Error("the runner is not found by the other name")
+	}
+	releaseA(nil)
+	releaseB(nil)
+	if !rs.stopPath(blob) || rs.up(link) {
+		t.Error("stopping by the other name left the runner up")
+	}
+	// A file of its own still gets a runner of its own.
+	other := filepath.Join(dir, "other.gguf")
+	os.WriteFile(other, []byte("gguf"), 0o644)
+	if c, release, err := rs.acquireAs(other, true); err != nil || c == a {
+		t.Fatalf("another file: %v, same runner %v", err, c == a)
+	} else {
+		release(nil)
+	}
+	rs.close()
+}

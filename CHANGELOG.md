@@ -1,5 +1,101 @@
 # Changelog
 
+## v0.7.1 — 2026-11-11
+
+What kinhome's test home found running on the box for a night, put right.
+
+The regression ran through runners on both machines, built as a release is:
+
+- **Box:** all six models (the 0.5B, ornith, qwen3.8-27B as GGUF and on MLX,
+  Flash-Next, V4.1), and V4.1 split with the laptop's worker over Thunderbolt.
+- **Laptop:** four models (ornith, qwen3.8-27B on MLX, Flash-Next, V4.1).
+- **Everywhere, the same checks:** a reply, the same after a reload, 4 at once
+  and 16 at once, a tool call, and all four dialects.
+- **Other paths:** room made for a picture, a runner killed mid-reply, `kinfer
+  run` (daemon and `-local`), `kinfer launch claude` and `codex`.
+
+Every check passed but one already known: a Responses reply cut at a short
+token limit, which completes at 700. Against v0.7.0 on the laptop, back to
+back, the replies were the same and so were the speeds: ornith 3,280 tok/s on a
+7,470-token prompt and 136 decoding; Flash-Next 903–987 and 13.7–17.0, as before.
+
+Not run:
+- the laptop borrowing the box as a worker;
+- the new sizing step on a GPU as short of memory as on the night it was found:
+  the box had more room this time, and that step is covered by unit tests;
+- Linux and Windows beyond building.
+
+The one-model-one-runner fix came after the regression; it was tested on its
+own.
+
+### Fixed — tool calls written back without their arguments
+
+A client in OpenAI's dialect sends an earlier turn's call back with its
+arguments as a string holding the object. kinfer wrote such calls into the
+prompt of a model of the `<function=…>` kind — ornith, Flash-Next — with no
+parameters at all, and the model, seeing its own earlier calls empty, wrote its
+next ones empty too: `remind {}`, the largest cause of ornith's failures in
+kinhome's test home. The string is read now (as V4.1's markup already did), and
+the parameters are written in the order they came: read through a map they had
+come out in a different order on every turn, so a prompt no longer repeated the
+one before it token for token. On the laptop, twelve of the test home's kept
+requests sent three times each: v0.7.0 answered with 31 calls, 22 of them
+empty; v0.7.1 with 28, none empty that needed arguments.
+
+### Fixed — a hybrid model beside another gave up its whole prefix pool
+
+On the box, qwen3.8-27B loaded beside ornith with the service's `-slots 4` had
+too little memory for its pool and gave the last entry up to keep four slots of
+32,768 tokens. A model with recurrent state reuses nothing without one, so each
+of the test home's 13,000-token turns was read whole again: 43–50 s to a first
+token, where ornith's took 0.4. Now the context is halved first (not below
+16,384 a slot; a longer prompt still gets a longer slot while it runs), and the
+pool keeps its last entry.
+
+### Fixed — replies lost on the box to clients that ask Connection: close
+
+Python's urllib asks every server to close the connection after its reply, and
+on the box most of those replies never arrived: six of eight of the test home's
+requests sent from the mini came back as `RemoteDisconnected`, and the server
+logged nothing. Ollama on the box lost them the same way, and nothing was lost
+from the box's own processes or on the other Macs; the box runs network filters
+of its own, which drop a reply whose connection is closed the moment it is
+written. kinfer's addresses now close a connection the orderly way, its writing
+half first, then the socket once the client has closed its own: 0 of 10 lost
+through urllib after, 20 of 20 answered for curl told to close.
+
+### Added — EmbeddingGemma 2
+
+`embeddinggemma-2` from Ollama's library is safetensors in NVFP4, not a GGUF,
+and kinfer listed it and could not load it. It is served now on MLX
+(internal/mlxembed, after Ollama's own): Gemma 4's text stack read both ways,
+per-layer inputs, mean pooling, length 1; up to 8,192 tokens; text only, not
+the pictures and sound the release can also embed. Its SentencePiece-style
+tokenizer is read too (internal/tokenizer), and gave the tokenizers library's
+ids on all of 25 test texts. Measured on the box against Ollama: cosine 0.99994
+on average and 0.99979 at worst over eleven texts, the same 1,192 tokens, and
+the same nearest neighbours; 0.19 s for the eleven where Ollama took 0.32.
+
+### Fixed — one model file, one runner, whatever it is called
+
+A model often has two names here: Ollama's (`ornith-1.5:35b`, a blob in its
+store) and kinfer's own (`ornith-1.5-35b`, a link to that blob). A runner was
+started for each name, so the swarm, which asked for one, and kinhome, which
+asked for the other, would have held the same weights twice. A request now goes
+to the runner already up for the same file under either name; each reply still
+says the name it was asked by. On the box: the two names asked for in turn,
+three times, one runner.
+
+### Fixed — /api/version
+
+It reports the release (`0.7.1`); it had said 0.2.0 since v0.2.0.
+
+### Known
+
+A prompt longer than one slot's context runs in a layout of fewer, longer slots,
+and those have no prefix pool: on the laptop with `-slots 4` (8,192 tokens a
+slot) the test home's 12,900-token requests reused nothing.
+
 ## v0.7.0 — 2026-11-10
 
 ### Changed — every model in a process of its own
@@ -18,8 +114,10 @@ and `/metrics` gather the runners'; a stream cut short by a runner's end ends
 with an error in its own format. `-runners=false` serves chat in this process,
 one model at a time, as v0.6.0 did.
 
-Measured on the box: the release regression through runners passed as
-v0.6.0's did, at the same speeds (ornith 98.7 tok/s, 0.5B 289.8); decode
+Measured on the box: the regression through runners passed on four of the six
+models v0.6.0's was run with there (the 0.5B, ornith, and qwen3.8-27B as GGUF
+and on MLX; not Flash-Next or V4.1, nor the two-machine split), at the same
+speeds (ornith 98.7 tok/s, 0.5B 289.8); decode
 through a runner 94.6–104.1 tok/s against 95.7–99.1 in-process; a runner
 killed with -9 mid-reply answered by the next request 2.3 s later; ten unloads
 and reloads, every reply right and no runner left. With the budget pretended

@@ -28,6 +28,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/chat"
 	"github.com/LocalKinAI/kinfer/internal/engine"
 	"github.com/LocalKinAI/kinfer/internal/mlxasr"
+	"github.com/LocalKinAI/kinfer/internal/mlxembed"
 	"github.com/LocalKinAI/kinfer/internal/mlxengine"
 	"github.com/LocalKinAI/kinfer/internal/mlximage"
 	"github.com/LocalKinAI/kinfer/internal/mlxtts"
@@ -90,12 +91,15 @@ type Server struct {
 	pulls          *pullSet
 }
 
-// Version is reported by /api/version.
+// Version is reported by /api/version: the release this binary was built as,
+// without its "v", set by main from the version release.sh stamps in. A build
+// from a checkout says 0.0.0, as Ollama's own does.
 //
 // It has to parse as a version: Ollama clients compare this string to decide
 // which features to use, and a value like "kinfer" fails that comparison
-// silently, disabling capabilities rather than reporting anything.
-const Version = "0.2.0"
+// silently, disabling capabilities rather than reporting anything. It was a
+// constant once, and stayed "0.2.0" through v0.7.0.
+var Version = "0.0.0"
 
 // lease is one loaded model plus the number of users holding it: every
 // in-flight request, plus one for the server itself while the model is
@@ -372,7 +376,7 @@ func (s *Server) acquireOnce(name string) (generator, func(), error) {
 	loaded := s.cur != nil && s.cur.path == path
 	s.mu.Unlock()
 	if !loaded {
-		if sh, err := store.ReadShape(path); err == nil && sh.Embeds() {
+		if embeds(path) {
 			return nil, nil, fmt.Errorf("%s %w", name, errEmbeddingModel)
 		}
 	}
@@ -1054,6 +1058,7 @@ func describe(path string) modelFacts {
 	var f modelFacts
 	if mlxengine.IsModelDir(path) {
 		f.mlx = true
+		f.embeds = mlxembed.IsModelDir(path)
 		if b, err := os.ReadFile(filepath.Join(path, "chat_template.jinja")); err == nil {
 			f.template = string(b)
 		}

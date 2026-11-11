@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/engine"
+	"github.com/LocalKinAI/kinfer/internal/mlxembed"
+	"github.com/LocalKinAI/kinfer/internal/store"
 )
 
 // ─── embeddings ──────────────────────────────────────────────────────────────
@@ -35,7 +37,21 @@ type embedder interface {
 }
 
 func openEmbedder(path string, opts engine.Options) (embedder, error) {
+	if mlxembed.IsModelDir(path) {
+		return mlxembed.Open(path)
+	}
 	return engine.OpenEmbedder(path, opts)
+}
+
+// embeds reports a model that makes vectors and writes no text: a GGUF whose
+// header says how it pools, or an MLX one mlxembed serves (EmbeddingGemma 2,
+// which Ollama keeps as safetensors).
+func embeds(path string) bool {
+	if mlxembed.IsModelDir(path) {
+		return true
+	}
+	sh, err := store.ReadShape(path)
+	return err == nil && sh.Embeds()
 }
 
 // embedLease is the loaded embedding model and its holders: each request

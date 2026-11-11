@@ -352,9 +352,11 @@ A model embeds if its header names a pooling (`<arch>.pooling_type`: mean, the
 first token, the last), or if it is an encoder — BERT, nomic-bert, jina-bert,
 modern-bert, EmbeddingGemma — which embeds by the mean of its tokens when its
 header names none. Ollama's own copies are found the way its chat models are,
-so `nomic-embed-text` pulled with `ollama pull` answers without a download; a
-model Ollama 0.40 keeps for its MLX engine (EmbeddingGemma 2 is one) is not a
-GGUF, and is not.
+so `nomic-embed-text` pulled with `ollama pull` answers without a download.
+EmbeddingGemma 2 (`embeddinggemma-2`), which Ollama 0.40 keeps for its MLX
+engine as safetensors in NVFP4 rather than a GGUF, runs on MLX on a Mac
+(internal/mlxembed): text only, up to 8,192 tokens, the same vectors as
+Ollama's to a cosine of 0.9998 or better.
 
 It loads in a place of its own, beside whatever chat model is loaded, with its
 own idle clock. That is the point: an agent asks for vectors between its turns

@@ -6,7 +6,10 @@
 //
 // What is covered: added tokens (special or not) matched before anything
 // else, a Split pre-tokenizer whose pattern is one of the GPT-style ones below,
-// ByteLevel, and BPE with merges. The tokenizers library also applies the
+// ByteLevel, and BPE with merges. And the SentencePiece-style files Gemma's
+// releases ship: a normalizer that writes spaces as ▁, no split, and BPE over
+// characters that falls back to <0xXX> byte tokens for one it does not know
+// (see metaspace). The tokenizers library also applies the
 // NFC normalizer these files name; the Go standard library has no Unicode
 // normalization, and text that is already NFC — nearly all text — is
 // unchanged by it, so this skips it.
@@ -31,6 +34,15 @@ type Tokenizer struct {
 	special map[int32]bool
 	split   func(string) []string
 
+	// metaspace is a SentencePiece-style file: spaces become ▁ before
+	// anything is merged, the text is merged as one word, and the pieces are
+	// characters, not GPT-2's byte characters. byteFallback spells a character
+	// the vocabulary lacks as its UTF-8 bytes, <0xE4><0xB8>…, as the
+	// tokenizers library's BPE does with byte_fallback.
+	metaspace    bool
+	byteFallback bool
+	unk          int32
+
 	mu    sync.Mutex
 	cache map[string][]int32
 }
@@ -47,11 +59,14 @@ type fileFormat struct {
 		Content string `json:"content"`
 		Special bool   `json:"special"`
 	} `json:"added_tokens"`
+	Normalizer   json.RawMessage `json:"normalizer"`
 	PreTokenizer json.RawMessage `json:"pre_tokenizer"`
 	Model        struct {
-		Type   string           `json:"type"`
-		Vocab  map[string]int32 `json:"vocab"`
-		Merges json.RawMessage  `json:"merges"`
+		Type         string           `json:"type"`
+		Vocab        map[string]int32 `json:"vocab"`
+		Merges       json.RawMessage  `json:"merges"`
+		ByteFallback bool             `json:"byte_fallback"`
+		UnkToken     string           `json:"unk_token"`
 	} `json:"model"`
 }
 
@@ -81,12 +96,23 @@ func parse(raw []byte, path string) (*Tokenizer, error) {
 	if f.Model.Type != "BPE" {
 		return nil, fmt.Errorf("%s: model type %q, only BPE is supported", path, f.Model.Type)
 	}
-	split, err := pretokenizer(f.PreTokenizer)
+	metaspace := spacesAsMeta(f.Normalizer)
+	var split func(string) []string
+	var err error
+	if metaspace {
+		split, err = metaPretokenizer(f.PreTokenizer)
+	} else {
+		split, err = pretokenizer(f.PreTokenizer)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	t := &Tokenizer{vocab: f.Model.Vocab, ranks: map[[2]string]int{}, special: map[int32]bool{},
-		split: split, cache: map[string][]int32{}}
+		split: split, cache: map[string][]int32{},
+		metaspace: metaspace, byteFallback: f.Model.ByteFallback, unk: -1}
+	if id, ok := f.Model.Vocab[f.Model.UnkToken]; ok && f.Model.UnkToken != "" {
+		t.unk = id
+	}
 
 	// Merges are "a b" strings in older files and ["a", "b"] pairs in newer.
 	var asStrings []string
@@ -215,6 +241,12 @@ func (t *Tokenizer) nextAdded(text string, special bool) (int, added) {
 }
 
 func (t *Tokenizer) encodePlain(text string, ids []int32) []int32 {
+	if t.metaspace {
+		for _, piece := range t.split(strings.ReplaceAll(text, " ", "▁")) {
+			ids = append(ids, t.mergeChars(piece)...)
+		}
+		return ids
+	}
 	for _, piece := range t.split(text) {
 		ids = append(ids, t.bpe(byteLevel(piece))...)
 	}
@@ -282,6 +314,14 @@ func (t *Tokenizer) Bytes(ids []int32) []byte {
 		p := t.pieces[id]
 		if t.isAdded(id) {
 			b = append(b, p...)
+			continue
+		}
+		if t.metaspace {
+			if c, ok := byteToken(p); ok {
+				b = append(b, c)
+			} else {
+				b = append(b, strings.ReplaceAll(p, "▁", " ")...)
+			}
 			continue
 		}
 		for _, r := range p {

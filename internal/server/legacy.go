@@ -418,7 +418,7 @@ func (s *Server) ServeSpeechAddrs() {
 		go func() {
 			h := s.SpeechHandler(kind)
 			for {
-				err := http.ListenAndServe(addr, h)
+				err := ListenAndServeOrderly(addr, h)
 				log.Printf("speech: %s at %s: %v; trying again in 10 s", kindNames[kind], addr, err)
 				time.Sleep(10 * time.Second)
 			}

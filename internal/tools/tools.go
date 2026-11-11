@@ -36,6 +36,7 @@
 package tools
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -181,18 +182,12 @@ func (f Format) RenderCalls(calls []Call) string {
 	}
 	var b strings.Builder
 	for _, c := range calls {
-		args := string(c.Arguments)
-		if args == "" {
-			args = "{}"
-		}
+		args := callArguments(c.Arguments)
 		switch f {
 		case FunctionXML:
 			fmt.Fprintf(&b, "\n%s\n<function=%s>\n", openTag, c.Name)
-			var fields map[string]json.RawMessage
-			if json.Unmarshal([]byte(args), &fields) == nil {
-				for k, v := range fields {
-					fmt.Fprintf(&b, "<parameter=%s>\n%s\n</parameter>\n", k, scalarText(v))
-				}
+			for _, kv := range objectFields(args) {
+				fmt.Fprintf(&b, "<parameter=%s>\n%s\n</parameter>\n", kv.key, scalarText(kv.value))
 			}
 			fmt.Fprintf(&b, "</function>\n%s", closeTag)
 		default:
@@ -200,6 +195,68 @@ func (f Format) RenderCalls(calls []Call) string {
 		}
 	}
 	return b.String()
+}
+
+// callArguments is a call's arguments as the JSON object the model wrote.
+//
+// Ollama's dialect sends an earlier turn's arguments back as an object, and
+// OpenAI's as a string holding one. Read as it came, the string had no fields,
+// so every call an OpenAI-dialect client sent back was rendered with none —
+// <function=remind></function> — and ornith-1.5-35b, seeing its own earlier
+// calls written empty, wrote its next one empty too: in kinhome's test home
+// half the calls that followed a filled one of the same tool came back as
+// remind {}, and none did with the calls written out whole. Like DeepSeek's
+// encoder (dsmlArguments), up to two layers of string are taken off; what is
+// not JSON underneath stays as it came.
+func callArguments(raw json.RawMessage) json.RawMessage {
+	t := bytes.TrimSpace(raw)
+	for range 2 {
+		var s string
+		if len(t) == 0 || t[0] != '"' || json.Unmarshal(t, &s) != nil {
+			break
+		}
+		inner := bytes.TrimSpace([]byte(s))
+		if len(inner) > 0 && !json.Valid(inner) {
+			break
+		}
+		t = inner
+	}
+	if len(t) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	return t
+}
+
+type field struct {
+	key   string
+	value json.RawMessage
+}
+
+// objectFields reads a JSON object's members in the order they were written,
+// or none when it is no object. The order has to hold: an earlier turn is
+// rendered again on every later one, and read through a map its parameters
+// came out in a different order each time, so a prompt that repeated the
+// conversation so far no longer repeated it token for token, and a model with
+// recurrent state, which reuses only whole prompts, read it all again.
+func objectFields(raw json.RawMessage) []field {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil
+	}
+	var out []field
+	for dec.More() {
+		k, err := dec.Token()
+		if err != nil {
+			return out
+		}
+		key, _ := k.(string)
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return out
+		}
+		out = append(out, field{key, v})
+	}
+	return out
 }
 
 // Parse splits a reply into the prose the model wrote and the calls it asked

@@ -187,6 +187,62 @@ func TestFunctionXMLRoundTrips(t *testing.T) {
 	}
 }
 
+// TestRenderCallsReadsArgumentsSentAsAString covers the OpenAI dialect, whose
+// clients send an earlier turn's arguments back as a string holding the
+// object: rendered as it came, every call had no parameters, and a model that
+// saw its own calls written empty wrote its next ones empty too.
+func TestRenderCallsReadsArgumentsSentAsAString(t *testing.T) {
+	asString := json.RawMessage(`"{\"at\":\"2026-11-11 02:47\",\"what\":\"把车挪一下\",\"days\":3}"`)
+	asObject := json.RawMessage(`{"at":"2026-11-11 02:47","what":"把车挪一下","days":3}`)
+	for _, raw := range []json.RawMessage{asString, asObject} {
+		got := FunctionXML.RenderCalls([]Call{{Name: "remind", Arguments: raw}})
+		want := "\n<tool_call>\n<function=remind>\n" +
+			"<parameter=at>\n2026-11-11 02:47\n</parameter>\n" +
+			"<parameter=what>\n把车挪一下\n</parameter>\n" +
+			"<parameter=days>\n3\n</parameter>\n" +
+			"</function>\n</tool_call>"
+		if got != want {
+			t.Errorf("arguments %s rendered as\n%s\nwant\n%s", raw, got, want)
+		}
+		got = Hermes.RenderCalls([]Call{{Name: "remind", Arguments: raw}})
+		if !strings.Contains(got, `"arguments": {"at":"2026-11-11 02:47","what":"把车挪一下","days":3}`) {
+			t.Errorf("Hermes rendered arguments %s as %s, want the object", raw, got)
+		}
+	}
+}
+
+// TestRenderCallsKeepsTheParametersOrder: a conversation's earlier calls are
+// rendered again on every later turn, and a model with recurrent state reuses
+// a prompt only when it repeats the last one token for token.
+func TestRenderCallsKeepsTheParametersOrder(t *testing.T) {
+	calls := []Call{{Name: "f", Arguments: json.RawMessage(`{"z":1,"y":2,"x":3,"w":4,"v":5,"u":6}`)}}
+	first := FunctionXML.RenderCalls(calls)
+	for i := 0; i < 50; i++ {
+		if got := FunctionXML.RenderCalls(calls); got != first {
+			t.Fatalf("rendered differently on try %d:\n%s\nthen\n%s", i, first, got)
+		}
+	}
+	if strings.Index(first, "<parameter=z>") > strings.Index(first, "<parameter=u>") {
+		t.Errorf("parameters not in the order written:\n%s", first)
+	}
+}
+
+func TestRenderCallsTakesStringsThatAreNotJSONAsTheyCame(t *testing.T) {
+	for _, raw := range []string{``, `""`, `"plain"`, `null`} {
+		_ = FunctionXML.RenderCalls([]Call{{Name: "f", Arguments: json.RawMessage(raw)}})
+		got := Hermes.RenderCalls([]Call{{Name: "f", Arguments: json.RawMessage(raw)}})
+		if !strings.Contains(got, `"arguments": `) {
+			t.Errorf("arguments %q rendered as %s", raw, got)
+		}
+	}
+	if got := callArguments(json.RawMessage(`"plain"`)); string(got) != `"plain"` {
+		t.Errorf(`"plain" became %s, want it as it came`, got)
+	}
+	if got := callArguments(json.RawMessage(`""`)); string(got) != `{}` {
+		t.Errorf(`an empty string became %s, want {}`, got)
+	}
+}
+
 func TestEachFormatDeclaresItsOwnWording(t *testing.T) {
 	ts := []Tool{{Type: "function", Function: Function{Name: "f"}}}
 

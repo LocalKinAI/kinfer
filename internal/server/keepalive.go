@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"strconv"
 	"time"
-
-	"github.com/LocalKinAI/kinfer/internal/store"
 )
 
 // Loading and unloading a model on request, the way Ollama's clients ask.
@@ -130,7 +128,7 @@ func (s *Server) loadOrUnload(model string, keepAlive *time.Duration) (reason st
 	}
 
 	// An embedding model is loaded in its own place, beside the chat model.
-	if sh, err := store.ReadShape(path); err == nil && sh.Embeds() {
+	if embeds(path) {
 		l, _, err := s.acquireEmbedder(model)
 		if err != nil {
 			return "", embedStatus(err), err
