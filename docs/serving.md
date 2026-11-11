@@ -910,6 +910,13 @@ request does not start a stopped service. While the service runs it is passed
 through, but it does not count as use, so a poll does not keep the service from
 its idle stop.
 
+The same answer tells kinfer when a service is busy with nobody waiting on it,
+such as a ComfyUI job sent without waiting for the result, which can run for an
+hour. When the idle time is up, or the GPU is wanted, kinfer asks the quiet
+path itself. If the answer differs from the stopped one (the queue is not
+empty), the service is left running and asked again every minute. Once it is
+done, it gets its whole idle time again before it stops.
+
 Adopting, releasing and stopping are asked of `/api/services/…` from the
 machine itself only; from the network, the list can be read.
 

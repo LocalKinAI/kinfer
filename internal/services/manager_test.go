@@ -341,3 +341,49 @@ func TestQuietPathsDoNotKeepItUp(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 }
+
+// A service left at work with nobody waiting — a ComfyUI job let run on its
+// own, its queue not empty — is not stopped idle, nor taken for room, until
+// its quiet path answers as the front does for it stopped.
+func TestAtWorkItIsNotStopped(t *testing.T) {
+	defer func(d time.Duration) { workCheck = d }(workCheck)
+	workCheck = 300 * time.Millisecond
+	addr := freeAddr(t)
+	path, svc := fake(t, addr, true, time.Second)
+	idle := `{"queue_running":[],"queue_pending":[]}`
+	svc.Quiet = map[string]json.RawMessage{"/queue": json.RawMessage(idle)}
+	if err := Save(path, File{Services: []Service{svc}}); err != nil {
+		t.Fatal(err)
+	}
+	queue := filepath.Join(svc.Dir, "queue") // what the stand-in answers on /queue
+	if err := os.WriteFile(queue, []byte(`{"queue_running":[[0,"a job"]],"queue_pending":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(path)
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	waitFor(t, "the address taken", func() bool {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			c.Close()
+		}
+		return err == nil
+	})
+	get(t, addr)
+	time.Sleep(3 * time.Second) // three times its idle time
+	if st := state(m); st.State != "running" {
+		t.Fatalf("stopped at work: %+v", st)
+	}
+	if name, _, ok := m.Idlest(); ok {
+		t.Fatalf("%s, at work, offered for room", name)
+	}
+	if err := os.WriteFile(queue, []byte(idle), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if name, _, ok := m.Idlest(); !ok || name != "fake" {
+		t.Errorf("done, not offered for room: %q %v", name, ok)
+	}
+	waitFor(t, "the idle stop once done", func() bool { return state(m).State == "stopped" })
+}

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,6 +65,8 @@ type managed struct {
 	startErr error
 	inflight int
 	used     time.Time
+	working  bool      // seen at work, nobody waiting, when last looked (atWork)
+	worked   time.Time // when last seen so
 	idle     *time.Timer
 	peak     uint64
 	started  time.Time
@@ -399,23 +402,92 @@ func (m *Manager) release(s *managed) {
 }
 
 // armIdle stops the service after d unless a request comes; a quiet one
-// still in flight when the clock runs out puts it off by a few seconds only.
-// Called with m.mu.
+// still in flight when the clock runs out puts it off by a few seconds only,
+// and work it was left to do on its own (atWork) until it is done and has
+// then been idle its time. Called with m.mu.
 func (m *Manager) armIdle(s *managed, d time.Duration) {
 	if s.idle != nil {
 		s.idle.Stop()
 	}
-	s.idle = time.AfterFunc(d, func() {
+	var t *time.Timer
+	t = time.AfterFunc(d, func() {
 		m.mu.Lock()
-		busy, onlyQuiet := s.inflight > 0, s.inflight > 0 && s.inflight == s.quietIn
-		if onlyQuiet {
-			m.armIdle(s, 5*time.Second)
+		if s.idle != t || s.inflight > 0 { // a request came: it arms the clock again
+			if s.idle == t && s.inflight == s.quietIn {
+				m.armIdle(s, 5*time.Second)
+			}
+			m.mu.Unlock()
+			return
+		}
+		// Idle since its last request, or since it was last seen at work.
+		left := func() time.Duration {
+			last := s.used
+			if s.worked.After(last) {
+				last = s.worked
+			}
+			return time.Duration(s.svc.Idle) - time.Since(last)
+		}
+		if l := left(); !s.working && l > time.Second {
+			m.armIdle(s, l)
+			m.mu.Unlock()
+			return
 		}
 		m.mu.Unlock()
-		if !busy {
-			m.stop(s, "idle for "+time.Duration(s.svc.Idle).String())
+		working := m.atWork(s)
+		m.mu.Lock()
+		if s.idle != t || s.inflight > 0 {
+			m.mu.Unlock()
+			return
 		}
+		if s.working = working; working {
+			s.worked = time.Now()
+			m.armIdle(s, workCheck)
+			m.mu.Unlock()
+			return
+		}
+		if l := left(); l > time.Second { // just done: idle its time from now
+			m.armIdle(s, l)
+			m.mu.Unlock()
+			return
+		}
+		m.mu.Unlock()
+		m.stop(s, "idle for "+time.Duration(s.svc.Idle).String())
 	})
+	s.idle = t
+}
+
+// workCheck is how often a service at work with nobody waiting is looked at
+// again.
+var workCheck = time.Minute
+
+// atWork reports a running service at work that nobody waits on — a ComfyUI
+// job let run on its own, which can take an hour: one of its quiet paths,
+// asked, answers otherwise than the front does for it stopped (a queue that is
+// not empty).
+func (m *Manager) atWork(s *managed) bool {
+	m.mu.Lock()
+	quiet, port := s.svc.Quiet, s.port
+	m.mu.Unlock()
+	cl := http.Client{Timeout: 5 * time.Second}
+	for path, stopped := range quiet {
+		r, err := cl.Get("http://127.0.0.1:" + strconv.Itoa(port) + path)
+		if err != nil {
+			continue
+		}
+		b, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+		r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			continue
+		}
+		var now, idle any
+		if err != nil || json.Unmarshal(b, &now) != nil || json.Unmarshal(stopped, &idle) != nil {
+			return true // an answer it cannot read: kept, not stopped mid-work
+		}
+		if !reflect.DeepEqual(now, idle) {
+			return true
+		}
+	}
+	return false
 }
 
 // start runs the service on a free loopback port and waits until it answers.
@@ -541,6 +613,7 @@ func (m *Manager) stop(s *managed, why string) {
 		s.idle.Stop()
 		s.idle = nil
 	}
+	s.working = false
 	m.mu.Unlock()
 	if cmd == nil || exited(done) {
 		return
@@ -642,11 +715,17 @@ func freePort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-// Idlest is the adopted service running that nothing uses and is not kept,
-// unused longest: the one to stop for room, and since when it is unused.
+// Idlest is the adopted service running that nothing uses, is not kept and is
+// not at work, unused longest: the one to stop for room, and since when it is
+// unused.
 func (m *Manager) Idlest() (name string, since time.Time, ok bool) {
+	type unused struct {
+		s    *managed
+		name string
+		at   time.Time
+	}
+	var list []unused
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, s := range m.svcs {
 		if s.inflight > 0 || s.svc.Idle == 0 || exited(s.done) || s.started.IsZero() {
 			continue
@@ -655,11 +734,16 @@ func (m *Manager) Idlest() (name string, since time.Time, ok bool) {
 		if u.IsZero() {
 			u = s.started
 		}
-		if !ok || u.Before(since) {
-			name, since, ok = s.svc.Name, u, true
+		list = append(list, unused{s, s.svc.Name, u})
+	}
+	m.mu.Unlock()
+	sort.Slice(list, func(i, j int) bool { return list[i].at.Before(list[j].at) })
+	for _, u := range list {
+		if !m.atWork(u.s) {
+			return u.name, u.at, true
 		}
 	}
-	return name, since, ok
+	return "", time.Time{}, false
 }
 
 // Stop stops the service called name if the manager runs it.
