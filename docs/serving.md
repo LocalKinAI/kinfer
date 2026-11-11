@@ -355,8 +355,11 @@ header names none. Ollama's own copies are found the way its chat models are,
 so `nomic-embed-text` pulled with `ollama pull` answers without a download.
 EmbeddingGemma 2 (`embeddinggemma-2`), which Ollama 0.40 keeps for its MLX
 engine as safetensors in NVFP4 rather than a GGUF, runs on MLX on a Mac
-(internal/mlxembed): text only, up to 8,192 tokens, the same vectors as
-Ollama's to a cosine of 0.9998 or better.
+(internal/mlxembed), up to 8,192 tokens, the same vectors as Ollama's to a
+cosine of 0.9998 or better. It reads pictures and sound too, as Ollama takes
+them: an input `{"image": base64}` or `{"audio": base64}`, with an optional
+`"text"` before them. A picture Go does not decode (WebP, HEIC, TIFF) goes
+through macOS's `sips`, and a sound that is not a WAV through `afconvert`.
 
 It loads in a place of its own, beside whatever chat model is loaded, with its
 own idle clock. That is the point: an agent asks for vectors between its turns

@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/engine"
@@ -176,8 +177,45 @@ func (s *Server) stopEmbedIdleLocked() {
 	s.embExpiry = time.Time{}
 }
 
+// embedMedia reads one input that is an object, as Ollama 0.40 takes them for
+// its MLX embedding models: {"image": base64} or {"audio": base64} — each a
+// file or a list of them — with an optional "text" before them.
+func embedMedia(m map[string]json.RawMessage) (engine.EmbedInput, error) {
+	var in engine.EmbedInput
+	if t, ok := m["text"]; ok {
+		if err := json.Unmarshal(t, &in.Text); err != nil {
+			return in, errors.New("text: want a string")
+		}
+	}
+	for _, kind := range []string{"image", "audio"} {
+		raw, ok := m[kind]
+		if !ok {
+			continue
+		}
+		var files []string
+		var one string
+		if json.Unmarshal(raw, &one) == nil {
+			files = []string{one}
+		} else if json.Unmarshal(raw, &files) != nil {
+			return in, fmt.Errorf("%s: want base64, or a list of it", kind)
+		}
+		for j, f := range files {
+			if k := strings.Index(f, ";base64,"); strings.HasPrefix(f, "data:") && k > 0 {
+				f = f[k+len(";base64,"):]
+			}
+			b, err := base64.StdEncoding.DecodeString(f)
+			if err != nil {
+				return in, fmt.Errorf("%s %d: not base64: %w", kind, j, err)
+			}
+			in.Media = append(in.Media, engine.EmbedMedia{Kind: kind, Data: b})
+		}
+	}
+	return in, nil
+}
+
 // embedInputs reads an "input" field: a text, a list of texts, the tokens of
-// a text (OpenAI's list of numbers), or a list of those. Absent, or an empty
+// a text (OpenAI's list of numbers), or a list of those; and for a model that
+// reads them, pictures and sounds (embedMedia). Absent, or an empty
 // text, is no input: the request only loads the model, as in Ollama.
 func embedInputs(raw json.RawMessage) ([]engine.EmbedInput, error) {
 	if len(raw) == 0 || string(raw) == "null" {
@@ -205,7 +243,11 @@ func embedInputs(raw json.RawMessage) ([]engine.EmbedInput, error) {
 		case json.Unmarshal(item, &out[i].Text) == nil:
 		case json.Unmarshal(item, &out[i].Tokens) == nil && len(out[i].Tokens) > 0:
 		case json.Unmarshal(item, &media) == nil && (media["image"] != nil || media["audio"] != nil):
-			return nil, fmt.Errorf("input %d: kinfer embeds text; pictures and sound are not supported yet", i)
+			in, err := embedMedia(media)
+			if err != nil {
+				return nil, fmt.Errorf("input %d: %w", i, err)
+			}
+			out[i] = in
 		default:
 			return nil, fmt.Errorf("input %d: want a text or a list of tokens", i)
 		}

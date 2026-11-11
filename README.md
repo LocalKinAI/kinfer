@@ -192,7 +192,7 @@ drafting reaches 51, and at 16 replies llama.cpp leads, 130 against 105. A model
 that keeps its MTP head drafts with it on MLX too: Ollama's qwen3.8:27b-mlx on a
 MacBook Pro (M5 Max) went from 30 tok/s to 40–107, 72.5 on average against Ollama's 78. Pictures read by a chat model run only
 on llama.cpp so far, and so do embeddings, but for EmbeddingGemma 2, which
-Ollama keeps in NVFP4: that one runs on MLX. A mixture of experts runs on MLX too: Ollama's
+Ollama keeps in NVFP4: that one runs on MLX, and reads pictures and sound as well as text. A mixture of experts runs on MLX too: Ollama's
 qwen3.5:35b-a3b-nvfp4 writes 104 tok/s alone against Ollama's 125, and four
 replies at once 188 against 112. The numbers: [CHANGELOG.md](CHANGELOG.md).
 

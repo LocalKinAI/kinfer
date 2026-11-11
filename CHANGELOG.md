@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.7.2 — 2026-11-11
+
+### Added — pictures and sound in EmbeddingGemma 2
+
+kinhome places its pictures and recordings by meaning, beside its words, with
+EmbeddingGemma 2, so to move it off the box's Ollama kinfer has to read them
+as Ollama does. `/api/embed` now takes an input as Ollama 0.40 takes it for
+its MLX embedding models: `{"image": base64}` or `{"audio": base64}` (a file
+or a list, a data URL too), with an optional `"text"` before them. A
+text-only model answers one with a 400, as before.
+
+The release's own towers read them (internal/mlxembed), ported from Ollama:
+- **Pictures:** resized to whole 48-pixel cells within 280 soft tokens with
+  the Catmull-Rom kernel Ollama scales with, cut into 16-pixel patches, read by
+  the 16-layer vision tower with a rotary position on each axis, and pooled 3×3.
+- **Sound:** a WAV at any rate, resampled to 16 kHz with the same Kaiser sinc,
+  cut into pieces of at most 30 s at their quietest moments, and read by the
+  12-layer conformer as log-mel frames.
+
+Beyond Ollama, a picture Go does not decode (WebP, HEIC, TIFF) goes through
+macOS's `sips`, and a sound that is not a WAV (mp3, m4a, aac, ogg) through
+`afconvert`. Ollama refuses those sounds.
+
+Measured on the box against Ollama, cosine of the two vectors:
+
+| Input | Cosine |
+|---|---|
+| Six made-up pictures, from 120×90 to 3000×2000, one with alpha | 0.99990–0.99999 |
+| Six of kinhome's own PNGs | 0.99996–0.99999 |
+| Six of kinhome's own WAVs, one of 1,304 tokens | 0.99981–0.99996 |
+| Four of kinhome's WebPs, which macOS decodes slightly differently from Ollama's Go decoder | 0.9972–0.9990 |
+
+Every input read as the same number of tokens. Three mp3s that Ollama refuses
+were read.
+
 ## v0.7.1 — 2026-11-11
 
 What kinhome's test home found running on the box for a night, put right.

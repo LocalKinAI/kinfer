@@ -47,10 +47,19 @@ type Embedder struct {
 	limit int // tokens one text may hold
 }
 
-// EmbedInput is one thing to embed: a text, or the tokens of one.
+// EmbedInput is one thing to embed: a text, or the tokens of one, and for a
+// model that reads them (EmbeddingGemma 2, internal/mlxembed) pictures and
+// sounds placed after the text, as sentence-transformers places them.
 type EmbedInput struct {
 	Text   string
 	Tokens []int32
+	Media  []EmbedMedia
+}
+
+// EmbedMedia is one picture ("image") or sound ("audio"), its file's bytes.
+type EmbedMedia struct {
+	Kind string
+	Data []byte
 }
 
 // OpenEmbedder loads path to embed with.
@@ -119,6 +128,9 @@ func (e *Embedder) Embed(ctx context.Context, inputs []EmbedInput, truncate bool
 	read := 0
 	vocab := llama.NVocab(e.vocab)
 	for i, in := range inputs {
+		if len(in.Media) > 0 {
+			return nil, 0, InputError{fmt.Errorf("input %d: this model reads text, not pictures or sound", i)}
+		}
 		toks := in.Tokens
 		if toks == nil {
 			var err error

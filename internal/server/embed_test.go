@@ -39,6 +39,9 @@ func (f *fakeEmbedder) Embed(_ context.Context, inputs []engine.EmbedInput, trun
 	out := make([][]float32, len(inputs))
 	n := 0
 	for i, in := range inputs {
+		if len(in.Media) > 0 { // as engine.Embedder, a text model, refuses them
+			return nil, 0, engine.InputError{Err: fmt.Errorf("input %d: this model reads text, not pictures or sound", i)}
+		}
 		l := len(in.Text) + len(in.Tokens)
 		if l > 100 && !truncate {
 			return nil, 0, engine.InputError{Err: fmt.Errorf("input %d is too long", i)}
@@ -294,5 +297,22 @@ func TestEmbeddingModelUnloadsAsAsked(t *testing.T) {
 	}
 	if !embedders()[1].isClosed() {
 		t.Error("ollama stop left the embedding model loaded")
+	}
+}
+
+// Pictures and sounds come as Ollama's MLX embedding models take them: an
+// object per input, base64 or a data URL, with optional text before them.
+func TestEmbedInputsReadsPicturesAndSound(t *testing.T) {
+	png := base64.StdEncoding.EncodeToString([]byte("\x89PNG"))
+	in, err := embedInputs(json.RawMessage(`["a cat", {"image": "` + png + `"}, {"text": "hi", "audio": ["data:audio/wav;base64,` + png + `"]}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(in) != 3 || in[0].Text != "a cat" || len(in[1].Media) != 1 || in[1].Media[0].Kind != "image" ||
+		string(in[1].Media[0].Data) != "\x89PNG" || in[2].Text != "hi" || in[2].Media[0].Kind != "audio" {
+		t.Fatalf("%+v", in)
+	}
+	if _, err := embedInputs(json.RawMessage(`[{"image": "not base64!"}]`)); err == nil {
+		t.Error("bad base64 was read")
 	}
 }

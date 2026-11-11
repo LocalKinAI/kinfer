@@ -10,11 +10,13 @@
 // averaged over the tokens and scaled to length 1 — sentence-transformers'
 // Pooling (mean) and Normalize modules. Written after Ollama's
 // mlxrunner/model/gemma4embedding, whose vectors these are measured against.
-// The audio and vision towers the release carries are not loaded: text only.
+// Pictures and sounds go through the release's own towers (vision.go,
+// audio.go) and take their places in the text, as they do there.
 package mlxembed
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -22,6 +24,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/LocalKinAI/kinfer/internal/engine"
 	"github.com/LocalKinAI/kinfer/internal/mlx"
 	"github.com/LocalKinAI/kinfer/internal/mlxmodel"
 	"github.com/LocalKinAI/kinfer/internal/tokenizer"
@@ -81,7 +84,21 @@ type Model struct {
 	baseFull float32
 	baseSlid float32
 
+	// The towers, when the release carries them, and the tokens that mark
+	// their runs in the text.
+	audio  *audioTower
+	vision *visionTower
+	marks  marks
+
 	all []mlx.Array
+}
+
+// marks are the special tokens a picture's or a sound's run is written with.
+type marks struct {
+	Image, BOI, EOI int32
+	Audio, BOA, EOA int32
+	EOAIndex        int32 `json:"eoa_token_index"`
+	SoftPerImage    int32
 }
 
 type layer struct {
@@ -98,19 +115,6 @@ type layer struct {
 	hasPLE, hasPLENorms bool
 }
 
-// towers are the parts of the release this package does not read.
-var towers = []string{"audio_tower", "vision_tower", "embed_audio", "embed_vision"}
-
-func isTower(name string) bool {
-	name = strings.TrimPrefix(name, "model.")
-	for _, t := range towers {
-		if strings.HasPrefix(name, t) {
-			return true
-		}
-	}
-	return false
-}
-
 // Load reads the model in dir. mlx.Open must have been called.
 func Load(dir string) (m *Model, err error) {
 	defer mlx.Recover(&err)
@@ -119,7 +123,17 @@ func Load(dir string) (m *Model, err error) {
 		return nil, err
 	}
 	var c struct {
-		TextConfig textConfig `json:"text_config"`
+		TextConfig   textConfig    `json:"text_config"`
+		AudioConfig  *audioConfig  `json:"audio_config"`
+		VisionConfig *visionConfig `json:"vision_config"`
+		ImageToken   int32         `json:"image_token_id"`
+		BOI          int32         `json:"boi_token_id"`
+		EOI          int32         `json:"eoi_token_id"`
+		AudioToken   int32         `json:"audio_token_id"`
+		BOA          int32         `json:"boa_token_id"`
+		EOA          int32         `json:"eoa_token_id"`
+		EOAIndex     int32         `json:"eoa_token_index"`
+		SoftPerImage int32         `json:"vision_soft_tokens_per_image"`
 	}
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("%s/config.json: %w", dir, err)
@@ -153,21 +167,12 @@ func Load(dir string) (m *Model, err error) {
 	files, _ := filepath.Glob(filepath.Join(dir, "*.safetensors"))
 	t := map[string]mlx.Array{}
 	for _, f := range files {
-		// Ollama keeps a tensor to a file, named for it: the towers are
-		// left on the disk.
-		if isTower(strings.TrimSuffix(filepath.Base(f), ".safetensors")) {
-			continue
-		}
 		got, err := mlx.LoadSafetensors(f)
 		if err != nil {
 			return nil, err
 		}
 		for k, v := range got {
-			if isTower(k) {
-				v.Free()
-				continue
-			}
-			t[k] = v
+			t[strings.TrimPrefix(k, "model.")] = v
 		}
 	}
 	m = &Model{cfg: cfg, tok: tok, baseFull: 1e6, baseSlid: 1e4}
@@ -275,11 +280,33 @@ func Load(dir string) (m *Model, err error) {
 	if sh := m.embed.W.Shape(); len(sh) != 2 || (m.embed.Scales == 0 && sh[1] != cfg.HiddenSize) {
 		return nil, fmt.Errorf("%s: embed_tokens is %v, want [vocab, %d]", dir, sh, cfg.HiddenSize)
 	}
+	m.marks = marks{Image: c.ImageToken, BOI: c.BOI, EOI: c.EOI, Audio: c.AudioToken, BOA: c.BOA, EOA: c.EOA, SoftPerImage: c.SoftPerImage}
+	if m.marks.EOA == 0 {
+		m.marks.EOA = c.EOAIndex
+	}
+	// The towers, when both the config and the weights have them: a
+	// release may carry the config of a tower whose weights it left out.
+	if _, ok := t["audio_tower.subsample_conv_projection.layer0.conv.weight"]; ok && c.AudioConfig != nil && c.AudioConfig.ModelType == "gemma4_audio" {
+		if m.audio, err = loadAudio(t, *c.AudioConfig); err != nil {
+			return nil, fmt.Errorf("%s: the audio tower: %w", dir, err)
+		}
+	}
+	if _, ok := t["vision_tower.patch_embedder.input_proj.weight"]; ok && c.VisionConfig != nil && c.VisionConfig.ModelType == "gemma4_vision" {
+		if m.vision, err = loadVision(t, *c.VisionConfig); err != nil {
+			return nil, fmt.Errorf("%s: the vision tower: %w", dir, err)
+		}
+	}
 	return m, nil
 }
 
 // Free releases the weights.
 func (m *Model) Free() {
+	if m.audio != nil {
+		m.audio.free()
+	}
+	if m.vision != nil {
+		m.vision.free()
+	}
 	for _, a := range m.all {
 		a.Free()
 	}
@@ -293,11 +320,69 @@ func (m *Model) Tokens(text string) []int32 {
 	return append(ids, m.cfg.EOS)
 }
 
+// withMedia is an input with pictures or sounds as the model reads it: <bos>,
+// its text, each picture's and sound's run of soft tokens between its
+// markers, <eos> — and the pieces whose features stand in those runs.
+func (m *Model) withMedia(in engine.EmbedInput) ([]int32, []piece, error) {
+	ids := []int32{m.cfg.BOS}
+	if in.Text != "" {
+		ids = append(ids, m.tok.Encode(in.Text, true)...)
+	}
+	var pieces []piece
+	run := func(mark int32, n int) int {
+		at := len(ids)
+		for range n {
+			ids = append(ids, mark)
+		}
+		return at
+	}
+	for j, md := range in.Media {
+		switch md.Kind {
+		case "audio":
+			if m.audio == nil {
+				return nil, nil, errors.New("this model's release has no audio tower")
+			}
+			ps, err := prepareAudio(md.Data)
+			if err != nil {
+				return nil, nil, fmt.Errorf("sound %d: %w", j, err)
+			}
+			ids = append(ids, m.marks.BOA)
+			for _, p := range ps {
+				p := p
+				pieces = append(pieces, piece{at: run(m.marks.Audio, p.tokens), n: p.tokens,
+					encode: func() mlx.Array { return m.audio.encode(p.mel, p.frames) }})
+			}
+			ids = append(ids, m.marks.EOA)
+		case "image":
+			if m.vision == nil {
+				return nil, nil, errors.New("this model's release has no vision tower")
+			}
+			budget := int(m.marks.SoftPerImage)
+			if budget <= 0 {
+				budget = 280
+			}
+			v, err := m.vision.prepare(md.Data, budget)
+			if err != nil {
+				return nil, nil, fmt.Errorf("picture %d: %w", j, err)
+			}
+			ids = append(ids, m.marks.BOI)
+			pieces = append(pieces, piece{at: run(m.marks.Image, v.softTokens), n: v.softTokens,
+				encode: func() mlx.Array { return m.vision.encode(v) }})
+			ids = append(ids, m.marks.EOI)
+		default:
+			return nil, nil, fmt.Errorf("%q is not a picture or a sound", md.Kind)
+		}
+	}
+	return append(ids, m.cfg.EOS), pieces, nil
+}
+
 // VocabSize is the number of token ids the model reads.
 func (m *Model) VocabSize() int { return max(m.cfg.VocabSize, m.tok.VocabSize()) }
 
-// Embed is the vector of one token sequence, length 1.
-func (m *Model) Embed(ids []int32) (vec []float32, err error) {
+// Embed is the vector of one token sequence, length 1. Each piece's features
+// stand in for its run of soft tokens, after the token embeddings are scaled,
+// as the release's model scatters them.
+func (m *Model) Embed(ids []int32, pieces []piece) (vec []float32, err error) {
 	defer mlx.Recover(&err)
 	sc := mlx.NewScope()
 	defer sc.Close()
@@ -306,6 +391,14 @@ func (m *Model) Embed(ids []int32) (vec []float32, err error) {
 
 	h := m.embed.Rows(mlx.FromInt32(ids, 1, n)) // [1, n, hidden]
 	h = mlx.MulScalar(h, float32(math.Sqrt(float64(c.HiddenSize))))
+	for _, p := range pieces {
+		f := p.encode()
+		if sh := f.Shape(); len(sh) != 2 || sh[0] != p.n || sh[1] != c.HiddenSize {
+			return nil, fmt.Errorf("a piece made %v features for %d tokens of %d", sh, p.n, c.HiddenSize)
+		}
+		f = mlx.Reshape(mlx.Astype(f, h.Dtype()), 1, p.n, c.HiddenSize)
+		h = mlx.SliceUpdate(h, f, []int{0, p.at, 0}, []int{1, p.at + p.n, c.HiddenSize})
+	}
 
 	var ple mlx.Array
 	if c.PerLayerInput > 0 {

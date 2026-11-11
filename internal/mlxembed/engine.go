@@ -50,9 +50,22 @@ func Open(dir string) (*Embedder, error) {
 // <eos>; without it that is an error.
 func (e *Embedder) Embed(ctx context.Context, inputs []engine.EmbedInput, truncate bool) ([][]float32, int, error) {
 	seqs := make([][]int32, len(inputs))
+	pieces := make([][]piece, len(inputs))
 	read := 0
 	vocab := int32(e.m.VocabSize())
 	for i, in := range inputs {
+		if len(in.Media) > 0 {
+			toks, ps, err := e.m.withMedia(in)
+			if err != nil {
+				return nil, 0, engine.InputError{Err: fmt.Errorf("input %d: %w", i, err)}
+			}
+			if len(toks) > maxTokens {
+				return nil, 0, engine.InputError{Err: fmt.Errorf("input %d is %d tokens with its pictures and sound, more than the %d this model reads", i, len(toks), maxTokens)}
+			}
+			seqs[i], pieces[i] = toks, ps
+			read += len(toks)
+			continue
+		}
 		toks := in.Tokens
 		if toks == nil {
 			toks = e.m.Tokens(in.Text)
@@ -85,7 +98,7 @@ func (e *Embedder) Embed(ctx context.Context, inputs []engine.EmbedInput, trunca
 		if err := ctx.Err(); err != nil {
 			return nil, 0, err
 		}
-		v, err := e.m.Embed(toks)
+		v, err := e.m.Embed(toks, pieces[i])
 		if err != nil {
 			return nil, 0, err
 		}
