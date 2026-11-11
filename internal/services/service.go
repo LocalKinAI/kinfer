@@ -41,6 +41,11 @@ type Service struct {
 	// Idle is how long an adopted service is left running unused; 0 keeps
 	// it running, and the GPU is never taken from it.
 	Idle Duration `json:"idle,omitempty"`
+	// Quiet are paths asked only to see how it is — ComfyUI's /queue, which
+	// kinhome asks to know whether the box is busy — each with the JSON the
+	// front answers itself while the service is stopped. They neither start
+	// it nor count as using it, so they do not keep it from its idle stop.
+	Quiet map[string]json.RawMessage `json:"quiet,omitempty"`
 	// Adopted: the front listens on Addr and runs it. Not adopted: watched.
 	Adopted bool `json:"adopted"`
 	// Need is the most memory it was seen to hold, in bytes: the room the

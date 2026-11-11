@@ -3,6 +3,7 @@
 package services
 
 import (
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -289,5 +290,54 @@ func TestLeftoversOfAServerBeforeAreEnded(t *testing.T) {
 	if syscall.Kill(left, 0) == nil {
 		syscall.Kill(-left, syscall.SIGKILL)
 		t.Fatalf("pid %d, left by the server before, still runs", left)
+	}
+}
+
+// A quiet path neither starts a stopped service — the front answers it — nor,
+// running, keeps the service from its idle stop.
+func TestQuietPathsDoNotKeepItUp(t *testing.T) {
+	addr := freeAddr(t)
+	path, svc := fake(t, addr, true, time.Second)
+	svc.Quiet = map[string]json.RawMessage{"/queue": json.RawMessage(`{"queue_running":[],"queue_pending":[]}`)}
+	if err := Save(path, File{Services: []Service{svc}}); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(path)
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	waitFor(t, "the address taken", func() bool {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			c.Close()
+		}
+		return err == nil
+	})
+	c := http.Client{Timeout: 10 * time.Second}
+	r, err := c.Get("http://" + addr + "/queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	if string(b) != `{"queue_running":[],"queue_pending":[]}` || state(m).State != "stopped" {
+		t.Fatalf("stopped, /queue answered %q and it is %s", b, state(m).State)
+	}
+	get(t, addr) // a real request starts it
+	// Polled every 200 ms, it still stops once idle.
+	stop := time.After(4 * time.Second)
+	for stopped := false; !stopped; {
+		select {
+		case <-stop:
+			t.Fatalf("polling /queue kept it up: %+v", state(m))
+		default:
+		}
+		if r, err := c.Get("http://" + addr + "/queue"); err == nil {
+			io.Copy(io.Discard, r.Body)
+			r.Body.Close()
+		}
+		stopped = state(m).State == "stopped"
+		time.Sleep(200 * time.Millisecond)
 	}
 }

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -57,6 +58,7 @@ type managed struct {
 	cmd      *exec.Cmd
 	done     chan struct{} // closed when cmd has exited
 	port     int
+	quietIn  int           // of inflight, quiet requests: no use of it
 	ready    chan struct{} // closed once started, or failed (startErr)
 	starting bool          // a request is starting it: the others wait on ready
 	startErr error
@@ -260,12 +262,26 @@ func (m *Manager) unbind(s *managed) {
 // handler forwards to the service, started first if it is not running.
 func (m *Manager) handler(s *managed) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		port, err := m.acquire(s)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("kinfer: %s could not be started: %v", s.svc.Name, err), http.StatusBadGateway)
-			return
+		var port int
+		if body, quiet := m.quiet(s, r); quiet {
+			// Running, it answers, uncounted; stopped, the front answers.
+			p, running := m.peek(s)
+			if !running {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(body)
+				return
+			}
+			port = p
+			defer m.unpeek(s)
+		} else {
+			p, err := m.acquire(s)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("kinfer: %s could not be started: %v", s.svc.Name, err), http.StatusBadGateway)
+				return
+			}
+			port = p
+			defer m.release(s)
 		}
-		defer m.release(s)
 		target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(port)}
 		p := &httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
@@ -283,6 +299,45 @@ func (m *Manager) handler(s *managed) http.Handler {
 		}
 		p.ServeHTTP(w, r) // a WebSocket is held here until it closes
 	})
+}
+
+// quiet reports a request to one of the service's quiet paths, and what the
+// front answers for it while the service is stopped.
+func (m *Manager) quiet(s *managed, r *http.Request) ([]byte, bool) {
+	if r.Method != http.MethodGet {
+		return nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	body, ok := s.svc.Quiet[r.URL.Path]
+	if !ok {
+		return nil, false
+	}
+	var c bytes.Buffer // as written in the file, indented; answered compact
+	if json.Compact(&c, body) == nil {
+		body = c.Bytes()
+	}
+	return body, true
+}
+
+// peek holds the service for a quiet request if it is running, without
+// counting it as use: the idle clock goes on.
+func (m *Manager) peek(s *managed) (int, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s.starting || exited(s.done) || s.startErr != nil {
+		return 0, false
+	}
+	s.inflight++
+	s.quietIn++
+	return s.port, true
+}
+
+func (m *Manager) unpeek(s *managed) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s.inflight--
+	s.quietIn--
 }
 
 // acquire counts a request in, starting the service if it must be, and
@@ -339,15 +394,28 @@ func (m *Manager) release(s *managed) {
 		if s.idle != nil {
 			s.idle.Stop()
 		}
-		s.idle = time.AfterFunc(time.Duration(s.svc.Idle), func() {
-			m.mu.Lock()
-			busy := s.inflight > 0
-			m.mu.Unlock()
-			if !busy {
-				m.stop(s, "idle for "+time.Duration(s.svc.Idle).String())
-			}
-		})
+		m.armIdle(s, time.Duration(s.svc.Idle))
 	}
+}
+
+// armIdle stops the service after d unless a request comes; a quiet one
+// still in flight when the clock runs out puts it off by a few seconds only.
+// Called with m.mu.
+func (m *Manager) armIdle(s *managed, d time.Duration) {
+	if s.idle != nil {
+		s.idle.Stop()
+	}
+	s.idle = time.AfterFunc(d, func() {
+		m.mu.Lock()
+		busy, onlyQuiet := s.inflight > 0, s.inflight > 0 && s.inflight == s.quietIn
+		if onlyQuiet {
+			m.armIdle(s, 5*time.Second)
+		}
+		m.mu.Unlock()
+		if !busy {
+			m.stop(s, "idle for "+time.Duration(s.svc.Idle).String())
+		}
+	})
 }
 
 // start runs the service on a free loopback port and waits until it answers.

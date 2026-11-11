@@ -902,6 +902,14 @@ An adopted one runs from `kinfer serve`:
   started has its successor end those first. Released, the service is
   started on its own again, outliving the server.
 
+Some requests only ask how a service is: kinhome asks ComfyUI's `/queue`
+every so often to know whether the box is busy. Such a path is written in the
+entry's `quiet`, each with the JSON the front answers while the service is
+stopped (for ComfyUI, `{"queue_running": [], "queue_pending": []}`). A quiet
+request does not start a stopped service. While the service runs it is passed
+through, but it does not count as use, so a poll does not keep the service from
+its idle stop.
+
 Adopting, releasing and stopping are asked of `/api/services/…` from the
 machine itself only; from the network, the list can be read.
 
