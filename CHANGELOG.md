@@ -25,10 +25,11 @@ while nothing used them, and none of them knew the others were there.
   - idle for `-idle`, it stops;
   - the room it held last time is made before it starts, and the runner or
     service unused longest goes first when anything needs room.
-- `quiet` paths, such as ComfyUI's `/queue`, which kinhome polls, are answered
-  by the front while the service is stopped, and never count as use. A service
-  whose quiet path answers otherwise (a job in its queue) is not stopped, for
-  idleness or for room, until the job is done.
+- `quiet` paths, such as a health check or ComfyUI's `/queue`, which kinhome
+  polls, are answered by the front while the service is stopped, and never
+  count as use. A service whose `busy` path answers otherwise than when stopped
+  (a job in its queue) is not stopped, for idleness or for room, until the job
+  is done.
 - `release` gives it back, running on its own; `stop` stops kinfer's copy.
   These are asked from the machine itself only.
 

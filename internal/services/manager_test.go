@@ -296,9 +296,20 @@ func TestLeftoversOfAServerBeforeAreEnded(t *testing.T) {
 // A quiet path neither starts a stopped service — the front answers it — nor,
 // running, keeps the service from its idle stop.
 func TestQuietPathsDoNotKeepItUp(t *testing.T) {
+	defer func(d time.Duration) { workCheck = d }(workCheck)
+	workCheck = 300 * time.Millisecond
 	addr := freeAddr(t)
 	path, svc := fake(t, addr, true, time.Second)
-	svc.Quiet = map[string]json.RawMessage{"/queue": json.RawMessage(`{"queue_running":[],"queue_pending":[]}`)}
+	svc.Quiet = map[string]json.RawMessage{
+		"/queue":                json.RawMessage(`{"queue_running":[],"queue_pending":[]}`),
+		"/tasks?status=running": json.RawMessage(`[]`),
+		"/health":               json.RawMessage(`{"ok":true}`),
+	}
+	// Running, the stand-in answers /health otherwise than written here (a
+	// file of that name): not being in busy, that is no sign of work.
+	if err := os.WriteFile(filepath.Join(svc.Dir, "health"), []byte(`{"ok":true,"loaded":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := Save(path, File{Services: []Service{svc}}); err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +335,21 @@ func TestQuietPathsDoNotKeepItUp(t *testing.T) {
 	if string(b) != `{"queue_running":[],"queue_pending":[]}` || state(m).State != "stopped" {
 		t.Fatalf("stopped, /queue answered %q and it is %s", b, state(m).State)
 	}
-	get(t, addr) // a real request starts it
+	for _, q := range []string{"/queue?x=1", "/tasks?status=running", "/health"} {
+		if r, err := c.Get("http://" + addr + q); err == nil {
+			r.Body.Close()
+		}
+		if st := state(m).State; st != "stopped" {
+			t.Fatalf("%s started it", q)
+		}
+	}
+	// Another question on a quiet path written with its query is a request.
+	if r, err := c.Get("http://" + addr + "/tasks?status=done"); err == nil {
+		r.Body.Close()
+	}
+	if st := state(m); st.State != "running" {
+		t.Fatalf("/tasks?status=done did not start it: %+v", st)
+	}
 	// Polled every 200 ms, it still stops once idle.
 	stop := time.After(4 * time.Second)
 	for stopped := false; !stopped; {
@@ -333,9 +358,11 @@ func TestQuietPathsDoNotKeepItUp(t *testing.T) {
 			t.Fatalf("polling /queue kept it up: %+v", state(m))
 		default:
 		}
-		if r, err := c.Get("http://" + addr + "/queue"); err == nil {
-			io.Copy(io.Discard, r.Body)
-			r.Body.Close()
+		for _, q := range []string{"/queue", "/health"} {
+			if r, err := c.Get("http://" + addr + q); err == nil {
+				io.Copy(io.Discard, r.Body)
+				r.Body.Close()
+			}
 		}
 		stopped = state(m).State == "stopped"
 		time.Sleep(200 * time.Millisecond)
@@ -352,6 +379,7 @@ func TestAtWorkItIsNotStopped(t *testing.T) {
 	path, svc := fake(t, addr, true, time.Second)
 	idle := `{"queue_running":[],"queue_pending":[]}`
 	svc.Quiet = map[string]json.RawMessage{"/queue": json.RawMessage(idle)}
+	svc.Busy = []string{"/queue"}
 	if err := Save(path, File{Services: []Service{svc}}); err != nil {
 		t.Fatal(err)
 	}

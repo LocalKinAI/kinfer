@@ -312,7 +312,10 @@ func (m *Manager) quiet(s *managed, r *http.Request) ([]byte, bool) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	body, ok := s.svc.Quiet[r.URL.Path]
+	body, ok := s.svc.Quiet[r.URL.Path+"?"+r.URL.RawQuery] // the question itself
+	if !ok {
+		body, ok = s.svc.Quiet[r.URL.Path] // the path, whatever its query
+	}
 	if !ok {
 		return nil, false
 	}
@@ -461,15 +464,19 @@ func (m *Manager) armIdle(s *managed, d time.Duration) {
 var workCheck = time.Minute
 
 // atWork reports a running service at work that nobody waits on — a ComfyUI
-// job let run on its own, which can take an hour: one of its quiet paths,
+// job let run on its own, which can take an hour: one of its busy paths,
 // asked, answers otherwise than the front does for it stopped (a queue that is
 // not empty).
 func (m *Manager) atWork(s *managed) bool {
 	m.mu.Lock()
-	quiet, port := s.svc.Quiet, s.port
+	busy, quiet, port := s.svc.Busy, s.svc.Quiet, s.port
 	m.mu.Unlock()
 	cl := http.Client{Timeout: 5 * time.Second}
-	for path, stopped := range quiet {
+	for _, path := range busy {
+		stopped, ok := quiet[path]
+		if !ok {
+			continue
+		}
 		r, err := cl.Get("http://127.0.0.1:" + strconv.Itoa(port) + path)
 		if err != nil {
 			continue

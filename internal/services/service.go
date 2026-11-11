@@ -41,11 +41,19 @@ type Service struct {
 	// Idle is how long an adopted service is left running unused; 0 keeps
 	// it running, and the GPU is never taken from it.
 	Idle Duration `json:"idle,omitempty"`
-	// Quiet are paths asked only to see how it is — ComfyUI's /queue, which
-	// kinhome asks to know whether the box is busy — each with the JSON the
-	// front answers itself while the service is stopped. They neither start
-	// it nor count as using it, so they do not keep it from its idle stop.
+	// Quiet are paths asked only to see how it is — a health check, ComfyUI's
+	// /queue, which kinhome asks to know whether the box is busy — each with
+	// the JSON the front answers itself while the service is stopped: what it
+	// says idle. They neither start it nor count as using it, so they do not
+	// keep it from its idle stop. A path written with its query
+	// (/api/tasks?status=running) is that question only; without, the path
+	// with any query.
 	Quiet map[string]json.RawMessage `json:"quiet,omitempty"`
+	// Busy are those of its quiet paths whose answer tells it is at work with
+	// nobody waiting — a job in ComfyUI's /queue, a task in Pixelle's
+	// /api/tasks?status=running: answered otherwise than when stopped, it is
+	// not stopped, idle or for room, until it is done.
+	Busy []string `json:"busy,omitempty"`
 	// Adopted: the front listens on Addr and runs it. Not adopted: watched.
 	Adopted bool `json:"adopted"`
 	// Need is the most memory it was seen to hold, in bytes: the room the
@@ -165,6 +173,11 @@ func Load(path string) (File, error) {
 			return f, fmt.Errorf("%s: two services are called %s", path, s.Name)
 		}
 		seen[s.Name] = true
+		for _, b := range s.Busy {
+			if _, ok := s.Quiet[b]; !ok {
+				return f, fmt.Errorf("%s: %s's busy path %s needs its answer when stopped in quiet", path, s.Name, b)
+			}
+		}
 	}
 	return f, nil
 }

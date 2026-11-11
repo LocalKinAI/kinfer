@@ -902,20 +902,32 @@ An adopted one runs from `kinfer serve`:
   started has its successor end those first. Released, the service is
   started on its own again, outliving the server.
 
-Some requests only ask how a service is: kinhome asks ComfyUI's `/queue`
-every so often to know whether the box is busy. Such a path is written in the
-entry's `quiet`, each with the JSON the front answers while the service is
-stopped (for ComfyUI, `{"queue_running": [], "queue_pending": []}`). A quiet
+Some requests only ask how a service is: a health check, or ComfyUI's
+`/queue`, which kinhome asks every so often to know whether the box is busy.
+Such a path is written in the entry's `quiet`, each with the JSON the front
+answers while the service is stopped: what the service says when idle. A quiet
 request does not start a stopped service. While the service runs it is passed
 through, but it does not count as use, so a poll does not keep the service from
-its idle stop.
+its idle stop. A path written with its query, such as
+`/api/tasks?status=running`, matches that question only; a path without one
+matches any query.
 
-The same answer tells kinfer when a service is busy with nobody waiting on it,
-such as a ComfyUI job sent without waiting for the result, which can run for an
-hour. When the idle time is up, or the GPU is wanted, kinfer asks the quiet
-path itself. If the answer differs from the stopped one (the queue is not
-empty), the service is left running and asked again every minute. Once it is
-done, it gets its whole idle time again before it stops.
+Some services work on their own after the request that started the work has
+been answered: a ComfyUI job sent without waiting for its result can run for an
+hour. The quiet paths that show such work go in `busy`. When the idle time is
+up, or the GPU is wanted, kinfer asks those paths itself. If an answer differs
+from the stopped one (the queue is not empty), the service is left running and
+asked again every minute. Once it is done, it gets its whole idle time again
+before it stops. A health check whose answer changes as the service runs
+(`"model_loaded": true`) belongs in `quiet` only, never in `busy`.
+
+```json
+"quiet": {
+  "/api/health": {"status": "healthy"},
+  "/api/tasks?status=running": []
+},
+"busy": ["/api/tasks?status=running"]
+```
 
 Adopting, releasing and stopping are asked of `/api/services/…` from the
 machine itself only; from the network, the list can be read.
