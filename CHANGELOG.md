@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.0 — 2026-11-10
 
 ### Changed — every model in a process of its own
 
@@ -29,6 +29,16 @@ then stopped it; a picture stopped ornith. A chat model sizes its context and
 prefix pool to the memory it finds, so a second one usually stops the first,
 as one model at a time did before.
 
+On the laptop (M5 Max, 48 GB): the same regression passed with four models
+(ornith, qwen3.8-27B on MLX, Flash-Next and V4.1 with experts on the SSD).
+Against v0.6.0, back to back in the order new, old, old, new with no flags,
+the replies were the same and so were the speeds: ornith 3,300 tok/s on a
+7,470-token prompt and 136 tok/s decoding; Flash-Next 987 tok/s on the prompt,
+its experts placed the same, its GPU cache 106 MiB smaller. With ornith and
+both speech models loaded, a picture found 4.8 GB free of the 19.6 GB it
+needed and stopped ornith; a chat runner killed mid-reply ended its stream with
+an error, and the next reply came 3.9 s later.
+
 ### Added — pictures, behind the same address
 
 `POST /v1/images/generations`, as OpenAI has it, on a Mac: Z-Image-Turbo
@@ -46,7 +56,8 @@ Ultra: the tokens, the caption's features, the schedule and the starting
 noise the same, the decoder within 1e-5 on mflux's latents, and the pictures at
 40.5–40.8 dB PSNR from mflux's own; 1024×1024 in 30.9 s (29.7 s of
 denoising, mflux's the same 29.7 s), 1024×768 in 22.5 s, 10.8 GB resident and
-an 18.4 GB peak. Each stage's intermediates are freed before it is evaluated:
+an 18.4 GB peak. On the laptop's M5 Max, 1024×1024 in 13.1 s (11.2 s of
+denoising) and 1024×768 in 9.6 s. Each stage's intermediates are freed before it is evaluated:
 held, a 1024×1024 picture's attention took a runner to 84 GB.
 
 ### Added — the Python audio service's addresses
