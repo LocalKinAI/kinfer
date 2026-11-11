@@ -34,8 +34,16 @@ type Manager struct {
 	// Skip is an address the manager never takes: the front's own.
 	Skip string
 
-	mu    sync.Mutex
-	svcs  map[string]*managed
+	mu   sync.Mutex
+	svcs map[string]*managed
+	// snap is the machine as Stats last looked: who listens where and whose
+	// children are whose, two calls out (lsof, ps) that are not made again
+	// for snapAge. /api/ps is asked often, by clients waiting for room.
+	snap struct {
+		at    time.Time
+		ports map[int]int // port → listening pid
+		tree  map[int][]int
+	}
 	mtime time.Time
 	quit  chan struct{}
 	wg    sync.WaitGroup
@@ -625,7 +633,7 @@ func (m *Manager) Stats() []Stat {
 		list = append(list, s)
 	}
 	m.mu.Unlock()
-	tree := children()
+	ports, tree := m.machine()
 	var out []Stat
 	for _, s := range list {
 		m.mu.Lock()
@@ -655,7 +663,7 @@ func (m *Manager) Stats() []Stat {
 		}
 		m.mu.Unlock()
 		if !s.svc.Adopted {
-			if p := listenerPID(s.svc.Port()); p != 0 {
+			if p := ports[s.svc.Port()]; p != 0 {
 				pid, st.State = p, "up"
 			}
 		}
@@ -667,6 +675,35 @@ func (m *Manager) Stats() []Stat {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+const snapAge = 3 * time.Second
+
+// machine is who listens on each port and the process tree, as of at most
+// snapAge ago.
+func (m *Manager) machine() (map[int]int, map[int][]int) {
+	m.mu.Lock()
+	if time.Since(m.snap.at) < snapAge && m.snap.ports != nil {
+		p, t := m.snap.ports, m.snap.tree
+		m.mu.Unlock()
+		return p, t
+	}
+	m.mu.Unlock()
+	ports := map[int]int{}
+	if ls, err := listening(); err == nil {
+		for pid, addrs := range ls {
+			for _, a := range addrs {
+				if n := (Service{Addr: a}).Port(); n != 0 {
+					ports[n] = pid
+				}
+			}
+		}
+	}
+	tree := children()
+	m.mu.Lock()
+	m.snap.at, m.snap.ports, m.snap.tree = time.Now(), ports, tree
+	m.mu.Unlock()
+	return ports, tree
 }
 
 // listenerPID is the process listening on port, 0 if none.

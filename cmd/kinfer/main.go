@@ -84,7 +84,12 @@ func main() {
 		os.Setenv("GGML_METAL_FREE_DEVICE", "1")
 	}
 
+	// /api/version is the release's numbers only: Ollama's clients compare
+	// it as a version, and an internal build's -dev.1 is no part of that.
 	if v := strings.TrimPrefix(version, "v"); v != "dev" {
+		if i := strings.IndexAny(v, "-+"); i > 0 {
+			v = v[:i]
+		}
 		server.Version = v
 	}
 
