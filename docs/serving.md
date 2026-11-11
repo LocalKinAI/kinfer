@@ -856,6 +856,55 @@ buffer to the end of the evaluation, and a 1024² picture's attention held so,
 step after step, took a runner to 84 GB and the box into swap; let go, MLX
 frees each as soon as the graph is done with it.
 
+## The other programs on the machine
+
+A Mac that serves models usually runs more than kinfer: ComfyUI, a talking
+face, a navigation model, each holding gigabytes whether it is used or not,
+and none of them knowing about the others. `kinfer serve` can take them in, so
+one manager knows what is on the GPU, as it already does for its own runners.
+
+```bash
+kinfer service scan            # what is listening here, as entries
+kinfer service scan -save      # written to ~/.kinfer/services.json, watched
+kinfer service list            # what each holds now, and at most
+kinfer service adopt comfyui -idle 30m
+kinfer service release comfyui # back on its own, as it was
+```
+
+`scan` reads what started each program from the process itself: its exact
+command line, the folder it runs in, the environment it was given less the
+session's own, the launchd job it belongs to, and what it holds in memory,
+the GPU's share included. In the command, its port and host become `{port}`
+and `{host}`. That is what lets it run on another port, and it works whether
+they come after `--port`/`--host`, as `--port=…`, as a bare word
+(`http.server 8000`), or in the environment (`PORT=8105`). A program whose port
+is none of these is watched only; so is a launchd job, which launchd would
+start again.
+
+A watched service is shown in `kinfer service list` and in `/api/ps` (as
+`services`, which Ollama's clients do not read), with its process, what it
+holds now and the most it was seen to hold.
+
+An adopted one runs from `kinfer serve`:
+- **Taking it over:** its own process, and only that, is asked to end, and the
+  front listens on its address in its place. Programs started by the same
+  script are left alone.
+- **Started on demand:** the first request starts it on a loopback port, with
+  the same command, folder and environment, and waits until it answers.
+  Requests go through as they came, HTTP or WebSocket, so its clients change
+  nothing.
+- **Stopped when idle:** idle for `-idle`, it is stopped; `-idle 0` keeps it
+  running.
+- **Room on the GPU:** before it starts, room is made for the most it held
+  last time, and when a model or another service needs room, the runner or
+  service unused longest goes first, whichever it is.
+- **Restarts and releases:** a front that ended without stopping what it
+  started has its successor end those first. Released, the service is
+  started on its own again, outliving the server.
+
+Adopting, releasing and stopping are asked of `/api/services/…` from the
+machine itself only; from the network, the list can be read.
+
 ## `kinfer install` keeps the server up
 
 The daemon `run` starts is a plain background process: a reboot loses it, and

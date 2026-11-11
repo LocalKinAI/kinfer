@@ -24,6 +24,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/llama"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
 	"github.com/LocalKinAI/kinfer/internal/server"
+	"github.com/LocalKinAI/kinfer/internal/services"
 	"github.com/LocalKinAI/kinfer/internal/store"
 )
 
@@ -107,6 +108,8 @@ func main() {
 		err = cmdPS(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "service", "services":
+		err = cmdService(os.Args[2:])
 	case "worker":
 		err = cmdWorker(os.Args[2:])
 	case "install":
@@ -729,6 +732,18 @@ func cmdServe(args []string) error {
 	srv.ServeSpeechAddrs()
 	if o.speech == server.SpeechKeep {
 		go srv.PrepareSpeech()
+	}
+	// The other programs on this machine the services file names: watched,
+	// or adopted and run from here (internal/services). Not in a runner.
+	if !runner {
+		mgr := services.NewManager(services.DefaultPath())
+		mgr.Skip = l.Addr().String()
+		srv.SetServices(mgr)
+		if err := mgr.Start(); err != nil {
+			log.Printf("services: %v", err)
+		} else {
+			defer mgr.Close()
+		}
 	}
 
 	select {

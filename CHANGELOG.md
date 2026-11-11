@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.8.0 — unreleased
+
+### Added — the machine's other programs, under one manager
+
+On the box, beside kinfer, ComfyUI, a talking face and a navigation model held
+memory each on their own. The face held 10 GB and the navigation model 9.8 GB
+while nothing used them, and none of them knew the others were there.
+`kinfer service` takes them in.
+
+- `kinfer service scan` lists the programs listening here as service entries.
+  - It reads, from each process itself: its exact command line, its folder,
+    its environment less the session's, its launchd job, and its memory
+    footprint (the GPU's share included).
+  - Its port and host become `{port}` and `{host}`, whether written after a
+    flag, as `--flag=value`, as a bare word, or in the environment.
+  - `-save` writes the new ones to `~/.kinfer/services.json`, watched.
+- `/api/ps` shows every service as `services`: its process, what it holds now,
+  and the most it was seen to hold.
+- `kinfer service adopt NAME` hands one to `kinfer serve`:
+  - its own process is ended, and the front answers on its address;
+  - the first request starts it on a loopback port, and HTTP and WebSocket go
+    through, so its clients change nothing;
+  - idle for `-idle`, it stops;
+  - the room it held last time is made before it starts, and the runner or
+    service unused longest goes first when anything needs room.
+- `release` gives it back, running on its own; `stop` stops kinfer's copy.
+  These are asked from the machine itself only.
+
+Tested on the box with a stand-in: found and templated; adopted, with its own
+process ended; started by the first request in 0.4 s; an upgrade request passed
+through; stopped after 15 s idle; started again by the next request; released
+and running on its own again. Unit tests cover:
+- requests arriving together while the service is stopped, which start it once;
+- refusing an address another program holds;
+- ending what a crashed front left running.
+
 ## v0.7.2 — 2026-11-11
 
 ### Added — pictures and sound in EmbeddingGemma 2

@@ -164,12 +164,9 @@ func (s *Server) makeRoomFor(path string) {
 		if free >= need {
 			return
 		}
-		if r := rs.idlest(path); r != nil {
-			log.Printf("runner: %s needs about %s of the GPU and %s is free: stopping %s, unused since %s",
-				modelName(path), gb(need), gb(free), modelName(r.path), r.used.Format("15:04:05"))
-			rs.stopNow(r)
-			waitFreed(free)
-			continue
+		// The runner or the service unused longest goes (services.go).
+		if s.makeRoom(modelName(path), need, path, "") {
+			return
 		}
 		if rs.busy(path) && time.Now().Before(deadline) {
 			if !waited {

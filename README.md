@@ -263,6 +263,11 @@ several. How it works, and every measurement behind it:
 
 ## What else it does
 
+- **The machine's other programs** ([docs/serving.md](docs/serving.md#the-other-programs-on-the-machine)):
+  `kinfer service scan` finds what is listening here (ComfyUI, a talking face, a
+  navigation model), and `adopt` hands one to `kinfer serve`, which answers on its
+  address, starts it when asked for, stops it when idle, and makes room on the GPU
+  for it and its own models from one account.
 - **Serving** ([docs/serving.md](docs/serving.md)): `run` keeps a model warm in
   a daemon; `serve` sizes the context, the slots and the micro-batch to the model
   and the memory left; a prompt too long for its slot gets a longer one;

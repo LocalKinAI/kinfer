@@ -32,6 +32,7 @@ import (
 	"github.com/LocalKinAI/kinfer/internal/mlxengine"
 	"github.com/LocalKinAI/kinfer/internal/mlximage"
 	"github.com/LocalKinAI/kinfer/internal/mlxtts"
+	"github.com/LocalKinAI/kinfer/internal/services"
 	"github.com/LocalKinAI/kinfer/internal/store"
 	"github.com/LocalKinAI/kinfer/internal/tools"
 )
@@ -86,8 +87,9 @@ type Server struct {
 	speechDefaults []SpeechModel
 	speechAddrs    map[string]string // kind → the extra address answering it (legacy.go)
 	runners        *runnerSet
-	chatRunners    bool     // chat and embedding models in runners too (chatrunners.go)
-	chatArgs       []string // the serve flags a chat model's runner takes
+	services       *services.Manager // the other programs taken in (services.go), or nil
+	chatRunners    bool              // chat and embedding models in runners too (chatrunners.go)
+	chatArgs       []string          // the serve flags a chat model's runner takes
 	pulls          *pullSet
 }
 
@@ -198,6 +200,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/generate", chat("/api/generate", s.handleOllamaGenerate))
 	mux.HandleFunc("/api/tags", s.handleOllamaTags)
 	mux.HandleFunc("/api/ps", s.handlePS)
+	mux.HandleFunc("/api/services", s.handleServices)
+	for _, a := range []string{"adopt", "release", "stop"} {
+		mux.HandleFunc("/api/services/"+a, s.handleServiceAction(a))
+	}
 	mux.HandleFunc("/api/show", show)
 	mux.HandleFunc("/props", props)
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
@@ -935,7 +941,11 @@ func (s *Server) handlePS(w http.ResponseWriter, r *http.Request) {
 		}
 		loaded = append(loaded, e)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": loaded})
+	out := map[string]any{"models": loaded}
+	if s.services != nil { // the other programs taken in (services.go); Ollama's clients read only models
+		out["services"] = s.services.Stats()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleShow answers the capability probe many Ollama clients make before their
