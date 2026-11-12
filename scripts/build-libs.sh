@@ -42,6 +42,10 @@ set -euo pipefail
 
 VERSION=b11998 # the release the patches are made against
 LEVEL=k8       # bumped when the patches change, so a cached copy is not reused
+# The sha256 of codeload's tarball of $VERSION, as every build k1–k8 fetched
+# it. Changed with VERSION; a source that differs is refused, as
+# fetch-libs-other.sh refuses a release archive that differs.
+SRC_SHA=1f31ceacc2840237f81bf7dd77953b84d787781c62ff75065c1df08e54a915cc
 SRC=""
 for arg in "$@"; do
   case "$arg" in
@@ -76,7 +80,12 @@ if [[ -z $SRC ]]; then
   echo "build-libs: downloading $URL"
   curl -fL --retry 3 -o "$SRC" "$URL"
 fi
-echo "build-libs: sha256 $(shasum -a 256 "$SRC" | cut -d' ' -f1)"
+got=$(shasum -a 256 "$SRC" | cut -d' ' -f1)
+if [[ $got != "$SRC_SHA" ]]; then
+  echo "build-libs: $SRC has sha256 $got, not $SRC_SHA — not the $VERSION source the patches were made against" >&2
+  exit 1
+fi
+echo "build-libs: sha256 $got, the $VERSION source"
 mkdir "$TMP/src"
 tar xzf "$SRC" -C "$TMP/src" --strip-components 1
 

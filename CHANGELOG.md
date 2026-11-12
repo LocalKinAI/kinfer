@@ -36,6 +36,15 @@ short question took 30 ms where v0.6.0 took 18.
   read first, and more than 100 million pixels is refused.
 - A model split across machines handed llama.cpp one share for each device,
   where it reads 16; the rest are now zeros.
+- A pull that found its file already there kept it when its size matched,
+  whatever was in it: a file pushed again at the same size, or a shard of an
+  earlier version, was never fetched. Its sha256 must now be the one the repo
+  publishes. A pull records the sha256 of what it fetched, hidden beside the
+  files, so pulling again does not hash tens of gigabytes; a file it has no
+  record of is hashed once.
+- The Mac build of the llama.cpp libraries printed the source's sha256 without
+  comparing it. It now refuses a source other than the one the patches were
+  made against, as the Linux and Windows fetches do.
 
 ### Added — the machine's other programs, under one manager
 
