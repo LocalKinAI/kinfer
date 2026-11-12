@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/engine"
 )
@@ -26,6 +27,7 @@ type fakeEmbedder struct {
 
 	mu     sync.Mutex
 	closed bool
+	broken bool
 	seen   []engine.EmbedInput
 }
 
@@ -56,6 +58,12 @@ func (f *fakeEmbedder) Close() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = true
+}
+
+func (f *fakeEmbedder) Broken() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.broken
 }
 
 func (f *fakeEmbedder) isClosed() bool {
@@ -314,5 +322,31 @@ func TestEmbedInputsReadsPicturesAndSound(t *testing.T) {
 	}
 	if _, err := embedInputs(json.RawMessage(`[{"image": "not base64!"}]`)); err == nil {
 		t.Error("bad base64 was read")
+	}
+}
+
+// An embedder whose backend failed fatally is loaded again rather than handed
+// out: every call to it would fail the same way until it was unloaded.
+func TestABrokenEmbedderIsLoadedAgain(t *testing.T) {
+	srv, _, loaded := embedServer(t)
+	if code, _ := postJSON(t, srv, "/api/embed", `{"model":"nomic","input":"one"}`); code != 200 {
+		t.Fatalf("first embedding: %d", code)
+	}
+	first := loaded()[0]
+	first.mu.Lock()
+	first.broken = true
+	first.mu.Unlock()
+	if code, _ := postJSON(t, srv, "/api/embed", `{"model":"nomic","input":"two"}`); code != 200 {
+		t.Fatalf("after it broke: %d", code)
+	}
+	if n := len(loaded()); n != 2 {
+		t.Fatalf("%d embedders loaded, want the broken one loaded again", n)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !first.isClosed() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !first.isClosed() {
+		t.Error("the broken embedder was never closed")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"math"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/LocalKinAI/kinfer/internal/llama"
 	"github.com/LocalKinAI/kinfer/internal/nativelib"
@@ -45,7 +46,14 @@ type Embedder struct {
 	batch *llama.BatchBuilder
 	dims  int
 	limit int // tokens one text may hold
+
+	// broken is set when llama.cpp's backend failed fatally under it: every
+	// call would fail the same way, so the server loads it again instead.
+	broken atomic.Bool
 }
+
+// Broken reports a backend failure this embedder cannot serve past.
+func (e *Embedder) Broken() bool { return e.broken.Load() }
 
 // EmbedInput is one thing to embed: a text, or the tokens of one, and for a
 // model that reads them (EmbeddingGemma 2, internal/mlxembed) pictures and
@@ -185,6 +193,9 @@ func (e *Embedder) Embed(ctx context.Context, inputs []EmbedInput, truncate bool
 		// for the next.
 		llama.ClearMemory(e.ctx)
 		if err != nil {
+			if de := (*llama.DecodeError)(nil); errors.As(err, &de) && de.Fatal() {
+				e.broken.Store(true)
+			}
 			return nil, 0, fmt.Errorf("embed: %w", err)
 		}
 	}

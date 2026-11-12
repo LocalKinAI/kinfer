@@ -42,6 +42,9 @@ short question took 30 ms where v0.6.0 took 18.
   publishes. A pull records the sha256 of what it fetched, hidden beside the
   files, so pulling again does not hash tens of gigabytes; a file it has no
   record of is hashed once.
+- An embedding model run by llama.cpp whose backend failed fatally kept
+  answering every request with the same error until it was unloaded. It is
+  marked broken now, and the next request loads it again.
 - MLX models' tokenizer merged each word by scanning it after every merge:
   a run of text with no space or mark in it (long Chinese, base64) is one
   word, and tens of thousands of characters took seconds. It merges in a

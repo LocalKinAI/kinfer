@@ -37,6 +37,13 @@ type embedder interface {
 	Close()
 }
 
+// embedBroken reports an embedder whose backend failed fatally: loaded again
+// rather than handed out, since every call to it would fail the same way.
+func embedBroken(e embedder) bool {
+	b, ok := e.(interface{ Broken() bool })
+	return ok && b.Broken()
+}
+
 func openEmbedder(path string, opts engine.Options) (embedder, error) {
 	if mlxembed.IsModelDir(path) {
 		return mlxembed.Open(path)
@@ -80,7 +87,7 @@ func (s *Server) acquireEmbedder(name string) (*embedLease, time.Duration, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
-		if l := s.emb; l != nil && l.path == path {
+		if l := s.emb; l != nil && l.path == path && !embedBroken(l.emb) {
 			l.refs++
 			s.stopEmbedIdleLocked()
 			return l, 0, nil
