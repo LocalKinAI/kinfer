@@ -1,6 +1,9 @@
 package engine
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // The box's layout: -ctx 16384 -slots 4 on a model trained for 262144.
 var boxHome = layout{slots: 4, perSeq: 16384}
@@ -142,8 +145,10 @@ func TestPlaceFollowsTheHeadOfTheQueue(t *testing.T) {
 }
 
 func TestWaitingCountsTheHeldRequest(t *testing.T) {
-	s := &scheduler{incoming: make(chan *job, 4)}
-	s.incoming <- &job{}
+	s := testQueue(4)
+	if err := s.submit(&job{ctx: context.Background()}); err != nil {
+		t.Fatal(err)
+	}
 	if got := s.Waiting(); got != 1 {
 		t.Fatalf("Waiting = %d with one queued, want 1", got)
 	}

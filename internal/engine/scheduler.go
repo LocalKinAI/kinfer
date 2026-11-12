@@ -169,6 +169,15 @@ type scheduler struct {
 	stop     chan struct{}
 	stopped  chan struct{}
 
+	// queueCap is how many requests may wait for a slot that are still
+	// wanted, and waiting counts them. incoming has room for more: for the
+	// ones whose callers gave up, which leave it only on reaching its head.
+	// Counted with them, a burst of callers timing out and asking again
+	// filled it with requests nobody waited for, and the ones still wanted
+	// were refused.
+	queueCap int
+	waiting  atomic.Int64
+
 	// rate is how fast requests have actually been finishing, which is the only
 	// honest basis for telling a refused caller when to come back.
 	rate completionRate
@@ -257,6 +266,12 @@ type job struct {
 	// stats is what was counted and measured while answering. The scheduler
 	// fills it in before finish, so it is only read after frags is closed.
 	stats Stats
+
+	// inQueue is true while the job waits in incoming and counts in the
+	// scheduler's waiting; unwatch stops the watch that takes it out of the
+	// count the moment its caller gives up.
+	inQueue atomic.Bool
+	unwatch func() bool
 }
 
 func (j *job) finish(err error) {
@@ -340,7 +355,8 @@ func newScheduler(lctx llama.Context, draft *drafter, home layout, vocab llama.V
 		vocab:         vocab,
 		tpl:           tpl,
 		batch:         llama.NewBatchBuilder(batchCap),
-		incoming:      make(chan *job, maxQueue),
+		incoming:      make(chan *job, maxQueue*givenUpRoom),
+		queueCap:      maxQueue,
 		limits:        limits,
 		wholePrefixes: wholePrefixes,
 		flex:          fx,
@@ -365,33 +381,83 @@ func (s *scheduler) submit(j *job) error {
 		// Same case as a job drained from the queue: nothing of this request
 		// happened, so a caller able to reload can simply run it again.
 		return ErrNotStarted
+	case <-s.stopped:
+		// The loop has ended (the backend failed fatally) and nothing reads
+		// the queue any more. Queued, the request would wait for ever, and
+		// its hold on the engine would keep the model it failed on loaded.
+		return ErrNotStarted
 	default:
 	}
 
 	j.queued = time.Now()
+	if n := s.waiting.Load(); n >= int64(s.queueCap) {
+		return s.busyError(n)
+	}
+	j.inQueue.Store(true)
+	s.waiting.Add(1)
+	if j.ctx != nil {
+		// A caller that gives up stops counting at once, not when the
+		// request reaches the head of the queue.
+		j.unwatch = context.AfterFunc(j.ctx, func() { s.leftQueue(j) })
+	}
 
 	select {
 	case s.incoming <- j:
-		return nil
 	case <-s.stop:
+		s.taken(j)
 		return ErrNotStarted
 	default:
-		// The queue is full. Refuse, rather than block until something times
-		// out: a caller told it is 200 deep can back off, and a caller left
-		// holding an open connection cannot tell that from a slow model.
-		waiting := len(s.incoming)
-		return &BusyError{
-			Waiting:    waiting,
-			Capacity:   cap(s.incoming),
-			RetryAfter: s.rate.wait(waiting),
-		}
+		// Room for the wanted ones, but not beside the given-up ones still
+		// in the queue.
+		s.taken(j)
+		return s.busyError(s.waiting.Load())
 	}
+	select {
+	case <-s.stopped:
+		// The loop ended while this was being queued, after its last look at
+		// the queue: answer what it left there.
+		s.drainQueue()
+	default:
+	}
+	return nil
+}
+
+// givenUpRoom is how many times queueCap the queue holds, the rest for the
+// requests given up on that have not yet reached its head.
+const givenUpRoom = 4
+
+// busyError is the refusal of a request with n waiting. Refused rather than
+// left to block until something times out: a caller told it is 200 deep can
+// back off, and a caller left holding an open connection cannot tell that
+// from a slow model.
+func (s *scheduler) busyError(n int64) error {
+	return &BusyError{
+		Waiting:    int(n),
+		Capacity:   s.queueCap,
+		RetryAfter: s.rate.wait(int(n)),
+	}
+}
+
+// leftQueue takes j out of the count of requests waiting: it reached the head
+// of the queue, or its caller gave up.
+func (s *scheduler) leftQueue(j *job) {
+	if j.inQueue.CompareAndSwap(true, false) {
+		s.waiting.Add(-1)
+	}
+}
+
+// taken is j off the queue: out of the count, and no longer watched.
+func (s *scheduler) taken(j *job) {
+	if j.unwatch != nil {
+		j.unwatch()
+	}
+	s.leftQueue(j)
 }
 
 // Waiting is how many requests are queued for a slot, counting the one at the
 // head that admission has already taken off the queue to size.
 func (s *scheduler) Waiting() int {
-	n := len(s.incoming)
+	n := int(s.waiting.Load())
 	if s.holding.Load() {
 		n++
 	}
@@ -405,7 +471,7 @@ func (s *scheduler) close() {
 
 // run is the only goroutine that touches the context.
 func (s *scheduler) run() {
-	defer close(s.stopped)
+	defer s.ended()
 
 	for {
 		if !s.admit() {
@@ -426,6 +492,7 @@ func (s *scheduler) run() {
 			// keep a core warm.
 			select {
 			case j := <-s.incoming:
+				s.taken(j)
 				if s.prepare(j) {
 					s.hold(j)
 				}
@@ -519,6 +586,7 @@ func (s *scheduler) head() *job {
 		}
 		select {
 		case j := <-s.incoming:
+			s.taken(j)
 			if s.prepare(j) {
 				s.hold(j)
 			}
@@ -1402,12 +1470,26 @@ func (s *scheduler) drain() {
 		s.held.finish(ErrNotStarted)
 		s.hold(nil)
 	}
+	s.drainQueue()
+}
+
+// drainQueue answers every request still queued: nothing of it happened.
+func (s *scheduler) drainQueue() {
 	for {
 		select {
 		case j := <-s.incoming:
+			s.taken(j)
 			j.finish(ErrNotStarted)
 		default:
 			return
 		}
 	}
+}
+
+// ended is run's end, however it came: from now on submit refuses, and what
+// was queued after the loop's last drain, before it could know, is answered.
+// What is queued later still is answered by submit itself.
+func (s *scheduler) ended() {
+	close(s.stopped)
+	s.drainQueue()
 }
