@@ -261,7 +261,11 @@ func pullDir(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, 
 		m.start(f.Name)
 		// A file in a folder keeps it: Qwen3-TTS's speech_tokenizer/ holds a
 		// model.safetensors of its own.
-		dest := filepath.Join(dir, filepath.FromSlash(f.Name))
+		rel, ok := repoPath(f.Name)
+		if !ok {
+			return fmt.Errorf("%s names a file %q outside its folder; not pulled", ref.Repo, f.Name)
+		}
+		dest := filepath.Join(dir, rel)
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			return err
 		}
@@ -402,4 +406,16 @@ func (m *pullMeter) draw(line string) {
 	}
 	fmt.Printf("\r%-*s", w, line)
 	m.drawn = true
+}
+
+// repoPath is a repo's file name as a path under the model's folder: its
+// folders kept, nothing in it that leaves the folder. A backslash is refused
+// too — a plain character in a name on Hugging Face, a separator on Windows,
+// where ..\..\ in one would write outside the store.
+func repoPath(name string) (string, bool) {
+	if strings.Contains(name, "\\") {
+		return "", false
+	}
+	rel := filepath.FromSlash(name)
+	return rel, filepath.IsLocal(rel)
 }

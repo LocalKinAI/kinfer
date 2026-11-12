@@ -42,6 +42,13 @@ short question took 30 ms where v0.6.0 took 18.
   publishes. A pull records the sha256 of what it fetched, hidden beside the
   files, so pulling again does not hash tens of gigabytes; a file it has no
   record of is hashed once.
+- A pull threw away every piece already fetched when one ranged request was
+  answered with the whole file, a CDN's hiccup, and fetched it all again. Once
+  a pull has had its ranges, such an answer is asked again.
+- A file name in a repo with a backslash, Windows' separator, could write
+  outside the model's folder on Windows. Names that leave the folder are
+  refused.
+- A remote GGUF header with a length near the limit crashed `kinfer pull`.
 - The Mac build of the llama.cpp libraries printed the source's sha256 without
   comparing it. It now refuses a source other than the one the patches were
   made against, as the Linux and Windows fetches do.

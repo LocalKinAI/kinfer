@@ -251,7 +251,7 @@ func ggufArchitecture(d []byte) (string, error) {
 		}
 		n := int(binary.LittleEndian.Uint64(d[off:]))
 		off += 8
-		if n < 0 || off+n > len(d) {
+		if n < 0 || n > len(d)-off {
 			return "", false
 		}
 		s := string(d[off : off+n])
