@@ -98,7 +98,7 @@ func deviceList(peers []string, split []float32) ([]uintptr, []float32, error) {
 		if len(split) != len(devs) {
 			return nil, nil, fmt.Errorf("the split names %d shares for %d devices (each peer's, then this machine's)", len(split), len(devs))
 		}
-		shares = append(make([]float32, 0, len(split)), split...)
+		shares = paddedShares(split)
 	}
 
 	parts := make([]string, len(devs))
@@ -111,4 +111,17 @@ func deviceList(peers []string, split []float32) ([]uintptr, []float32, error) {
 	}
 	log.Printf("devices: %s — the first layers go to the peers, the rest and the output stay here", strings.Join(parts, ", "))
 	return append(devs, 0), shares, nil
+}
+
+// llamaMaxDevices is llama.cpp's llama_max_devices() (16 in b11998): the
+// shares it copies from a model's tensor_split, however many devices there are.
+const llamaMaxDevices = 16
+
+// paddedShares is split with zeros after it to llamaMaxDevices: llama.cpp
+// reads that many, and read past a slice of one share a device it read memory
+// that was not ours.
+func paddedShares(split []float32) []float32 {
+	shares := make([]float32, max(len(split), llamaMaxDevices))
+	copy(shares, split)
+	return shares
 }

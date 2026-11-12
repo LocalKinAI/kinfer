@@ -17,6 +17,26 @@ short question took 30 ms where v0.6.0 took 18.
   now takes 6.6 ms to its first word (it took 29.8), and one embedding 14 ms
   (it took 39).
 
+### Fixed — found by a review of the code, each tested
+
+- An MLX model with an MTP head (Ollama's `-mlx` models) crashed its runner
+  when a prompt pooled while one reply was drafting was read on by two at
+  once: each pass freed the head's arrays the cache still held. Reproduced on
+  the box with qwen3.8:27b-mlx; each pass now frees only what it replaced.
+- After a fatal backend failure, a request that reached the model before it
+  was retired waited for ever, and its hold kept the failed model loaded. The
+  queue now refuses once its loop has ended, and the server reloads the model
+  and runs the request again.
+- Requests whose callers had gone counted toward the queue's limit until they
+  reached its head, so callers timing out and asking again could fill it and
+  have the ones still wanted refused with 503. They now stop counting the
+  moment the caller goes.
+- A picture sent for an embedding was decoded whole before its size was
+  looked at: a few hundred bytes of PNG could ask for gigabytes. Its header is
+  read first, and more than 100 million pixels is refused.
+- A model split across machines handed llama.cpp one share for each device,
+  where it reads 16; the rest are now zeros.
+
 ### Added — the machine's other programs, under one manager
 
 On the box, beside kinfer, ComfyUI, a talking face and a navigation model held

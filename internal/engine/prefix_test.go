@@ -352,3 +352,16 @@ func TestHostExpertRegexes(t *testing.T) {
 		t.Error("the every-layer pattern misses a layer's experts")
 	}
 }
+
+// The shares handed to llama.cpp are as many as it reads, the devices' first.
+func TestSharesArePaddedToWhatLlamaReads(t *testing.T) {
+	got := paddedShares([]float32{0.6, 0.4})
+	if len(got) != llamaMaxDevices || got[0] != 0.6 || got[1] != 0.4 {
+		t.Fatalf("padded shares %v", got)
+	}
+	for i, v := range got[2:] {
+		if v != 0 {
+			t.Errorf("share %d past the devices is %g, want 0", i+2, v)
+		}
+	}
+}
