@@ -103,13 +103,37 @@ func (t *Tokenizer) mergeChars(word string) []int32 {
 		}
 		syms = append(syms, symbol{s: c})
 	}
+	t.merge(syms)
+
+	ids := make([]int32, 0, len(syms))
+	for i := 0; i >= 0 && i < len(syms); i = syms[i].next {
+		if id, ok := t.vocab[syms[i].s]; ok {
+			ids = append(ids, id)
+		} else if t.unk >= 0 {
+			ids = append(ids, t.unk)
+		}
+	}
+	if short {
+		t.mu.Lock()
+		if len(t.cache) < 1<<16 {
+			t.cache[word] = ids
+		}
+		t.mu.Unlock()
+	}
+	return ids
+}
+
+// merge merges syms — linked by prev and next, in order — by rank, the
+// lowest-ranked pair anywhere first and the leftmost of equals, keeping the
+// pairs in a heap rather than scanning for the best one after every merge:
+// a word of n symbols costs n log n, not n². What merged away is marked gone.
+func (t *Tokenizer) merge(syms []symbol) {
 	for i := range syms {
 		syms[i].prev, syms[i].next = i-1, i+1
 	}
 	if len(syms) > 0 {
 		syms[len(syms)-1].next = -1
 	}
-
 	q := &pairs{}
 	push := func(l int) {
 		if l < 0 || syms[l].next < 0 {
@@ -142,23 +166,6 @@ func (t *Tokenizer) mergeChars(word string) []int32 {
 		}
 		push(l)
 	}
-
-	ids := make([]int32, 0, len(syms))
-	for i := 0; i >= 0 && i < len(syms); i = syms[i].next {
-		if id, ok := t.vocab[syms[i].s]; ok {
-			ids = append(ids, id)
-		} else if t.unk >= 0 {
-			ids = append(ids, t.unk)
-		}
-	}
-	if short {
-		t.mu.Lock()
-		if len(t.cache) < 1<<16 {
-			t.cache[word] = ids
-		}
-		t.mu.Unlock()
-	}
-	return ids
 }
 
 type symbol struct {

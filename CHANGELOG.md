@@ -42,6 +42,10 @@ short question took 30 ms where v0.6.0 took 18.
   publishes. A pull records the sha256 of what it fetched, hidden beside the
   files, so pulling again does not hash tens of gigabytes; a file it has no
   record of is hashed once.
+- MLX models' tokenizer merged each word by scanning it after every merge:
+  a run of text with no space or mark in it (long Chinese, base64) is one
+  word, and tens of thousands of characters took seconds. It merges in a
+  heap now, as EmbeddingGemma's does, with the same tokens.
 - A reply longer than its buffer (2,048 pieces), read slowly by its client,
   lost its end without saying so. What does not fit now follows the rest.
 - A pull threw away every piece already fetched when one ranged request was

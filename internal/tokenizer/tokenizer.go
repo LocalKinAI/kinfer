@@ -265,26 +265,17 @@ func (t *Tokenizer) bpe(word string) []int32 {
 	}
 	t.mu.Unlock()
 
-	parts := make([]string, 0, len(word))
+	// A word is most often a few characters, but a run of text with no space
+	// or mark in it — long Chinese, base64 — is one word, of tens of
+	// thousands: merged in a heap (merge), not by scanning after each merge.
+	syms := make([]symbol, 0, len(word))
 	for _, r := range word {
-		parts = append(parts, string(r))
+		syms = append(syms, symbol{s: string(r)})
 	}
-	for len(parts) > 1 {
-		best, bestRank := -1, 0
-		for i := 0; i+1 < len(parts); i++ {
-			if r, ok := t.ranks[[2]string{parts[i], parts[i+1]}]; ok && (best < 0 || r < bestRank) {
-				best, bestRank = i, r
-			}
-		}
-		if best < 0 {
-			break
-		}
-		parts[best] += parts[best+1]
-		parts = append(parts[:best+1], parts[best+2:]...)
-	}
-	ids := make([]int32, 0, len(parts))
-	for _, p := range parts {
-		if id, ok := t.vocab[p]; ok {
+	t.merge(syms)
+	ids := make([]int32, 0, len(syms))
+	for i := 0; i >= 0 && i < len(syms); i = syms[i].next {
+		if id, ok := t.vocab[syms[i].s]; ok {
 			ids = append(ids, id)
 		}
 	}
