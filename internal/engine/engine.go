@@ -1170,6 +1170,12 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p GenParams,
 			onToken(frag)
 		}
 	}
+	if j.tail != "" { // what the buffer had no room for, read slowly
+		out.WriteString(j.tail)
+		if onToken != nil {
+			onToken(j.tail)
+		}
+	}
 	<-j.done
 
 	// A deadline is not a failure at this boundary. The partial reply is worth

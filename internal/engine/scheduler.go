@@ -267,6 +267,10 @@ type job struct {
 	// fills it in before finish, so it is only read after frags is closed.
 	stats Stats
 
+	// tail is the end of a reply that would not fit in frags, a client
+	// having read too slowly: read after frags closes.
+	tail string
+
 	// inQueue is true while the job waits in incoming and counts in the
 	// scheduler's waiting; unwatch stops the watch that takes it out of the
 	// count the moment its caller gives up.
@@ -1333,14 +1337,16 @@ func (s *scheduler) take(sl *slot, tok llama.Token, past int32) bool {
 func (s *scheduler) finishSlot(sl *slot) {
 	text, _ := s.tpl.TrimStop(sl.out.String())
 	if len(text) > sl.emitted {
-		// The buffer is sized to hold a whole reply, so this does not block in
-		// practice; the default arm keeps a vanished client from proving that
-		// wrong at everyone else's expense.
+		// Never blocking here keeps a client that stopped reading from
+		// stalling every other slot. A reply longer than the buffer, read
+		// slowly, fills it; what does not fit then goes as the job's tail,
+		// which the reader takes after the rest, instead of being lost.
 		select {
 		case sl.job.frags <- text[sl.emitted:]:
-			sl.emitted = len(text)
 		default:
+			sl.job.tail = text[sl.emitted:]
 		}
+		sl.emitted = len(text)
 	}
 	s.release(sl, nil)
 }

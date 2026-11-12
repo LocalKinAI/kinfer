@@ -42,6 +42,8 @@ short question took 30 ms where v0.6.0 took 18.
   publishes. A pull records the sha256 of what it fetched, hidden beside the
   files, so pulling again does not hash tens of gigabytes; a file it has no
   record of is hashed once.
+- A reply longer than its buffer (2,048 pieces), read slowly by its client,
+  lost its end without saying so. What does not fit now follows the rest.
 - A pull threw away every piece already fetched when one ranged request was
   answered with the whole file, a CDN's hiccup, and fetched it all again. Once
   a pull has had its ranges, such an answer is asked again.

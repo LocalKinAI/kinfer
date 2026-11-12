@@ -3,8 +3,11 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/LocalKinAI/kinfer/internal/chat"
 )
 
 // A refusal has to be recognisable as one. A caller that cannot tell "too busy"
@@ -156,5 +159,25 @@ func TestNothingWaitsForALoopThatEnded(t *testing.T) {
 	}
 	if got := s.Waiting(); got != 0 {
 		t.Errorf("Waiting = %d after the end, want 0", got)
+	}
+}
+
+// A reply longer than its buffer, read slowly, keeps its end: what the buffer
+// had no room for goes as the job's tail, read after the rest.
+func TestAReplyReadSlowlyKeepsItsEnd(t *testing.T) {
+	s := &scheduler{tpl: &chat.Template{}}
+	j := &job{ctx: context.Background(), frags: make(chan string, 1), done: make(chan struct{})}
+	j.frags <- "the start, " // the buffer is full, and nobody has read it yet
+	sl := &slot{job: j}
+	sl.out.WriteString("the start, and the end.")
+	sl.emitted = len("the start, ")
+	s.finishSlot(sl)
+	var got strings.Builder
+	for f := range j.frags {
+		got.WriteString(f)
+	}
+	got.WriteString(j.tail)
+	if got.String() != "the start, and the end." {
+		t.Errorf("read slowly, the reply came as %q", got.String())
 	}
 }
