@@ -36,6 +36,10 @@ type fakeHub struct {
 	noRanges bool
 	cut      int64 // each CDN reply drops its connection after this many bytes; 0 never
 
+	wholeAt   atomic.Int64 // once this many bytes have gone out, one ranged request is answered whole
+	wholeDone atomic.Bool
+	unranged  atomic.Int64 // CDN requests that asked for no range: the whole file
+
 	stopAt   atomic.Int64 // once this many bytes have gone out, call stop
 	stop     func()
 	expireAt atomic.Int64 // once this many bytes have gone out, expire every address so far
@@ -93,8 +97,14 @@ func (h *fakeHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "down", http.StatusServiceUnavailable)
 		return
 	}
+	if r.Header.Get("Range") == "" {
+		h.unranged.Add(1)
+	}
 	if h.noRanges {
 		r.Header.Del("Range")
+	}
+	if at := h.wholeAt.Load(); at > 0 && h.served(0) >= at && r.Header.Get("Range") != "" && h.wholeDone.CompareAndSwap(false, true) {
+		r.Header.Del("Range") // a CDN edge's hiccup
 	}
 	http.ServeContent(&cdnWriter{ResponseWriter: w, hub: h, sig: sig, left: h.cut},
 		r, "blob", time.Time{}, bytes.NewReader(b.data))
@@ -610,5 +620,26 @@ func TestDownloadFetchesAgainAFileOfTheSameSizeThatDiffers(t *testing.T) {
 	}
 	if sums := readSums(dir); sums["m.gguf"].SHA256 != h.file.Load().sum {
 		t.Errorf("recorded sum %+v, want the repo's", sums["m.gguf"])
+	}
+}
+
+// One ranged request answered with the whole file, halfway through a pull
+// whose others came with their ranges, is asked again: the pieces already
+// here are kept, and the file is not fetched over from the start.
+func TestDownloadKeepsItsPiecesWhenOneRangeIsAnsweredWhole(t *testing.T) {
+	small(t)
+	const size = 4 << 20
+	h := serve(t, size)
+	h.wholeAt.Store(size / 2)
+	dir := t.TempDir()
+	if _, err := Download(context.Background(), "o/r", "m.gguf", dir, 4, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !h.wholeDone.Load() {
+		t.Fatal("no request was answered whole: the test did not test")
+	}
+	holds(t, filepath.Join(dir, "m.gguf"), h.file.Load().data)
+	if n := h.unranged.Load(); n != 0 {
+		t.Errorf("%d requests for the whole file: the pull started over", n)
 	}
 }

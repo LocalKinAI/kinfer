@@ -76,11 +76,14 @@ var (
 const saveEvery = 2 * time.Second
 
 var (
-	errNoRanges  = errors.New("the server ignores ranged requests")
-	errMismatch  = errors.New("the file does not match the sha256 Hugging Face publishes for it")
-	errExpired   = errors.New("the CDN's address for the file expired")
-	errDiskFull  = errors.New("the disk is nearly full")
-	errRedirects = errors.New("stopped after 10 redirects")
+	errNoRanges = errors.New("the server ignores ranged requests")
+	// errAnsweredWhole is a ranged request answered with the whole file
+	// by a server that has answered this pull's others with their ranges.
+	errAnsweredWhole = errors.New("a ranged request was answered with the whole file")
+	errMismatch      = errors.New("the file does not match the sha256 Hugging Face publishes for it")
+	errExpired       = errors.New("the CDN's address for the file expired")
+	errDiskFull      = errors.New("the disk is nearly full")
+	errRedirects     = errors.New("stopped after 10 redirects")
 )
 
 // permanent marks an error that asking again cannot fix.
@@ -302,6 +305,10 @@ type download struct {
 	gen    int    // how many times url has been asked for again
 
 	checked atomic.Int64
+	// ranged is set once a ranged request of this pull was answered with
+	// its range: the server takes ranges, and one answered whole after that
+	// is a hiccup to ask again, not a reason to start the file over.
+	ranged  atomic.Bool
 	waiting atomic.Pointer[string] // why the last request failed, until bytes arrive again
 }
 
@@ -607,7 +614,13 @@ func (d *download) get(ctx context.Context, p *piece, buf []byte) error {
 
 	switch code := resp.StatusCode; {
 	case code == http.StatusPartialContent:
+		d.ranged.Store(true)
 	case code == http.StatusOK:
+		if d.ranged.Load() {
+			// Asked again, like a dropped connection: falling back to the
+			// whole file would throw away every piece already here.
+			return errAnsweredWhole
+		}
 		return permanent{errNoRanges}
 	case code == http.StatusUnauthorized, code == http.StatusForbidden,
 		code == http.StatusNotFound, code == http.StatusGone:
