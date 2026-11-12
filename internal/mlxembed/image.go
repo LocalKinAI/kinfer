@@ -14,15 +14,9 @@ import (
 // prepare decodes a picture and makes the tower's input at the release's
 // budget of soft tokens (vision_soft_tokens_per_image, 280).
 func (vt *visionTower) prepare(data []byte, budget int) (visionInput, error) {
-	img, _, err := image.Decode(bytes.NewReader(data))
+	img, err := decodePicture(data)
 	if err != nil {
-		png, cerr := toPNG(data) // WebP, HEIC, TIFF
-		if cerr != nil {
-			return visionInput{}, fmt.Errorf("not a picture this reads: %w", err)
-		}
-		if img, _, err = image.Decode(bytes.NewReader(png)); err != nil {
-			return visionInput{}, fmt.Errorf("not a picture this reads: %w", err)
-		}
+		return visionInput{}, err
 	}
 	c := vt.cfg
 	b := img.Bounds()
@@ -36,6 +30,48 @@ func (vt *visionTower) prepare(data []byte, budget int) (visionInput, error) {
 	rgb := resizeRGB(img, tw, th)
 	return patchify(rgb, tw, th, c.Patch, c.Pool), nil
 }
+
+// maxPicturePixels is the most pixels a picture may have: a phone's largest
+// photo is 48 million. A picture is decoded whole before it is made small, and
+// its header is all that says how large it is: a few hundred kilobytes of PNG
+// can say 50,000 × 50,000, gigabytes once decoded.
+const maxPicturePixels = 100_000_000
+
+// decodePicture decodes a picture, its size read from its header first and
+// refused past maxPicturePixels; one Go does not read (WebP, HEIC, TIFF) is
+// made a PNG first.
+func decodePicture(data []byte) (image.Image, error) {
+	decode := func(b []byte) (image.Image, error) {
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxPicturePixels {
+			return nil, fmt.Errorf("%w: %d×%d is more than %d million pixels", errTooLarge, cfg.Width, cfg.Height, maxPicturePixels/1_000_000)
+		}
+		img, _, err := image.Decode(bytes.NewReader(b))
+		return img, err
+	}
+	img, err := decode(data)
+	if errors.Is(err, errTooLarge) {
+		return nil, err
+	}
+	if err != nil {
+		png, cerr := toPNG(data) // WebP, HEIC, TIFF
+		if cerr != nil {
+			return nil, fmt.Errorf("not a picture this reads: %w", err)
+		}
+		if img, err = decode(png); err != nil {
+			if errors.Is(err, errTooLarge) {
+				return nil, err
+			}
+			return nil, fmt.Errorf("not a picture this reads: %w", err)
+		}
+	}
+	return img, nil
+}
+
+var errTooLarge = errors.New("the picture is too large")
 
 // visionTargetSize is the reference's resize: each side a multiple of
 // patch·pool, the area within budget soft tokens, the shape kept; a side
