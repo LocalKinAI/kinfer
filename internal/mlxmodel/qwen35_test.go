@@ -507,3 +507,71 @@ func TestQwen35CacheClone(t *testing.T) {
 	same("the cache, after its clone wrote over the same positions", gotD, wantD)
 	same("the clone", gotC, wantC)
 }
+
+// A cache read while drafting — the head read its tokens too — and cloned, as
+// the prefix pool does, reads on in a reply that does not draft (one of two at
+// once): the head's arrays stay as they were, and the clone gives exactly what
+// a cache that never drafted gives. Each pass used to free the head's arrays
+// while the cache kept them, and the next pass read freed memory.
+func TestQwen35PooledWhileDraftingReadsOnWithout(t *testing.T) {
+	lib, dir := os.Getenv("KINFER_MLX_LIB"), os.Getenv("KINFER_MLX_MODEL")
+	if lib == "" || dir == "" {
+		t.Skip("KINFER_MLX_LIB and KINFER_MLX_MODEL not both set")
+	}
+	if err := mlx.Open(lib); err != nil {
+		t.Fatal(err)
+	}
+	m, err := LoadQwen35(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	if m.mtp == nil {
+		t.Skip("the model has no MTP head")
+	}
+	part := func(seed, n int) []int32 {
+		p := make([]int32, n)
+		for i := range p {
+			p[i] = int32(1000 + ((seed+1)*7919+i*104729)%50000)
+		}
+		return p
+	}
+	a, c, d := part(1, 300), part(3, 50), part(4, 40)
+	read := func(cache *Qwen35Cache, chunks ...[]int32) []float32 {
+		var out []float32
+		for _, ch := range chunks {
+			lg, err := m.Forward([][]int32{ch}, cache, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = mlx.Astype(lg, mlx.Float32).Float32s()
+			lg.Free()
+		}
+		return out
+	}
+
+	pooled := m.NewCache()
+	pooled.Drafting = true
+	read(pooled, a)
+	if pooled.headH == 0 {
+		t.Fatal("drafting, the head kept no state")
+	}
+	reply := pooled.Clone()
+	reply.Drafting = false
+	got := read(reply, c, d) // two passes: the second used to meet freed arrays
+	again := reply.Clone()   // pooled at a checkpoint, as prefill does
+	again.Free()
+	reply.Free()
+	pooled.Free()
+
+	fresh := m.NewCache()
+	want := read(fresh, a, c, d)
+	fresh.Free()
+	worst := 0.0
+	for i := range want {
+		worst = math.Max(worst, math.Abs(float64(got[i]-want[i])))
+	}
+	if worst != 0 {
+		t.Errorf("read on without drafting from a cache pooled while drafting: logits differ by up to %g", worst)
+	}
+}

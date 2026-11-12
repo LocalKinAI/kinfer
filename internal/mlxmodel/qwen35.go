@@ -761,12 +761,15 @@ func (m *Qwen35) step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int
 
 	cache.Offset += L
 	scope.Keep(logits)
-	scope.Escape(cache.Arrays()...)
-	// The graph holds what it still needs of the old cache; our handles to it
-	// can go now, which also lets MLX update the KV buffers in place.
-	for _, a := range old {
-		a.Free()
-	}
+	fresh := cache.Arrays()
+	scope.Escape(fresh...)
+	// The graph holds what it still needs of the old cache; our handles to
+	// what this pass replaced can go now, which also lets MLX update the KV
+	// buffers in place. What it did not replace stays: a reply that does not
+	// draft leaves the head's arrays as they were (a cache pooled while one
+	// was drafting has them), and freeing them too left the cache holding
+	// freed arrays for its next pass.
+	freeOld(old, fresh)
 	return logits, hidden
 }
 
