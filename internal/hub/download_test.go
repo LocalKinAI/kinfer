@@ -177,7 +177,9 @@ func only(t *testing.T, dir string, names ...string) {
 	}
 	var got []string
 	for _, e := range entries {
-		got = append(got, e.Name())
+		if e.Name() != sumsFile { // the sums of what was pulled, not a leftover
+			got = append(got, e.Name())
+		}
 	}
 	if strings.Join(got, " ") != strings.Join(names, " ") {
 		t.Errorf("%s holds %q, want %q", dir, got, names)
@@ -577,4 +579,36 @@ func TestDownloadAs(t *testing.T) {
 	}
 	holds(t, dest, h.file.Load().data)
 	only(t, dir, "Vis-Q4_K_M.mmproj.gguf")
+}
+
+// A file here of the right size but other contents — the repo's file pushed
+// again at the same size, a shard of an earlier version — is fetched again;
+// once fetched, pulling it again fetches nothing.
+func TestDownloadFetchesAgainAFileOfTheSameSizeThatDiffers(t *testing.T) {
+	h := serve(t, 256<<10)
+	dir := t.TempDir()
+	old := newBlob(256 << 10) // the version pulled before, the same size
+	if err := os.WriteFile(filepath.Join(dir, "m.gguf"), old.data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Download(context.Background(), "o/r", "m.gguf", dir, 4, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.served(0); got == 0 {
+		t.Fatal("kept a file of the right size whose sha256 is not the repo's")
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "m.gguf"))
+	if !bytes.Equal(b, h.file.Load().data) {
+		t.Fatal("the file is not the repo's after the pull")
+	}
+	before := h.served(0)
+	if _, err := Download(context.Background(), "o/r", "m.gguf", dir, 4, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.served(0) - before; got != 0 {
+		t.Errorf("pulled again, fetched %d bytes of a file already here and summed", got)
+	}
+	if sums := readSums(dir); sums["m.gguf"].SHA256 != h.file.Load().sum {
+		t.Errorf("recorded sum %+v, want the repo's", sums["m.gguf"])
+	}
 }

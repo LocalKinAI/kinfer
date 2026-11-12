@@ -136,7 +136,7 @@ func DownloadAs(ctx context.Context, repo, filename, final string, conns int, on
 	}
 	// Looked for under the lock, so that a pull of the same file finishing a
 	// moment ago is seen finished.
-	if fi, err := os.Stat(final); err == nil && r.size > 0 && fi.Size() == r.size {
+	if fi, err := os.Stat(final); err == nil && r.size > 0 && fi.Size() == r.size && hasSum(final, r.sha256) {
 		os.Remove(d.file.Name())
 		d.forget()
 		onProgress(Status{Done: r.size, Total: r.size, Kept: r.size})
@@ -159,7 +159,93 @@ func DownloadAs(ctx context.Context, repo, filename, final string, conns int, on
 	if err != nil {
 		return "", d.failed(ctx, filename, err)
 	}
+	if r.sha256 != "" {
+		rememberSum(final, r.sha256) // the pull checked the whole against it
+	}
 	return final, nil
+}
+
+// sumsFile is, hidden in a directory of pulled files, the sha256 of each with
+// the size and time it had when it was summed. A pull that finds its file
+// already there of the right size keeps it only if its sha256 is the one the
+// repo publishes: a file pushed again at the same size, or a shard of an
+// earlier version beside the pieces of a later one, is fetched again. The
+// record spares hashing tens of gigabytes each time a model is pulled again;
+// a file it does not know, or that changed since, is hashed once.
+const sumsFile = ".kinfer-sha256.json"
+
+type summed struct {
+	Size   int64  `json:"size"`
+	Time   int64  `json:"mtime"` // UnixNano
+	SHA256 string `json:"sha256"`
+}
+
+var sumsMu sync.Mutex
+
+// hasSum reports whether the file at path has the sha256 want; with nothing
+// published to compare with, whether it is there at all.
+func hasSum(path, want string) bool {
+	if want == "" {
+		return true
+	}
+	got, err := sumOf(path)
+	return err == nil && got == want
+}
+
+// sumOf is the file's sha256: as recorded, while the file is as it was when
+// summed, else hashed now and recorded.
+func sumOf(path string) (string, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	sumsMu.Lock()
+	rec, ok := readSums(filepath.Dir(path))[filepath.Base(path)]
+	sumsMu.Unlock()
+	if ok && rec.Size == fi.Size() && rec.Time == fi.ModTime().UnixNano() {
+		return rec.SHA256, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	rememberSum(path, sum)
+	return sum, nil
+}
+
+// rememberSum records sum as the sha256 of the file at path as it is now.
+func rememberSum(path, sum string) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	sumsMu.Lock()
+	defer sumsMu.Unlock()
+	dir := filepath.Dir(path)
+	all := readSums(dir)
+	all[filepath.Base(path)] = summed{Size: fi.Size(), Time: fi.ModTime().UnixNano(), SHA256: sum}
+	b, err := json.MarshalIndent(all, "", " ")
+	if err != nil {
+		return
+	}
+	tmp := filepath.Join(dir, sumsFile+".tmp")
+	if os.WriteFile(tmp, b, 0o644) == nil {
+		os.Rename(tmp, filepath.Join(dir, sumsFile))
+	}
+}
+
+func readSums(dir string) map[string]summed {
+	all := map[string]summed{}
+	if b, err := os.ReadFile(filepath.Join(dir, sumsFile)); err == nil {
+		json.Unmarshal(b, &all)
+	}
+	return all
 }
 
 // Room says whether the disk dir is on can take what files still need and
