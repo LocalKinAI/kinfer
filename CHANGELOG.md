@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.8.1 — unreleased
+## v0.8.1 — 2026-11-13
 
 ### Fixed — the machine's other programs, run safely
 
@@ -43,6 +43,27 @@ and each with a test.
   environment is kept in it as it was, keys and tokens included. The file and
   its list of processes are now the owner's only, and v0.8.0's files are made
   so when the server starts.
+
+### Run before release
+
+- **Unit tests**, with the race detector on the service manager and the
+  server. A test for each fix: a second server leaves the services alone; a
+  request during a stop starts the service again; a stop for room looks again;
+  an unanswered busy probe counts as work; need kept at its most; a mended file
+  taken in; private files; the idle clock with a poll in flight.
+- **On the box, in a scratch home**: a front runs a stand-in service, then a
+  second serve starts. With v0.8.0 the stand-in was ended ("left running by the
+  server before this one"); with this one it lives on. The service manager's
+  end-to-end check (scan, adopt, on demand, idle stop, release) passed 9 of 9.
+- **On the box's own service**:
+  - It holds the lock, and the services file is now its owner's only.
+  - The talking-turn service was started through it; `kinfer run` was then run
+    on the box, and its daemon logged that the services are another server's,
+    and the turn service stayed up.
+  - ornith, EmbeddingGemma 2, speech and transcription answered.
+- **Not run**: the model regression, as the models are not touched (v0.8.0's
+  stands); the laptop, which runs no services; Linux and Windows beyond
+  building.
 
 ## v0.8.0 — 2026-11-13
 
