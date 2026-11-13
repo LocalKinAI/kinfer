@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,15 @@ import (
 	"testing"
 	"time"
 )
+
+// macOnly skips a test of what reads another process's command line: kinfer
+// does that on macOS only (proc_darwin.go), so elsewhere a service is watched
+// and not taken over, and nothing a crashed server left is ended.
+func macOnly(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("taking over a program reads its command line, which kinfer does on macOS only")
+	}
+}
 
 func freeAddr(t *testing.T) string {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -127,6 +137,7 @@ func TestAdoptedServiceStartsOnDemandAndStopsIdle(t *testing.T) {
 // A watched service adopted: its own process, and only it, is ended, and the
 // manager answers on its address in its place.
 func TestAdoptEndsTheServicesOwnProcess(t *testing.T) {
+	macOnly(t)
 	addr := freeAddr(t)
 	path, svc := fake(t, addr, false, time.Minute)
 	_, port, _ := net.SplitHostPort(addr)
@@ -254,6 +265,7 @@ func join(a []string) string {
 // A server that ended without stopping its services (a crash) has the next
 // one end them before it starts its own.
 func TestLeftoversOfAServerBeforeAreEnded(t *testing.T) {
+	macOnly(t)
 	addr := freeAddr(t)
 	path, _ := fake(t, addr, true, time.Hour)
 	m := NewManager(path)

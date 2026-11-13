@@ -863,6 +863,11 @@ face, a navigation model, each holding gigabytes whether it is used or not,
 and none of them knowing about the others. `kinfer serve` can take them in, so
 one manager knows what is on the GPU, as it already does for its own runners.
 
+Taking a program over, and ending what a crashed server left running, both
+read another process's command line, which kinfer does on macOS only. On Linux
+and Windows a service in the file is watched and shown, and `adopt` says why it
+cannot take it over.
+
 ```bash
 kinfer service scan            # what is listening here, as entries
 kinfer service scan -save      # written to ~/.kinfer/services.json, watched
