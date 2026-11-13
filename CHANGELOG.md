@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Changed — who may ask
+
+From the same review. See [Who may ask](docs/serving.md#who-may-ask).
+
+- **A web page that is not this machine's own is refused (403).** Before,
+  any page open in a browser on the network could have the browser load a
+  model or start a fetch. The pages still allowed are this machine's own
+  (localhost and loopback addresses), kinfer's own address, and apps'
+  (`app://`, `file://`, `tauri://`, and the like). `KINFER_ORIGINS` adds
+  more. Requests that carry no `Origin`, such as curl, agents, apps and other
+  servers, are not affected.
+- **An optional key.** With `KINFER_API_KEY` set, a request from another
+  machine needs `Authorization: Bearer <key>` or `x-api-key: <key>`, or it
+  gets 401. This machine's own requests, `/api/version` and `/health` are
+  exempt. Unset, nothing changes.
+- kinfer's own commands (`ps`, `service`, `run`, `launch`) send
+  `KINFER_API_KEY` if it is set, and only to kinfer. `kinfer launch` gives it
+  to Claude Code, Codex and Pi.
+- **A missing speech or picture model is fetched only when this machine asks
+  for it.** A request from another machine gets 404 with the
+  `kinfer pull …` to run, unless a fetch is already under way.
+- **Starting, stopping and handing back a service must be asked as JSON**
+  (`application/json`), the form a page cannot make a browser send without
+  asking first.
+
 ### Fixed — a batch of small ones, found by the review of v0.8.0
 
 - A picture made in one step (`steps: 1`) divided by zero in its schedule,

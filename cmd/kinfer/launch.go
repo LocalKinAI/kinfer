@@ -114,7 +114,7 @@ func piFiles(base, model string, window int) map[string][]byte {
 		m["contextWindow"] = window
 	}
 	b, _ := json.MarshalIndent(map[string]any{"providers": map[string]any{"kinfer": map[string]any{
-		"baseUrl": base + "/v1", "api": "openai-completions", "apiKey": "kinfer", "models": []any{m},
+		"baseUrl": base + "/v1", "api": "openai-completions", "apiKey": cmp.Or(os.Getenv("KINFER_API_KEY"), "kinfer"), "models": []any{m},
 	}}}, "", "  ")
 	return map[string][]byte{"models.json": b}
 }
@@ -146,13 +146,22 @@ func openclawSetup(base, model string, window int) string {
 	}
 	b, _ := json.MarshalIndent(map[string]any{
 		"models": map[string]any{"mode": "merge", "providers": map[string]any{"kinfer": map[string]any{
-			"baseUrl": base + "/v1", "apiKey": "kinfer-local", "api": "openai-completions", "models": []any{m},
+			"baseUrl": base + "/v1", "apiKey": openclawKey(), "api": "openai-completions", "models": []any{m},
 		}}},
 		"agents": map[string]any{"defaults": map[string]any{"model": map[string]any{"primary": "kinfer/" + model}}},
 	}, "", "  ")
 	return "OpenClaw runs as a background service of its own, which kinfer does not start or change.\n" +
 		"To point it at kinfer, merge this into its configuration:\n\n" + string(b) + "\n\n" +
 		"or answer its onboarding (openclaw onboard) with Custom provider, base URL " + base + "/v1, model " + model + ".\n"
+}
+
+// openclawKey stands in the printed settings for the server's key, which
+// launch does not print: any word does when the server asks for none.
+func openclawKey() string {
+	if os.Getenv("KINFER_API_KEY") != "" {
+		return "<the server's KINFER_API_KEY>"
+	}
+	return "kinfer-local"
 }
 
 // claudeSetup: Claude Code asks for a model by role as well as by name — a
@@ -164,7 +173,10 @@ func openclawSetup(base, model string, window int) string {
 // session only near that: told the real window, it summarizes before kinfer
 // would have to drop the oldest turns unsaid.
 func claudeSetup(base, model string, window int) (args, env []string) {
-	env = []string{"ANTHROPIC_BASE_URL=" + base, "ANTHROPIC_AUTH_TOKEN=kinfer"}
+	// The server's key, if it asks for one (KINFER_API_KEY), is the agent's
+	// token; any word does otherwise.
+	token := cmp.Or(os.Getenv("KINFER_API_KEY"), "kinfer")
+	env = []string{"ANTHROPIC_BASE_URL=" + base, "ANTHROPIC_AUTH_TOKEN=" + token}
 	for _, role := range []string{"ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"} {
 		env = append(env, role+"="+model)
@@ -181,13 +193,22 @@ func claudeSetup(base, model string, window int) (args, env []string) {
 func codexSetup(base, model string, window int) (args, env []string) {
 	args = []string{
 		"-c", `model_provider="kinfer"`,
-		"-c", fmt.Sprintf(`model_providers.kinfer={name="kinfer",base_url=%q,wire_api="responses"}`, base+"/v1"),
+		"-c", fmt.Sprintf(`model_providers.kinfer={name="kinfer",base_url=%q,wire_api="responses"%s}`, base+"/v1", codexKey()),
 		"-m", model,
 	}
 	if window > 0 {
 		args = append(args, "-c", fmt.Sprintf("model_context_window=%d", window))
 	}
 	return args, nil
+}
+
+// codexKey has Codex send the server's key, read from KINFER_API_KEY when it
+// is set: Codex takes a provider's key from the variable env_key names.
+func codexKey() string {
+	if os.Getenv("KINFER_API_KEY") == "" {
+		return ""
+	}
+	return `,env_key="KINFER_API_KEY"`
 }
 
 func findAgent(name string) (agent, bool) {
@@ -351,7 +372,7 @@ func writeAgentFiles(a agent, base, model string, window int) (string, error) {
 		return "", err
 	}
 	for name, b := range a.files(base, model, window) {
-		if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name), b, 0o600); err != nil { // Pi's may hold the server's key
 			return "", err
 		}
 	}
@@ -363,7 +384,7 @@ func writeAgentFiles(a agent, base, model string, window int) (string, error) {
 // say).
 func loadForAgent(base, model string) (int, error) {
 	body, _ := json.Marshal(map[string]string{"model": model})
-	c := &http.Client{Timeout: 15 * time.Minute}
+	c := kinferClient(15 * time.Minute)
 	resp, err := c.Post(base+"/api/generate", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return 0, fmt.Errorf("load %s: %w", model, err)
@@ -521,7 +542,7 @@ func canChat(caps []string) bool {
 
 func modelCaps(base, model string) ([]string, error) {
 	body, _ := json.Marshal(map[string]string{"model": model})
-	c := &http.Client{Timeout: 30 * time.Second}
+	c := kinferClient(30 * time.Second)
 	resp, err := c.Post(base+"/api/show", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -542,7 +563,7 @@ func modelCaps(base, model string) ([]string, error) {
 }
 
 func getJSON(url string, v any) error {
-	c := &http.Client{Timeout: 30 * time.Second}
+	c := kinferClient(30 * time.Second)
 	resp, err := c.Get(url)
 	if err != nil {
 		return err

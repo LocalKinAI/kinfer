@@ -272,7 +272,7 @@ func streamChat(ctx context.Context, base, model string, msgs []clientMsg, maxTo
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := kinferClient(0).Do(req)
 	if err != nil {
 		return "", st, err
 	}

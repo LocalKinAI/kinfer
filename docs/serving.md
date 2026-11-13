@@ -965,6 +965,62 @@ own parser, so a typo is refused at the keyboard instead of by a job that fails
 at every login. Running `install` again replaces the job; `uninstall` stops it
 and removes the file. macOS only for now.
 
+## Who may ask
+
+`serve` listens on every interface, and it used to answer whatever reached
+its port. Three things are now asked at the door.
+
+**A web page that is not this machine's own is refused.** A page open in a browser
+can make the browser send requests to any address it can reach, to load a model or
+to start a fetch of gigabytes, and the browser sends the page's address along as
+`Origin`. kinfer answers 403 to every page whose address is not:
+
+- this machine's own (`localhost`, any `*.localhost`, `127.0.0.1`, `::1`, `0.0.0.0`),
+- the address the request was sent to (a page kinfer would serve itself), or
+- an app's (`app://`, `file://`, `tauri://`, `vscode-webview://`, `vscode-file://`).
+
+`KINFER_ORIGINS` adds pages, separated by commas, with `*` matching any part:
+`KINFER_ORIGINS="http://192.168.0.*:7700,https://home.example"`, or `*` for every
+page. A request with no `Origin`, such as one from curl, an agent, an app or another
+server, is not a page's request, and this check does not apply to it. Ollama has
+the same rule, and `OLLAMA_ORIGINS` is its equivalent of `KINFER_ORIGINS`.
+
+**A key, if one is set.** With `KINFER_API_KEY` set in `serve`'s environment, a
+request from another machine must carry the key, either as
+`Authorization: Bearer <key>` or as `x-api-key: <key>`, the header Anthropic's
+clients send. Without it the answer is 401. A request from this machine
+needs no key, and neither do `/api/version` and `/health`, which give nothing
+away. When `KINFER_API_KEY` is unset, nothing changes: the network is
+trusted, as before.
+
+```
+$ KINFER_API_KEY=… kinfer serve -addr :11590
+$ curl -H "Authorization: Bearer …" http://box:11590/v1/models
+```
+
+For a server that `kinfer install` set up, put the key in the launchd job's
+`EnvironmentVariables`. kinfer's own commands that talk to a server (`ps`,
+`service`, `run` and `launch`) send `KINFER_API_KEY` if it is set in their
+environment, and they send it only to kinfer. `kinfer launch` also gives the
+key to the agent it starts:
+
+- Claude Code gets it as its token.
+- Codex gets a provider that reads `KINFER_API_KEY` itself.
+- Pi gets it in its provider file, which only you can read.
+
+For OpenClaw and Hermes Agent, add the key in their own settings.
+
+**Fetching a model is this machine's decision.** A speech or picture model that
+is not here yet is fetched only when a request from this machine asks for it
+(`-auto-pull`). A request from another machine gets 404 and the
+`kinfer pull …` to run here. If a fetch is already under way, that request
+sees its progress instead.
+
+Starting, stopping and handing back the machine's other programs
+(`/api/services/…`) was already limited to this machine. These requests now
+also have to be sent as `application/json`: a page can make a browser send a
+form or plain text without asking first, but not JSON.
+
 ## `kinfer fit`
 
 Choosing a local model is guesswork: quantisation names carry no size, "7B"

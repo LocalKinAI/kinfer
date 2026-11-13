@@ -91,6 +91,7 @@ func newFrontServer(t *testing.T) (*Server, *fakeRunners, string, string) {
 func do(t *testing.T, srv *Server, method, path, contentType, body string) (int, map[string]any, http.Header) {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:41234" // a client on this machine, as most are
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}

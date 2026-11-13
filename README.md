@@ -556,9 +556,11 @@ What each does, and how serve sizes itself: [docs/serving.md](docs/serving.md).
   and CUDA and ROCm on no real card. `kinfer launch` for Pi, Hermes Agent and
   OpenClaw is written from their documentation and not yet run.
 - **MLX serves Qwen3.5 and Qwen3.8** as chat models; anything else is a GGUF.
-- **No keys yet.** `serve` answers whatever reaches its port, and listens on
-  every interface unless told otherwise: `kinfer serve -addr 127.0.0.1:11500`
-  keeps it to this machine. Put it on a network you trust.
+- **A key is optional.** `serve` listens on every interface and, unless
+  `KINFER_API_KEY` is set, answers whatever on the network reaches its port:
+  put it on a network you trust, or keep it to this machine with
+  `kinfer serve -addr 127.0.0.1:11500`. Web pages other than this machine's
+  own are refused either way ([Who may ask](docs/serving.md#who-may-ask)).
 - **Not built:** failing over between providers, and probing their health.
   kinfer is the local leg; when to stand on it is still the fleet's decision.
 

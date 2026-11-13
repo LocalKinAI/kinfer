@@ -196,7 +196,7 @@ var kindNames = map[string]string{kindASR: "speech recognition", kindTTS: "text 
 // proxySpeech answers a speech request in a runner: the model it names or
 // the default, fetched first if it must be. body is the request's, read.
 func (s *Server) proxySpeech(w http.ResponseWriter, r *http.Request, kind, asked string, body []byte) {
-	if path, ok := s.speechPath(w, kind, asked); ok {
+	if path, ok := s.speechPath(w, r, kind, asked); ok {
 		s.proxySpeechTo(w, r, kind, path, body)
 	}
 }
@@ -205,7 +205,10 @@ func (s *Server) proxySpeech(w http.ResponseWriter, r *http.Request, kind, asked
 // speechModelFor has it; with none here, it answers the request itself —
 // the fetch under way, what to pull, or that this machine has none — and
 // returns false.
-func (s *Server) speechPath(w http.ResponseWriter, kind, asked string) (string, bool) {
+//
+// A model is fetched for a request from this machine only: one from the
+// network that found it missing set gigabytes downloading.
+func (s *Server) speechPath(w http.ResponseWriter, r *http.Request, kind, asked string) (string, bool) {
 	path, fetch := s.speechModelFor(kind, asked)
 	if path != "" {
 		return path, true
@@ -219,6 +222,13 @@ func (s *Server) speechPath(w http.ResponseWriter, kind, asked string) (string, 
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{
 			"message": fmt.Sprintf("%s needs a model: kinfer pull %s (%s), or kinfer pull speech for the defaults", kindNames[kind], fetch.Repo, fetch.Size),
 			"type":    "invalid_request_error"}})
+	case r != nil && !fromThisMachine(r) && !s.pulls.under(*fetch):
+		// What is fetched, gigabytes of it, is this machine's to start: a
+		// request from another one sees a fetch under way, and starts none.
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{
+			"message": fmt.Sprintf("%s needs a model this machine does not have yet: kinfer pull %s (%s) on it, or ask once from it, and it is fetched",
+				kindNames[kind], fetch.Repo, fetch.Size),
+			"type": "invalid_request_error"}})
 	default:
 		s.fetching(w, s.pulls.get(*fetch), kind)
 	}
@@ -790,6 +800,22 @@ func (ps *pullSet) get(m SpeechModel) *pull {
 	log.Printf("speech: fetching %s (%s) for its first use; -auto-pull=false stops this", m.Repo, m.Size)
 	go ps.start(p)
 	return p
+}
+
+// under reports a fetch of m under way: a request from the network finds it
+// as one from this machine does, though it cannot start one.
+func (ps *pullSet) under(m SpeechModel) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if p := ps.byRepo[m.Repo]; p != nil {
+		select {
+		case <-p.finished:
+			return false
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // runPull fetches p.model with this binary's `kinfer pull`, which says how

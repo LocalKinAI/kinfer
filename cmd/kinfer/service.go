@@ -113,7 +113,7 @@ func askFront(host, method, path string, body any) (map[string]any, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c := http.Client{Timeout: 2 * time.Minute}
+	c := kinferClient(2 * time.Minute)
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("kinfer serve at %s: %w", host, err)

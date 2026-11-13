@@ -120,7 +120,7 @@ func (s *Server) SpeechHandler(kind string) http.Handler {
 				return
 			}
 			if body, _, ok := speechBody(w, r, maxRecording+1<<20); ok {
-				if path, ok := s.speechPath(w, kindASR, ""); ok {
+				if path, ok := s.speechPath(w, r, kindASR, ""); ok {
 					s.proxySpeechTo(w, r, kindASR, path, body)
 				}
 			}
@@ -142,12 +142,12 @@ func (s *Server) SpeechHandler(kind string) http.Handler {
 			// The Python service answered in WAV when no format was named,
 			// not OpenAI's mp3, and its clients rely on it; so does kinfer's
 			// own endpoint, so the request goes as it came.
-			if path, ok := s.speechPath(w, kind, ""); ok {
+			if path, ok := s.speechPath(w, r, kind, ""); ok {
 				s.proxySpeechTo(w, r, kind, path, body)
 			}
 		})
 		mux.HandleFunc("/v1/audio/voices", func(w http.ResponseWriter, r *http.Request) {
-			if path, ok := s.speechPath(w, kind, ""); ok {
+			if path, ok := s.speechPath(w, r, kind, ""); ok {
 				s.proxySpeechTo(w, r, kind, path, nil)
 			}
 		})
@@ -251,7 +251,7 @@ func (s *Server) legacyTranscribe(w http.ResponseWriter, r *http.Request) {
 		legacyError(w, http.StatusBadRequest, fmt.Sprintf("response_format %q: kinfer writes json and text here; srt, vtt and markdown need segment timestamps, which Qwen3-ASR does not give", format))
 		return
 	}
-	path, ok := s.speechPath(w, kindASR, "")
+	path, ok := s.speechPath(w, r, kindASR, "")
 	if !ok {
 		return
 	}
@@ -329,7 +329,7 @@ func (s *Server) legacySynthesize(w http.ResponseWriter, r *http.Request, kind s
 		legacyError(w, http.StatusBadRequest, "kinfer does not clone voices: it speaks in Qwen3-TTS's voices by name, or in one told in words")
 		return
 	}
-	path, ok := s.speechPath(w, kind, "")
+	path, ok := s.speechPath(w, r, kind, "")
 	if !ok {
 		return
 	}
@@ -373,7 +373,7 @@ func (s *Server) legacySynthesize(w http.ResponseWriter, r *http.Request, kind s
 // show, the language it is native in and whose it is; none for a VoiceDesign
 // model, whose voice is told in words.
 func (s *Server) legacyVoices(w http.ResponseWriter, r *http.Request, kind string) {
-	path, ok := s.speechPath(w, kind, "")
+	path, ok := s.speechPath(w, r, kind, "")
 	if !ok {
 		return
 	}
@@ -416,7 +416,7 @@ func (s *Server) legacyVoices(w http.ResponseWriter, r *http.Request, kind strin
 func (s *Server) ServeSpeechAddrs() {
 	for kind, addr := range s.speechAddrs {
 		go func() {
-			h := s.SpeechHandler(kind)
+			h := s.guard(s.SpeechHandler(kind))
 			for {
 				err := ListenAndServeOrderly(addr, h)
 				log.Printf("speech: %s at %s: %v; trying again in 10 s", kindNames[kind], addr, err)

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/services"
@@ -45,6 +46,13 @@ func (s *Server) handleServiceAction(action string) http.HandlerFunc {
 		}
 		if !fromThisMachine(r) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "services are adopted, released and stopped from this machine only"})
+			return
+		}
+		// JSON only: a web page can make a browser send a form or plain text
+		// without asking first, and not JSON. The door refuses other pages too
+		// (guard.go); this holds should a page get past it.
+		if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "application/json") {
+			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "send {\"name\": …} as application/json"})
 			return
 		}
 		if s.services == nil {

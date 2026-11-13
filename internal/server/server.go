@@ -251,8 +251,8 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	// Counting wraps everything, so an endpoint added later cannot forget to
-	// report itself.
-	return s.count(mux)
+	// report itself; the door (guard.go) is in front of it all.
+	return s.guard(s.count(mux))
 }
 
 // Close releases the resident models.

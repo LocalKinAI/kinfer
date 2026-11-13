@@ -381,7 +381,7 @@ func cmdPS(args []string) error {
 		return nil
 	}
 
-	resp, err := http.Get(base + "/api/ps")
+	resp, err := kinferClient(30 * time.Second).Get(base + "/api/ps")
 	if err != nil {
 		return err
 	}
