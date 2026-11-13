@@ -89,7 +89,10 @@ func readOllamaManifest(root, manifests, path string) (Model, bool) {
 		return Model{}, false
 	}
 	parts := strings.Split(filepath.ToSlash(rel), "/")
-	if len(parts) < 2 {
+	// registry/namespace/name/tag; less is a file that is not a manifest, and
+	// one two deep made the namespace below an index of -1 — a panic on every
+	// request that looked a model up.
+	if len(parts) < 3 {
 		return Model{}, false
 	}
 	name := parts[len(parts)-2] + ":" + parts[len(parts)-1]

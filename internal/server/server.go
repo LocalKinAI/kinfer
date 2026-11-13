@@ -429,7 +429,7 @@ func (s *Server) acquireOnce(name string) (generator, func(), error) {
 	log.Printf("loading %s", path)
 	opts := s.opts
 	opts.Projector = s.store.ProjectorFor(path)
-	e, err := s.open(path, opts)
+	e, err := openSafely(s.open, path, opts)
 	s.mu.Lock()
 
 	if err != nil {
@@ -443,6 +443,17 @@ func (s *Server) acquireOnce(name string) (generator, func(), error) {
 	s.cur = l
 	s.stopIdleLocked()
 	return e, func() { s.release(l) }, nil
+}
+
+// openSafely loads a model, a panic in the loading answered as a failed load:
+// it ended the process, and with it every other request and the server.
+func openSafely(open func(string, engine.Options) (generator, error), path string, opts engine.Options) (g generator, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			g, err = nil, fmt.Errorf("loading %s panicked: %v", filepath.Base(path), r)
+		}
+	}()
+	return open(path, opts)
 }
 
 // ─── Ollama dialect ──────────────────────────────────────────────────────────

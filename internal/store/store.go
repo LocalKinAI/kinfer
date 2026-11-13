@@ -518,8 +518,13 @@ func (s *Store) Remove(name string) error {
 			return err
 		}
 	}
-	if u, ok := s.unfinished(model); ok {
-		return removeAll(u.Files)
+	// An unfinished pull of the same name goes too — that name exactly: by the
+	// name but for case it was another model's download, and it went with this one.
+	all, _ := s.Unfinished()
+	for _, u := range all {
+		if u.Name == model {
+			return removeAll(u.Files)
+		}
 	}
 	return nil
 }

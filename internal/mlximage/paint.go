@@ -62,8 +62,10 @@ func checkSize(w, h int) error {
 // sigmas is LinearScheduler's schedule for steps at w×h, shifted as
 // Z-Image-Turbo's requires_sigma_shift has it, then 0: float32 [steps+1].
 func sigmas(steps, w, h int) mlx.Array {
-	// mx.linspace(1, 1/steps, steps): MLX interpolates between the ends.
-	t := mlx.Divide(mlx.Arange(0, float64(steps), 1, mlx.Float32), mlx.Scalar(float32(steps-1)))
+	// mx.linspace(1, 1/steps, steps): MLX interpolates between the ends. One
+	// step is linspace's start alone: dividing by steps-1 made it 0/0, and a
+	// picture of noise came back as made.
+	t := mlx.Divide(mlx.Arange(0, float64(steps), 1, mlx.Float32), mlx.Scalar(float32(max(steps-1, 1))))
 	base := mlx.Add(mlx.Multiply(mlx.Subtract(mlx.Scalar(1), t), mlx.Scalar(1)), mlx.Multiply(t, mlx.Scalar(float32(1/float64(steps)))))
 	m := (1.15 - 0.5) / float64(4096-256)
 	b := 0.5 - m*256

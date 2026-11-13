@@ -214,11 +214,14 @@ func cmdCanRun(args []string) error {
 		return nil
 	}
 	if len(fits) == 0 {
-		fmt.Printf("  Nothing fits. The smallest is %s at %s%s.\n",
+		fmt.Printf("  Nothing fits whole. The smallest is %s at %s%s.\n",
 			quants[0].Name, store.HumanSize(resident(quants[0])), fromDisk(quants[0]))
-		fmt.Printf("  A mixture-of-experts model is no help here: it activates a fraction\n")
-		fmt.Printf("  of its weights per token, which makes it fast, but routing can reach\n")
-		fmt.Printf("  any expert, so all of them stay resident.\n")
+		// It said a mixture of experts was no help, every expert resident —
+		// what kinfer exists to get past: the experts that do not fit stay in
+		// host memory, read from the disk as they are used (docs/big-models.md).
+		fmt.Printf("  A dense model this size cannot run here. A mixture of experts still can,\n")
+		fmt.Printf("  slower: the experts that do not fit stay on the disk, read as they are\n")
+		fmt.Printf("  used. After the pull, kinfer plan says where it would go.\n")
 		return nil
 	}
 

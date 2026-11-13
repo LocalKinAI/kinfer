@@ -207,6 +207,12 @@ func (h Header) account(sh *Shape, arch string) {
 			return
 		}
 		layer, _ := strconv.Atoi(m[1])
+		// A tensor's name gives its layer, and the slices grow to it: a name
+		// with a layer of a billion asked for gigabytes. No model has more
+		// than a few hundred.
+		if layer < 0 || layer >= maxLayers {
+			return
+		}
 		for len(sh.LayerBytes) <= layer {
 			sh.LayerBytes = append(sh.LayerBytes, 0)
 			sh.ExpertBytes = append(sh.ExpertBytes, 0)
@@ -217,6 +223,9 @@ func (h Header) account(sh *Shape, arch string) {
 		}
 	})
 }
+
+// maxLayers bounds the layer a tensor's name may give.
+const maxLayers = 4096
 
 // HeadDim is the size of one attention head. GGUF states it outright when it
 // is not EmbedDim/Heads, which on the Qwen3.5 family it is not.

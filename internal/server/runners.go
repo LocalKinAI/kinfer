@@ -598,6 +598,28 @@ func (rs *runnerSet) close() {
 	wg.Wait()
 }
 
+// readLogLine reads one line of what a runner writes, its first max bytes
+// kept and the rest of it read and dropped. A Scanner stopped at the first
+// line over its limit, nothing read the pipe after it, and the runner hung on
+// its next write — a model printing one long line could stop answering.
+func readLogLine(rd *bufio.Reader, max int) (string, error) {
+	var b []byte
+	for {
+		chunk, err := rd.ReadSlice('\n')
+		if room := max - len(b); room > 0 {
+			b = append(b, chunk[:min(len(chunk), room)]...)
+		}
+		switch err {
+		case bufio.ErrBufferFull:
+			continue
+		case nil:
+			return strings.TrimRight(string(b), "\r\n"), nil
+		default:
+			return strings.TrimRight(string(b), "\r\n"), err
+		}
+	}
+}
+
 // logLine is one of kinfer's own log lines: log's date and time first.
 func logLine(line string) bool {
 	if len(line) < len("2006/01/02 15:04:05 ") {
@@ -660,10 +682,12 @@ func (s *Server) startRunner(path string, chat bool) (*proc, error) {
 	lines := make(chan struct{})
 	go func() {
 		defer close(lines)
-		sc := bufio.NewScanner(pr)
-		sc.Buffer(nil, 1<<20)
-		for sc.Scan() {
-			line := sc.Text()
+		rd := bufio.NewReaderSize(pr, 64<<10)
+		for {
+			line, err := readLogLine(rd, 1<<20)
+			if err != nil && line == "" {
+				return
+			}
 			if strings.TrimSpace(line) == "" {
 				continue
 			}

@@ -192,6 +192,9 @@ func TokenizeMedia(m Mtmd, text string, pictures [][]byte) (*MediaPrompt, error)
 		if len(pic) == 0 {
 			return nil, fmt.Errorf("picture %d is empty", i)
 		}
+		if err := checkPicture(i, pic); err != nil {
+			return nil, err
+		}
 		w := mtmdHelperBitmapFromBuf(m, &pic[0], uint64(len(pic)), false, opt)
 		runtime.KeepAlive(pic)
 		if w.bitmap == 0 {

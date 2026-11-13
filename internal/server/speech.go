@@ -237,6 +237,11 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	case len([]rune(text)) > maxSpeechInput:
 		speechError(w, http.StatusBadRequest, fmt.Sprintf("\"input\" is longer than %d characters", maxSpeechInput))
 		return
+	case len([]rune(req.Instructions)) > maxSpeechInput:
+		// The voice told in words is read by the model too, before every
+		// sentence: unbounded, a request could make it read a book first.
+		speechError(w, http.StatusBadRequest, fmt.Sprintf("\"instructions\" is longer than %d characters", maxSpeechInput))
+		return
 	}
 	format := strings.ToLower(req.ResponseFormat)
 	if format == "" {

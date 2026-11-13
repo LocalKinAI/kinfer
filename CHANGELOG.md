@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — a batch of small ones, found by the review of v0.8.0
+
+- A picture made in one step (`steps: 1`) divided by zero in its schedule,
+  and noise came back as a picture.
+- A file two deep in Ollama's manifests folder made every model lookup panic.
+- `kinfer rm` of a model also deleted the unfinished download of another model
+  whose name differed only in case.
+- The voice told in words (`instructions`) had no length limit; it now has
+  `input`'s, 4,096 characters.
+- A panic while a model loaded ended the process; it is now a failed load.
+- A GGUF tensor name giving a layer of a billion made kinfer allocate for it.
+  Layers past 4,096 are not counted.
+- `kinfer can-run` said a mixture of experts larger than memory cannot run,
+  which is what kinfer exists to do. It now says a dense model cannot and an
+  MoE can, slower, with its experts on the disk.
+- A runner that wrote a line longer than 1 MiB stopped having its output read,
+  and hung on its next write. A line that long is now cut, and reading goes on.
+- A picture sent to a chat model was decoded whole by llama.cpp before its
+  size was looked at. Its header is now read first, and more than 100 million
+  pixels is refused, as embeddings' pictures have been since v0.8.0.
+
 ## v0.8.1 — 2026-11-13
 
 ### Fixed — the machine's other programs, run safely
