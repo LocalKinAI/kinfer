@@ -191,6 +191,10 @@ type scheduler struct {
 	busy       atomic.Int64
 	promptSeen atomic.Int64
 	evalSeen   atomic.Int64
+	// passes is the decodes run since it started, prompt chunks and
+	// generated tokens alike: what moves while a reply is under way, as the
+	// two above do only once it is done. The watchdog reads it.
+	passes atomic.Int64
 	// reusedSeen is the prompt tokens of promptSeen the prefix pool gave a
 	// slot instead of the model reading them.
 	reusedSeen atomic.Int64
@@ -1039,6 +1043,7 @@ func (s *scheduler) step() error {
 			return err
 		}
 	}
+	s.passes.Add(1)
 	if s.debug {
 		decoded = time.Now()
 		s.tDecode += decoded.Sub(t0)

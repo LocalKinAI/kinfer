@@ -427,6 +427,7 @@ type serveOpts struct {
 	prefix          prefixFlag
 	maxGen, maxWait time.Duration
 	keepAlive       time.Duration
+	watchdog        time.Duration
 	flex            bool
 	batch           int
 	peers           []string
@@ -582,6 +583,7 @@ func serveFlags(h flag.ErrorHandling) (*flag.FlagSet, *serveOpts) {
 	fs.DurationVar(&o.maxGen, "max-gen", engine.DefaultMaxGenerate, "wall-clock limit on one reply (0 removes the limit)")
 	fs.DurationVar(&o.maxWait, "max-wait", engine.DefaultMaxWait, "how long a request may queue before being refused (0 removes the limit)")
 	fs.DurationVar(&o.keepAlive, "keepalive", 5*time.Minute, "unload an idle model after this long (0 = never)")
+	fs.DurationVar(&o.watchdog, "watchdog", 10*time.Minute, "end a process whose model has not moved for this long with requests on it, or whose own address has stopped answering, so that it is started again: a runner by the next request, the server by launchd or whatever keeps it up (0 = never)")
 	fs.IntVar(&o.batch, "batch", 0, "prompt tokens the GPU reads in one pass, up to 8192 (0 = sized the way Ollama sizes it: 2048, 1024 or 512 by context and memory; 2048 with -host-experts unless memory is short)")
 	fs.BoolVar(&o.flex, "flex", true, "give a prompt too long for a slot a longer one: fewer slots, the same tokens, while it runs (false = keep the layout)")
 	fs.IntVar(&o.hostExperts, "host-experts", 0, "a mixture of experts' routed experts stay in host memory, mapped from the file, for this many of the first layers (-1 = every layer; 0 = as many as -place decides, none for a model that fits)")
@@ -728,6 +730,7 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	srv.Watch(ctx, l.Addr().String(), o.watchdog)
 	errCh := make(chan error, 1)
 	go func() {
 		if err := httpSrv.Serve(server.OrderlyListener(l)); err != nil && err != http.ErrServerClosed {

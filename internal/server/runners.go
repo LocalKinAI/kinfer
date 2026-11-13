@@ -647,8 +647,9 @@ func logLine(line string) bool {
 func (s *Server) runnerArgs(port string, chat bool) []string {
 	args := []string{"serve", "-addr", "127.0.0.1:" + port, "-speech", SpeechOff, "-keepalive", "0", "-runners=false"}
 	if chat {
-		return append(args, s.chatArgs...)
+		return append(args, s.chatArgs...) // -watchdog among them, if set
 	}
+	args = append(args, "-watchdog", s.watchStall.String())
 	return append(args, "-slots", "1", "-ctx", "16384", "-prefix", "off")
 }
 

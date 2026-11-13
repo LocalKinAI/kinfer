@@ -90,6 +90,7 @@ type Server struct {
 	services       *services.Manager // the other programs taken in (services.go), or nil
 	chatRunners    bool              // chat and embedding models in runners too (chatrunners.go)
 	chatArgs       []string          // the serve flags a chat model's runner takes
+	watchStall     time.Duration     // -watchdog, which a speech or picture runner takes too
 	pulls          *pullSet
 }
 

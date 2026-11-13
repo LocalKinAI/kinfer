@@ -1071,6 +1071,12 @@ func (e *Engine) EvalTokens() int64 {
 	return e.counter(func(s *scheduler) int64 { return s.evalSeen.Load() })
 }
 
+// Steps is the decodes run, a prompt chunk or a token at a time: it moves
+// while a reply is under way, which the two counters above do not.
+func (e *Engine) Steps() int64 {
+	return e.counter(func(s *scheduler) int64 { return s.passes.Load() })
+}
+
 // Reuse is how many prompt tokens the prefix pool gave a reply instead of the
 // model reading them, since the model loaded, and how many entries the pool
 // has in the layout the context has now: 0 reads every prompt whole.

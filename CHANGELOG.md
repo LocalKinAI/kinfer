@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added — a process that hangs is ended, so that it is started again
+
+From the same review. See [Staying up under load](docs/serving.md#staying-up-under-load).
+
+- **Each process watches itself.** It ends when its model has had requests
+  on it and has not moved for `-watchdog` (default 10 minutes), or when its
+  own address has not answered four times in a row (about two minutes).
+  Moving means a prompt chunk read, a token written, or a step taken. On
+  llama.cpp every decode pass now counts, so a long reply in progress is
+  not taken for a hang.
+- Before it ends, it logs why and writes every goroutine's stack to
+  `~/.kinfer/hung-<time>-<pid>.txt`. A runner is then started again by the
+  next request for its model, and a server by launchd. The requests a hung
+  runner was holding get an error instead of waiting forever.
+- `-watchdog 0` turns it off. Runners get the server's setting.
+
 ### Changed — who may ask
 
 From the same review. See [Who may ask](docs/serving.md#who-may-ask).

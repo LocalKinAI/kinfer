@@ -1152,6 +1152,28 @@ with `Insufficient Memory` every time. Placed against the 32 GiB actually free â
 reply at 29.9 tokens a second; placed into all 40 GiB, on a day that happened
 to work, it did 30.9.
 
+**A process that hangs is ended, so that it is started again.** launchd starts
+`serve` again when it exits, and the front starts a runner again when its process
+ends. But a process that hangs does not exit: it answers nothing and reports no
+error, so to a client it looks like a busy one. Each kinfer process now watches
+itself, every half minute, and ends itself when it is clearly stuck:
+
+- **Its model has requests on it and has not moved for `-watchdog` (default
+  10 minutes).** Moving means reading a prompt chunk, writing a token, or taking a
+  step. A GPU pass that never finishes looks like this. On llama.cpp every decode
+  pass is counted, so a reply that is still being written counts as moving,
+  however long it is. A speech or picture model is counted once each request
+  finishes, and none of those takes ten minutes.
+- **Its own address has not answered `/api/version` four times in a row.**
+  Each try is given 10 seconds, so this means about two minutes of silence.
+
+Before it ends, it logs why and writes every goroutine's stack to
+`~/.kinfer/hung-<time>-<pid>.txt`. A runner that ends this way is started again
+by the next request for its model. The requests it was holding get an error, not
+an endless wait. A server without runners is started again by launchd if
+`kinfer install` set it up, and by the next `kinfer run` if `run` started it.
+`-watchdog 0` turns the watchdog off. Runners get the server's setting.
+
 ## Seeing what it is doing
 
 ```
