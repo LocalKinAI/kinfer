@@ -1,10 +1,12 @@
 name: xplat
 
-# Linux and Windows on the CPU, on real machines of each. Only this branch and
-# manual runs: nothing from a fork reaches it.
+# Linux and Windows on the CPU, on real machines of each. Pushes to main and
+# xplat, release tags and manual runs: nothing from a fork reaches it. Until
+# v0.8.1 it ran on xplat only, and six releases shipped without it.
 on:
   push:
-    branches: [xplat]
+    branches: [main, xplat]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
