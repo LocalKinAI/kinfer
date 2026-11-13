@@ -143,12 +143,39 @@ after.
     speech models' room took ornith, which had sized itself to the memory
     left, off the GPU, and it was loaded again on the next chat. v0.7.2 does
     the same on that laptop today.
-- **Speed against v0.7.2.** A fresh server each time, the two alternated six
-  times, and every reply's md5 the same:
-  - ornith on the box: prompt about 1,855 tok/s for both; decode 104.0–106.7
-    tok/s against 103.7–105.1.
-  - ornith on the laptop: decode 136.8–136.9 tok/s against 135.9–136.8.
-  - Flash-Next on the laptop, two rounds each: within the runs' own spread.
+- **Speed against v0.7.2, model by model.**
+  - A fresh server for each run, and the two versions alternated three times
+    each. V4.1 on the box was run twice more each, v0.7.2 first.
+  - Every reply's md5 was the same on both versions.
+  - The table gives tok/s as v0.8.0 / v0.7.2. The first run of a model not yet
+    read from disk is left out for the 0.5B and the box's MLX model.
+
+  | Machine | Model | Prompt | Long reply | Short reply |
+  |---|---|---|---|---|
+  | box | qwen2.5-0.5b | 12,499–12,643 / 12,597–12,619 | 278–283 / 279–283 | 307 / 301–318 |
+  | box | ornith-1.5-35b | 1,856–1,859 / 1,854–1,855 | 104.0–106.7 / 103.7–105.1 | 94.5–95.0 / 94.5–95.2 |
+  | box | qwen3.8-27b q4_k_m | 301–302 / 302 | 41.1–41.7 / 41.7–41.8 | 34.1–34.2 / 34.1–34.2 |
+  | box | qwen3.8:27b-mlx | 334.6 / 334.6–334.7 | 45.4 / 45.3–45.4 | 41.1–42.4 / 40.9–42.4 |
+  | box | Flash-Next | 754–757 / 755–758 | 41.7–42.3 / 41.8–42.4 | 42.6–43.0 / 42.5–42.8 |
+  | box | V4.1 alone | 228–242 / 234–248 | 13.8–15.3 / 14.3–15.7 | 17.6–18.6 / 17.6–18.5 |
+  | laptop | ornith-1.5:35b | 3,192–3,300 / 3,213–3,266 | 136.8–136.9 / 135.9–136.8 | 131.5–132.4 / 131.0–132.5 |
+  | laptop | qwen3.8:27b-mlx | 687–761 / 692–778 | 42.0–49.0 / 41.4–49.0 | 36.4–45.0 / 36.5–43.4 |
+  | laptop | Flash-Next | 916–950 / 885–936 | 30.2–30.7 / 27.8–30.6 | 32.7–33.0 / 28.5–31.3 |
+  | laptop | V4.1 | 216–265 / 201–255 | 11.7–12.0 / 10.9–12.1 | 14.9–15.7 / 15.0–15.9 |
+
+  - V4.1 alone on the box keeps 28 layers' experts in host memory.
+    - In the first order, v0.8.0 was 5–7% lower; in the reverse order it was
+      not.
+    - Together, long replies came out at 14.7 against 15.2 on average, within
+      the 14.3–15.7 that v0.7.2 alone spread over.
+    - Both versions placed it the same way.
+  - The box's media, best of three after a warm-up, as v0.8.0 / v0.7.2:
+    - 64 sentences embedded at once: 0.68–0.69 / 0.71–0.72 s
+    - a picture embedded: 0.118 / 0.144 s
+    - a sound embedded: 0.088 / 0.113–0.119 s
+    - a sentence spoken: 0.91–1.01 / 0.91–1.02 s
+    - transcribed: 0.18 / 0.19–0.20 s
+    - a 512² picture: 7.39–7.40 / 7.40–7.41 s
 - **The two machines:** V4.1 served by the box, with the laptop's worker over
   Thunderbolt, found by `-peers auto`: 19.7–22.1 tok/s, and a 3,614-token
   prompt read at 262 tok/s.
