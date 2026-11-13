@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.8.0 — unreleased
+## v0.8.0 — 2026-11-13
 
 ### Faster — a model's name is found once
 
@@ -100,6 +100,62 @@ and running on its own again. Unit tests cover:
 - requests arriving together while the service is stopped, which start it once;
 - refusing an address another program holds;
 - ending what a crashed front left running.
+
+### Run before release
+
+On the release binary itself, on 2026-11-13 between 03:28 and 04:10. The box's
+kinfer service was stopped for the box's part, and put back on this build
+after.
+
+- **The box** (Mac Studio M3 Ultra, 96 GB, GPU limit 88 GiB):
+  - Six models through runners: qwen2.5-0.5b, ornith-1.5-35b, qwen3.8-27b
+    q4_k_m, qwen3.8:27b-mlx, Qwen3.8-Flash-Next IQ3_S and DeepSeek-V4.1-Flash
+    IQ2_XXS. 40 checks passed. The four that failed are the Responses API at a
+    short `max_output_tokens`, where a thinking model runs out, as in every
+    release before.
+  - The service's flags: 16 at once on ornith (3.2 s) and on Flash-Next
+    (32.1 s with its load). The 27B beside ornith, a 15,220-token request
+    three times: 64.2 s, then 1.2 and 1.4 s from the prefix pool.
+  - kinhome's kept tool-call requests: 20 calls, one of them with empty
+    arguments. Run again three times: 29 calls, none empty.
+  - Pictures and sound embedded against Ollama, ten files: cosine
+    0.99987–0.99999, the same token counts.
+  - `kinfer service` with a stand-in: 9 of 9.
+  - The fixes:
+    - MLX pooled while drafting, then two at once: no crash.
+    - A 69-byte picture of 50000×50000: refused with 400.
+    - Four given-up callers in a queue of four, then four wanted: all
+      answered.
+  - Speech: CustomVoice and VoiceDesign said, and heard back by Qwen3-ASR;
+    speech streamed as PCM.
+  - A 512² picture from Z-Image-Turbo in 8.5 s.
+- **The laptop** (MacBook Pro M5 Max, 48 GB):
+  - Four models: ornith-1.5:35b, qwen3.8:27b-mlx, Flash-Next and V4.1. 27
+    passed. The 3 that failed are the same Responses check.
+  - Room made for a picture.
+  - A runner killed mid-reply: the error in band, and the next reply
+    answered.
+  - 16 at once on ornith and on the MLX 27B.
+  - Kept tool calls: 19, none empty.
+  - `kinfer run`: a daemon started, kept and stopped; `-local`.
+  - `kinfer service`: 9 of 9.
+  - One check failed: chat, speech and transcription loaded at once. The
+    speech models' room took ornith, which had sized itself to the memory
+    left, off the GPU, and it was loaded again on the next chat. v0.7.2 does
+    the same on that laptop today.
+- **Speed against v0.7.2.** A fresh server each time, the two alternated six
+  times, and every reply's md5 the same:
+  - ornith on the box: prompt about 1,855 tok/s for both; decode 104.0–106.7
+    tok/s against 103.7–105.1.
+  - ornith on the laptop: decode 136.8–136.9 tok/s against 135.9–136.8.
+  - Flash-Next on the laptop, two rounds each: within the runs' own spread.
+- **The two machines:** V4.1 served by the box, with the laptop's worker over
+  Thunderbolt, found by `-peers auto`: 19.7–22.1 tok/s, and a 3,614-token
+  prompt read at 262 tok/s.
+- **Agents:** `kinfer launch claude` and `kinfer launch codex`, from a Mac
+  mini against the box: both answered.
+- **Not run:** Linux and Windows beyond building and packing; GPUs off the
+  Mac.
 
 ## v0.7.2 — 2026-11-11
 
