@@ -34,14 +34,14 @@ func (s *Server) guard(next http.Handler) http.Handler {
 	extra := splitList(os.Getenv("KINFER_ORIGINS"))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if o := r.Header.Get("Origin"); o != "" && !originAllowed(o, r.Host, extra) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "kinfer: a request from the web page at " + o +
-				" is refused; KINFER_ORIGINS lists the pages allowed"})
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "this kinfer server refuses requests from the web page at " + o +
+				"; KINFER_ORIGINS lists the pages it allows"})
 			return
 		}
 		if key != "" && !fromThisMachine(r) && r.URL.Path != "/api/version" && r.URL.Path != "/health" && !keyGiven(r, key) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="kinfer"`)
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "kinfer: this server asks for its key (KINFER_API_KEY), " +
-				"as Authorization: Bearer <key> or x-api-key: <key>"})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "this kinfer server asks for its key (KINFER_API_KEY), " +
+				"sent as Authorization: Bearer KEY or as x-api-key: KEY"})
 			return
 		}
 		next.ServeHTTP(w, r)

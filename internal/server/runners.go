@@ -538,7 +538,7 @@ func (rs *runnerSet) watch(r *runner) {
 	}
 	rs.mu.Unlock()
 	if gone {
-		log.Printf("speech: %s's runner exited; the next request starts it again", modelName(r.path))
+		log.Printf("runner: %s's process exited; the next request starts it again", modelName(r.path))
 	}
 }
 
