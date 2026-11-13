@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.8.1 — unreleased
+
+### Fixed — the machine's other programs, run safely
+
+Found by a review of v0.8.0's new service manager, each confirmed in the code
+and each with a test.
+
+- **A second server ended the first one's services.** Every `kinfer serve`
+  read the services file's list of running processes at its start, and ended
+  the live ones as a crashed server's leftovers. `kinfer run` starts its
+  daemon as a `serve`, and so does `kinfer launch` without `-host`: run once
+  on the box, either one stopped a talking-face session or a video being made.
+  - One server now runs a services file, by a lock it holds while it runs.
+  - Another one leaves the services alone, says which server runs them, and
+    refuses to adopt or release.
+  - Once the first has gone, the next server takes over, and ends what a
+    crashed one left running, as before.
+- **A service too busy to answer was stopped as idle.** A busy path that
+  timed out, failed to connect, or answered 5xx counted as no work, so the
+  service was stopped mid-job. Its clients then polled and got the front's
+  answer for a stopped service (an empty queue), and took the job for done.
+  Now such a service is kept. A path it does not have (4xx) still counts as no
+  sign of work.
+- **A request that came in as a service was being stopped got a 502.** It was
+  forwarded to the process on its way out. Now it waits for the stop and starts
+  the service again.
+  - A stop for room checks again, under the same lock, that nothing is in the
+    service and nothing has used it since it was picked.
+  - A stop for idleness is decided and marked under one lock too.
+- **What a service needs was overwritten by a short run.** One stopped soon
+  after it started wrote its few MB over the 11 GB the talking face holds in
+  use, and the next start made no room for it. The file now keeps the most of
+  all runs; a smaller number is the operator's to write.
+- **A health poll in flight kept the idle clock from starting.** When the last
+  real request ended while a quiet request was still in flight, the service
+  never stopped for idleness again.
+- **A services file that could not be read at the start was not watched.** It
+  was taken in only when someone asked `/api/ps`. Now it is read again as soon
+  as it changes.
+- **The services file was readable by every user.** A scanned service's
+  environment is kept in it as it was, keys and tokens included. The file and
+  its list of processes are now the owner's only, and v0.8.0's files are made
+  so when the server starts.
+
 ## v0.8.0 — 2026-11-13
 
 ### Faster — a model's name is found once

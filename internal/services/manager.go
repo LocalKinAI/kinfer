@@ -49,7 +49,19 @@ type Manager struct {
 	mtime time.Time
 	quit  chan struct{}
 	wg    sync.WaitGroup
+
+	// One server runs a services file. A second one — a kinfer run's daemon,
+	// a test serve on another port — found the first's processes in the file
+	// of pids, took them for a crashed server's leftovers and ended them: a
+	// talking-face session or a video being made, gone. The lock, held for the
+	// server's life, is the first's; the second leaves the services alone.
+	lock    *os.File
+	passive bool // another server holds the lock
+	owner   int  // that server's pid, as its lock file says
 }
+
+// errHeld is the lock held by another server.
+var errHeld = errors.New("held by another server")
 
 // managed is one service's state.
 type managed struct {
@@ -70,6 +82,10 @@ type managed struct {
 	idle     *time.Timer
 	peak     uint64
 	started  time.Time
+	// stopping is open while its process is being stopped: a request that
+	// comes then waits for it to end and starts it again, instead of being
+	// forwarded to a process on its way out (a 502).
+	stopping chan struct{}
 }
 
 // startTimeout is how long a service may take to answer once started: a
@@ -83,11 +99,24 @@ func NewManager(path string) *Manager {
 }
 
 // Start takes in the file's adopted services and watches the file for
-// changes from then on.
+// changes from then on — unless another server runs them, when this one
+// leaves them alone. A file that cannot be read is read again once it changes.
 func (m *Manager) Start() error {
+	lock, owner, err := lockFile(m.path + ".lock")
+	if err != nil {
+		m.passive, m.owner = true, owner
+		if errors.Is(err, errHeld) {
+			log.Printf("services: %s is run by the kinfer serve with pid %d; this one leaves its services alone", m.path, owner)
+		} else {
+			log.Printf("services: %s not taken (%v); this server leaves its services alone", m.path, err)
+		}
+		return nil
+	}
+	m.lock = lock
+	keepPrivate(m.path, m.pidsPath())
 	m.endLeftovers()
 	if err := m.reload(true); err != nil {
-		return err
+		log.Printf("services: %v — read again when it changes", err)
 	}
 	m.wg.Add(1)
 	go func() {
@@ -112,6 +141,14 @@ func (m *Manager) Start() error {
 // addresses.
 func (m *Manager) Close() {
 	close(m.quit)
+	if m.passive {
+		return
+	}
+	defer func() {
+		if m.lock != nil {
+			m.lock.Close()
+		}
+	}()
 	m.mu.Lock()
 	var all []*managed
 	for _, s := range m.svcs {
@@ -136,6 +173,9 @@ func (m *Manager) Close() {
 // reload reads the file if it changed (or always, with force) and brings the
 // running state in line with it.
 func (m *Manager) reload(force bool) error {
+	if m.passive {
+		return nil
+	}
 	st, err := os.Stat(m.path)
 	if errors.Is(err, os.ErrNotExist) {
 		if force {
@@ -331,7 +371,7 @@ func (m *Manager) quiet(s *managed, r *http.Request) ([]byte, bool) {
 func (m *Manager) peek(s *managed) (int, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s.starting || exited(s.done) || s.startErr != nil {
+	if s.starting || s.stopping != nil || exited(s.done) || s.startErr != nil {
 		return 0, false
 	}
 	s.inflight++
@@ -354,6 +394,12 @@ func (m *Manager) acquire(s *managed) (int, error) {
 	if s.idle != nil {
 		s.idle.Stop()
 		s.idle = nil
+	}
+	for s.stopping != nil { // on its way out: wait, then start it again
+		ch := s.stopping
+		m.mu.Unlock()
+		<-ch
+		m.mu.Lock()
 	}
 	if !s.starting && (s.ready == nil || s.startErr != nil || exited(s.done)) {
 		s.starting = true
@@ -396,7 +442,10 @@ func (m *Manager) release(s *managed) {
 	defer m.mu.Unlock()
 	s.inflight--
 	s.used = time.Now()
-	if s.inflight == 0 && s.svc.Idle > 0 {
+	// Only quiet requests left — a health poll in flight as the last real
+	// request ends — and the idle clock starts all the same: it was left
+	// unarmed, and the service never stopped for idleness again.
+	if s.inflight == s.quietIn && s.svc.Idle > 0 {
 		if s.idle != nil {
 			s.idle.Stop()
 		}
@@ -453,8 +502,11 @@ func (m *Manager) armIdle(s *managed, d time.Duration) {
 			m.mu.Unlock()
 			return
 		}
+		ch, ok := m.beginStop(s) // decided and marked under one lock: a request now waits for it
 		m.mu.Unlock()
-		m.stop(s, "idle for "+time.Duration(s.svc.Idle).String())
+		if ok {
+			m.finishStop(s, "idle for "+time.Duration(s.svc.Idle).String(), ch)
+		}
 	})
 	s.idle = t
 }
@@ -479,12 +531,19 @@ func (m *Manager) atWork(s *managed) bool {
 		}
 		r, err := cl.Get("http://127.0.0.1:" + strconv.Itoa(port) + path)
 		if err != nil {
-			continue
+			// Too busy to answer in time, or not answering: kept. Taken for
+			// idle, it was stopped mid-work, and its clients, polling, then
+			// had the front's answer for it stopped — an empty queue — and
+			// took the job for done.
+			return true
 		}
 		b, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
 		r.Body.Close()
+		if r.StatusCode >= 500 {
+			return true // failing under its load: kept, as above
+		}
 		if r.StatusCode != http.StatusOK {
-			continue
+			continue // a path it does not have: no sign either way
 		}
 		var now, idle any
 		if err != nil || json.Unmarshal(b, &now) != nil || json.Unmarshal(stopped, &idle) != nil {
@@ -613,18 +672,43 @@ func (m *Manager) measure(s *managed, pid int, done chan struct{}) {
 
 // stop ends the service's process, if the manager started one: asked first,
 // then made to after 15 s. The most memory it held is written to the file.
+// One already being stopped is waited for.
 func (m *Manager) stop(s *managed, why string) {
 	m.mu.Lock()
-	cmd, done, peak := s.cmd, s.done, s.peak
+	ch, ok := m.beginStop(s)
+	m.mu.Unlock()
+	if ok {
+		m.finishStop(s, why, ch)
+	} else if ch != nil {
+		<-ch
+	}
+}
+
+// beginStop marks s stopping, with m.mu held. ok is false when there is
+// nothing to stop, or it is already being stopped: then ch, if not nil, is
+// closed once it is.
+func (m *Manager) beginStop(s *managed) (ch chan struct{}, ok bool) {
+	if s.stopping != nil {
+		return s.stopping, false
+	}
 	if s.idle != nil {
 		s.idle.Stop()
 		s.idle = nil
 	}
 	s.working = false
-	m.mu.Unlock()
-	if cmd == nil || exited(done) {
-		return
+	if s.cmd == nil || exited(s.done) {
+		return nil, false
 	}
+	s.stopping = make(chan struct{})
+	return s.stopping, true
+}
+
+// finishStop ends the process beginStop marked, and lets the requests that
+// waited for it go on.
+func (m *Manager) finishStop(s *managed, why string, ch chan struct{}) {
+	m.mu.Lock()
+	cmd, done := s.cmd, s.done
+	m.mu.Unlock()
 	pgid := cmd.Process.Pid
 	signalGroup(pgid, false)
 	select {
@@ -633,6 +717,11 @@ func (m *Manager) stop(s *managed, why string) {
 		signalGroup(pgid, true)
 		<-done
 	}
+	m.mu.Lock()
+	peak := s.peak
+	s.stopping = nil
+	m.mu.Unlock()
+	close(ch)
 	m.notePID(s.svc.Name, 0)
 	log.Printf("services: %s stopped (%s), having held %.1f GB at most", s.svc.Name, why, float64(peak)/1e9)
 	if peak > 0 {
@@ -640,13 +729,16 @@ func (m *Manager) stop(s *managed, why string) {
 	}
 }
 
-// remember writes the most a service held into the file.
+// remember writes the most a service held into the file: the most of all its
+// runs, not the last. A run stopped soon after it started holds little — the
+// talking face's 11 GB came back as a few MB — and the next start then made
+// no room for it. A smaller number is the operator's to write.
 func (m *Manager) remember(name string, peak uint64) {
 	f, err := Load(m.path)
 	if err != nil {
 		return
 	}
-	if _, i, ok := f.Find(name); ok && f.Services[i].Need != peak {
+	if _, i, ok := f.Find(name); ok && peak > f.Services[i].Need {
 		f.Services[i].Need = peak
 		if Save(m.path, f) == nil {
 			m.mu.Lock()
@@ -679,7 +771,18 @@ func (m *Manager) notePID(name string, pid int) {
 		pids[name] = pid
 	}
 	b, _ := json.Marshal(pids)
-	os.WriteFile(m.pidsPath(), b, 0o644)
+	os.WriteFile(m.pidsPath(), b, 0o600)
+}
+
+// keepPrivate makes the services file and its pids readable by their owner
+// only: a scanned service's environment is kept in the file as it was, keys
+// and tokens with it.
+func keepPrivate(paths ...string) {
+	for _, p := range paths {
+		if st, err := os.Stat(p); err == nil && st.Mode().Perm()&0o077 != 0 {
+			os.Chmod(p, 0o600)
+		}
+	}
 }
 
 // endLeftovers ends what a server before this one started and left running:
@@ -726,6 +829,9 @@ func freePort() (int, error) {
 // not at work, unused longest: the one to stop for room, and since when it is
 // unused.
 func (m *Manager) Idlest() (name string, since time.Time, ok bool) {
+	if m.passive {
+		return "", time.Time{}, false
+	}
 	type unused struct {
 		s    *managed
 		name string
@@ -734,7 +840,7 @@ func (m *Manager) Idlest() (name string, since time.Time, ok bool) {
 	var list []unused
 	m.mu.Lock()
 	for _, s := range m.svcs {
-		if s.inflight > 0 || s.svc.Idle == 0 || exited(s.done) || s.started.IsZero() {
+		if s.inflight > 0 || s.svc.Idle == 0 || exited(s.done) || s.started.IsZero() || s.stopping != nil {
 			continue
 		}
 		u := s.used
@@ -755,6 +861,9 @@ func (m *Manager) Idlest() (name string, since time.Time, ok bool) {
 
 // Stop stops the service called name if the manager runs it.
 func (m *Manager) Stop(name, why string) bool {
+	if m.passive {
+		return false
+	}
 	m.mu.Lock()
 	s := m.svcs[name]
 	m.mu.Unlock()
@@ -762,6 +871,30 @@ func (m *Manager) Stop(name, why string) bool {
 		return false
 	}
 	m.stop(s, why)
+	return true
+}
+
+// StopUnused stops the service called name to make room, if nothing has used
+// it since since — when Idlest found it unused — and no request is in it
+// now, the two looked at and the stop marked under one lock: a request that
+// came between Idlest and here had its service stopped under it. It reports
+// whether it stopped it.
+func (m *Manager) StopUnused(name string, since time.Time, why string) bool {
+	if m.passive {
+		return false
+	}
+	m.mu.Lock()
+	s := m.svcs[name]
+	if s == nil || s.inflight > s.quietIn || s.used.After(since) {
+		m.mu.Unlock()
+		return false
+	}
+	ch, ok := m.beginStop(s)
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	m.finishStop(s, why, ch)
 	return true
 }
 
@@ -783,6 +916,9 @@ type Stat struct {
 // Stats is every service's state, by name, the file read again first if it
 // changed.
 func (m *Manager) Stats() []Stat {
+	if m.passive {
+		return nil
+	}
 	if err := m.reload(false); err != nil {
 		log.Printf("services: %v", err)
 	}

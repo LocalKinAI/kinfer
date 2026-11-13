@@ -134,7 +134,9 @@ func (s *Server) makeRoom(label string, need uint64, exceptPath, exceptService s
 		case svc != "" && (r == nil || since.Before(r.used)):
 			log.Printf("services: %s needs about %s of the GPU and %s is free: stopping %s, unused since %s",
 				label, gb(need), gb(free), svc, since.Format("15:04:05"))
-			s.services.Stop(svc, "room for "+label)
+			if !s.services.StopUnused(svc, since, "room for "+label) {
+				continue // used since it was found unused: look again
+			}
 			waitFreed(free)
 		case r != nil:
 			log.Printf("runner: %s needs about %s of the GPU and %s is free: stopping %s, unused since %s",

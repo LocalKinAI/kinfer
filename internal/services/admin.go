@@ -17,6 +17,9 @@ import (
 // what was started beside it — and the manager listens there in its place,
 // starting it again when first asked for.
 func (m *Manager) Adopt(name string, idle time.Duration) error {
+	if err := m.active(); err != nil {
+		return err
+	}
 	f, err := Load(m.path)
 	if err != nil {
 		return err
@@ -97,6 +100,9 @@ func end(pid int) {
 // the address, and the service is started on it again the way it was, on its
 // own, outliving this server.
 func (m *Manager) Release(name string) (int, error) {
+	if err := m.active(); err != nil {
+		return 0, err
+	}
 	f, err := Load(m.path)
 	if err != nil {
 		return 0, err
@@ -152,6 +158,14 @@ func runAlone(svc Service, file string) (int, error) {
 	pid := cmd.Process.Pid
 	go cmd.Wait() // reaped if it ends while this server runs
 	return pid, nil
+}
+
+// active refuses a change to services another server runs.
+func (m *Manager) active() error {
+	if m.passive {
+		return fmt.Errorf("the services in %s are run by the kinfer serve with pid %d: ask that one", m.path, m.owner)
+	}
+	return nil
 }
 
 // ErrNoManager is what the front's endpoints answer with no services file.

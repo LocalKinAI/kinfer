@@ -272,7 +272,8 @@ func TestLeftoversOfAServerBeforeAreEnded(t *testing.T) {
 	if left == 0 {
 		t.Fatal("not running")
 	}
-	// The server goes without stopping it: its listeners only.
+	// The server goes without stopping it: its listeners only, and its lock,
+	// as a process that ends lets go of it.
 	m.mu.Lock()
 	for _, s := range m.svcs {
 		if s.srv != nil {
@@ -281,6 +282,7 @@ func TestLeftoversOfAServerBeforeAreEnded(t *testing.T) {
 		}
 	}
 	m.mu.Unlock()
+	m.lock.Close()
 
 	next := NewManager(path)
 	if err := next.Start(); err != nil {
