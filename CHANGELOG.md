@@ -21,7 +21,9 @@ either. See [Reasoning models](docs/agents.md#reasoning-models).
   so a request that names no level gets the prompt it got before.
 - `/v1/chat/completions` reads `chat_template_kwargs`: `enable_thinking`,
   `reasoning_effort`, and `preserve_thinking` (true keeps the reasoning of
-  every turn).
+  every turn, for the templates that have the switch: DeepSeek V4.1 keeps
+  its own rule, every turn when functions are declared and the current one
+  otherwise).
 - Each template's prompts are tested against the same templates rendered by
   Jinja, to the character: Qwen3.8-27B's, Flash-Next's and ornith's.
 - Not changed, as it would change replies nobody asked to have changed: the

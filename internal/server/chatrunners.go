@@ -165,7 +165,7 @@ func (s *Server) makeRoomFor(path string) {
 			return
 		}
 		// The runner or the service unused longest goes (services.go).
-		if s.makeRoom(modelName(path), need, path, "") {
+		if s.makeRoom(logName(path), need, path, "") {
 			return
 		}
 		if rs.busy(path) && time.Now().Before(deadline) {
@@ -427,7 +427,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, rn *runner, end
 			}
 			log.Printf("runner: %s: %v", logName(rn.path), err)
 			if !answered {
-				dialectError(w, endpoint, http.StatusBadGateway, fmt.Sprintf("the model %s stopped answering: %v; the next request starts it again", modelName(rn.path), err))
+				dialectError(w, endpoint, http.StatusBadGateway, fmt.Sprintf("the model %s stopped answering: %v; the next request starts it again", logName(rn.path), err))
 			}
 		},
 	}

@@ -134,7 +134,7 @@ func (w *watchdog) model(g generator, path string, now time.Time) string {
 	if now.Sub(w.since) < w.stall {
 		return ""
 	}
-	return fmt.Sprintf("%s has not moved for %s with %d requests on it", modelName(path), w.stall.Round(time.Second), waiting+busy)
+	return fmt.Sprintf("%s has not moved for %s with %d requests on it", logName(path), w.stall.Round(time.Second), waiting+busy)
 }
 
 // probe asks this server's own address for its version.
