@@ -74,16 +74,16 @@ func (s *Server) load(p *proc, path string) {
 	body, _ := json.Marshal(map[string]any{"model": s.storeName(path), "keep_alive": -1})
 	resp, err := (&http.Client{Timeout: 30 * time.Minute}).Post(p.base+"/api/generate", "application/json", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("runner: %s did not load: %v", modelName(path), err)
+		log.Printf("runner: %s did not load: %v", logName(path), err)
 		return
 	}
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("runner: %s did not load: %s", modelName(path), strings.TrimSpace(string(out)))
+		log.Printf("runner: %s did not load: %s", logName(path), strings.TrimSpace(string(out)))
 		return
 	}
-	log.Printf("runner: %s loaded in %v", modelName(path), time.Since(t0).Round(time.Millisecond))
+	log.Printf("runner: %s loaded in %v", logName(path), time.Since(t0).Round(time.Millisecond))
 }
 
 // ─── making room ─────────────────────────────────────────────────────────────
@@ -170,13 +170,13 @@ func (s *Server) makeRoomFor(path string) {
 		}
 		if rs.busy(path) && time.Now().Before(deadline) {
 			if !waited {
-				log.Printf("runner: %s needs about %s of the GPU and %s is free: waiting for a model in use to finish", modelName(path), gb(need), gb(free))
+				log.Printf("runner: %s needs about %s of the GPU and %s is free: waiting for a model in use to finish", logName(path), gb(need), gb(free))
 				waited = true
 			}
 			time.Sleep(250 * time.Millisecond)
 			continue
 		}
-		log.Printf("runner: %s needs about %s of the GPU, %s is free and nothing more can be stopped: it sizes itself to what there is", modelName(path), gb(need), gb(free))
+		log.Printf("runner: %s needs about %s of the GPU, %s is free and nothing more can be stopped: it sizes itself to what there is", logName(path), gb(need), gb(free))
 		return
 	}
 }
@@ -371,7 +371,7 @@ func (s *Server) proxyChat(endpoint string) http.HandlerFunc {
 		loadOnly := endpoint == "/api/generate" && empty(top["prompt"]) || endpoint == "/api/chat" && empty(top["messages"])
 		if loadOnly && ask != nil && *ask == 0 {
 			if s.runners.stopPath(path) {
-				log.Printf("runner: %s stopped as asked (keep_alive 0)", modelName(path))
+				log.Printf("runner: %s stopped as asked (keep_alive 0)", logName(path))
 			}
 			unloaded(w, endpoint, name)
 			return
@@ -417,7 +417,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, rn *runner, end
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			answered = true
-			resp.Body = &cutShort{ReadCloser: resp.Body, kind: resp.Header.Get("Content-Type"), model: modelName(rn.path)}
+			resp.Body = &cutShort{ReadCloser: resp.Body, kind: resp.Header.Get("Content-Type"), model: logName(rn.path)}
 			return nil
 		},
 		FlushInterval: -1, // a streamed reply goes out as it is written
@@ -425,7 +425,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, rn *runner, end
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			log.Printf("runner: %s: %v", modelName(rn.path), err)
+			log.Printf("runner: %s: %v", logName(rn.path), err)
 			if !answered {
 				dialectError(w, endpoint, http.StatusBadGateway, fmt.Sprintf("the model %s stopped answering: %v; the next request starts it again", modelName(rn.path), err))
 			}
@@ -455,6 +455,10 @@ func (c *cutShort) Read(p []byte) (int, error) {
 	}
 	n, err := c.ReadCloser.Read(p)
 	if err == nil || err == io.EOF || c.said {
+		return n, err
+	}
+	// The one who asked went away: the runner is well, and nobody is left to tell.
+	if errors.Is(err, context.Canceled) {
 		return n, err
 	}
 	c.said = true

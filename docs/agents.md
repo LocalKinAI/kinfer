@@ -315,8 +315,23 @@ with nothing to show for it whenever a reasoning model ran out of time.
 A level — `"think": "low"`, `"high"` or `"max"`, or OpenAI's
 `"reasoning_effort"`, where `"none"` is off — is passed to models that take a
 reasoning budget. DeepSeek V4.1 does, as a line at the top of its prompt
-("Reasoning Effort: 50", 75 or 100, or any number from 1 to 100); models
-without one ignore it.
+("Reasoning Effort: 50", 75 or 100, or any number from 1 to 100). Qwen3.8's
+templates do too, as an instruction at the head of the system prompt, in the
+template's own words for that level: `low` and `xhigh` each write one (`high`
+and `max` are read as `xhigh`), and `medium` writes none. When no level is
+named, kinfer writes none either, where the template alone would write
+`xhigh`'s: a caller who asked for nothing gets the prompt it always got.
+Models without a budget ignore the level.
+
+Reasoning a caller sends back with an earlier assistant turn, as `thinking` or
+`reasoning_content`, is given to the model as that turn's think block, the way
+the template writes it. It is kept for the turns since the user's last
+question, which is where a tool loop needs it, and dropped from the turns
+before: a reply's reasoning runs to thousands of tokens, and a long
+conversation would carry all of it on every turn.
+`"chat_template_kwargs": {"preserve_thinking": true}` in `/v1/chat/completions`
+keeps it in every turn. The same field takes `enable_thinking` and
+`reasoning_effort`, as llama-server and vLLM read them.
 
 A reasoning model can spend an entire token budget thinking and return an empty
 answer, so a reply cut short by the budget reports `done_reason: "length"` —

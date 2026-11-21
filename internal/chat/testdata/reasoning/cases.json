@@ -1,0 +1,315 @@
+[
+ {
+  "name": "qwen3.8 effort low",
+  "template": "qwen3.8-27b.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "Say hello."
+   }
+  ],
+  "thinking": {
+   "On": true,
+   "Effort": "low"
+  },
+  "want": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "qwen3.8 effort medium writes nothing",
+  "template": "qwen3.8-27b.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "Say hello."
+   }
+  ],
+  "thinking": {
+   "On": true,
+   "Effort": "medium"
+  },
+  "want": "<|im_start|>system\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "qwen3.8 effort xhigh, no system turn",
+  "template": "qwen3.8-27b.jinja",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Say hello."
+   }
+  ],
+  "thinking": {
+   "On": true,
+   "Effort": "xhigh"
+  },
+  "want": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "qwen3.8 effort high is the template's xhigh",
+  "template": "qwen3.8-27b.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "Say hello."
+   }
+  ],
+  "thinking": {
+   "On": true,
+   "Effort": "high"
+  },
+  "want": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "qwen3.8 thinking off: no instruction",
+  "template": "qwen3.8-27b.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "Say hello."
+   }
+  ],
+  "thinking": {
+   "Off": true,
+   "Effort": "low"
+  },
+  "want": "<|im_start|>system\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "flash-next high reads as xhigh",
+  "template": "qwen3.8-flash-next.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "Say hello."
+   }
+  ],
+  "thinking": {
+   "On": true,
+   "Effort": "high"
+  },
+  "want": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "flash-next effort low",
+  "template": "qwen3.8-flash-next.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "Say hello."
+   }
+  ],
+  "thinking": {
+   "On": true,
+   "Effort": "low"
+  },
+  "want": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "qwen3.8 reasoning back, the tool loop's turns",
+  "template": "qwen3.8-27b.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "What is 17 times 23?"
+   },
+   {
+    "role": "assistant",
+    "thinking": "17*23 = 17*20 + 17*3 = 340 + 51 = 391.",
+    "content": "391."
+   },
+   {
+    "role": "user",
+    "content": "List the files, then count them."
+   },
+   {
+    "role": "assistant",
+    "thinking": "First I need the listing; then I count.",
+    "content": "I will list them."
+   },
+   {
+    "role": "tool",
+    "content": "a.txt\nb.txt"
+   },
+   {
+    "role": "assistant",
+    "thinking": "Two names came back: a.txt and b.txt.",
+    "content": "Counting."
+   },
+   {
+    "role": "tool",
+    "content": "ok"
+   }
+  ],
+  "thinking": {
+   "On": true,
+   "Effort": "medium"
+  },
+  "want": "<|im_start|>system\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nWhat is 17 times 23?<|im_end|>\n<|im_start|>assistant\n391.<|im_end|>\n<|im_start|>user\nList the files, then count them.<|im_end|>\n<|im_start|>assistant\n<think>\nFirst I need the listing; then I count.\n</think>\n\nI will list them.<|im_end|>\n<|im_start|>user\n<tool_response>\na.txt\nb.txt\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nTwo names came back: a.txt and b.txt.\n</think>\n\nCounting.<|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "qwen3.8 reasoning back, every turn (the template's default)",
+  "template": "qwen3.8-27b.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "What is 17 times 23?"
+   },
+   {
+    "role": "assistant",
+    "thinking": "17*23 = 17*20 + 17*3 = 340 + 51 = 391.",
+    "content": "391."
+   },
+   {
+    "role": "user",
+    "content": "List the files, then count them."
+   },
+   {
+    "role": "assistant",
+    "thinking": "First I need the listing; then I count.",
+    "content": "I will list them."
+   },
+   {
+    "role": "tool",
+    "content": "a.txt\nb.txt"
+   },
+   {
+    "role": "assistant",
+    "thinking": "Two names came back: a.txt and b.txt.",
+    "content": "Counting."
+   },
+   {
+    "role": "tool",
+    "content": "ok"
+   }
+  ],
+  "thinking": {
+   "On": true,
+   "Effort": "medium",
+   "KeepAll": true
+  },
+  "want": "<|im_start|>system\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nWhat is 17 times 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17*23 = 17*20 + 17*3 = 340 + 51 = 391.\n</think>\n\n391.<|im_end|>\n<|im_start|>user\nList the files, then count them.<|im_end|>\n<|im_start|>assistant\n<think>\nFirst I need the listing; then I count.\n</think>\n\nI will list them.<|im_end|>\n<|im_start|>user\n<tool_response>\na.txt\nb.txt\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nTwo names came back: a.txt and b.txt.\n</think>\n\nCounting.<|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "ornith reasoning back, every turn (its template has no switch)",
+  "template": "ornith-1.5-35b.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "What is 17 times 23?"
+   },
+   {
+    "role": "assistant",
+    "thinking": "17*23 = 17*20 + 17*3 = 340 + 51 = 391.",
+    "content": "391."
+   },
+   {
+    "role": "user",
+    "content": "List the files, then count them."
+   },
+   {
+    "role": "assistant",
+    "thinking": "First I need the listing; then I count.",
+    "content": "I will list them."
+   },
+   {
+    "role": "tool",
+    "content": "a.txt\nb.txt"
+   },
+   {
+    "role": "assistant",
+    "thinking": "Two names came back: a.txt and b.txt.",
+    "content": "Counting."
+   },
+   {
+    "role": "tool",
+    "content": "ok"
+   }
+  ],
+  "thinking": {
+   "KeepAll": true
+  },
+  "want": "<|im_start|>system\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nWhat is 17 times 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17*23 = 17*20 + 17*3 = 340 + 51 = 391.\n</think>\n\n391.<|im_end|>\n<|im_start|>user\nList the files, then count them.<|im_end|>\n<|im_start|>assistant\n<think>\nFirst I need the listing; then I count.\n</think>\n\nI will list them.<|im_end|>\n<|im_start|>user\n<tool_response>\na.txt\nb.txt\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nTwo names came back: a.txt and b.txt.\n</think>\n\nCounting.<|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "ornith reasoning back, thinking off",
+  "template": "ornith-1.5-35b.jinja",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a careful engineer."
+   },
+   {
+    "role": "user",
+    "content": "What is 17 times 23?"
+   },
+   {
+    "role": "assistant",
+    "thinking": "17*23 = 17*20 + 17*3 = 340 + 51 = 391.",
+    "content": "391."
+   },
+   {
+    "role": "user",
+    "content": "List the files, then count them."
+   },
+   {
+    "role": "assistant",
+    "thinking": "First I need the listing; then I count.",
+    "content": "I will list them."
+   },
+   {
+    "role": "tool",
+    "content": "a.txt\nb.txt"
+   },
+   {
+    "role": "assistant",
+    "thinking": "Two names came back: a.txt and b.txt.",
+    "content": "Counting."
+   },
+   {
+    "role": "tool",
+    "content": "ok"
+   }
+  ],
+  "thinking": {
+   "Off": true,
+   "KeepAll": true
+  },
+  "want": "<|im_start|>system\nYou are a careful engineer.<|im_end|>\n<|im_start|>user\nWhat is 17 times 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17*23 = 17*20 + 17*3 = 340 + 51 = 391.\n</think>\n\n391.<|im_end|>\n<|im_start|>user\nList the files, then count them.<|im_end|>\n<|im_start|>assistant\n<think>\nFirst I need the listing; then I count.\n</think>\n\nI will list them.<|im_end|>\n<|im_start|>user\n<tool_response>\na.txt\nb.txt\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nTwo names came back: a.txt and b.txt.\n</think>\n\nCounting.<|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ }
+]

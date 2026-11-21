@@ -226,7 +226,7 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p engine.Gen
 			return "", engine.Stats{}, errors.New("pictures are not supported by the MLX backend yet")
 		}
 	}
-	th := chat.Thinking{Off: p.NoThink, On: p.Think, Effort: p.Effort}
+	th := chat.Thinking{Off: p.NoThink, On: p.Think, Effort: p.Effort, KeepAll: p.KeepThinking}
 	prompt := e.tok.Encode(e.tpl.RenderWith(msgs, p.Tools, th), true)
 	j := &job{ctx: ctx, prompt: prompt, params: p, frags: make(chan string, 1<<16), done: make(chan struct{})}
 	if e.pool != nil {
@@ -300,7 +300,7 @@ func (e *Engine) checkpoints(msgs []chat.Message, p engine.GenParams, th chat.Th
 
 // CountTokens is how many tokens msgs render to.
 func (e *Engine) CountTokens(msgs []chat.Message, p engine.GenParams) (int, error) {
-	th := chat.Thinking{Off: p.NoThink, On: p.Think, Effort: p.Effort}
+	th := chat.Thinking{Off: p.NoThink, On: p.Think, Effort: p.Effort, KeepAll: p.KeepThinking}
 	return len(e.tok.Encode(e.tpl.RenderWith(msgs, p.Tools, th), true)), nil
 }
 

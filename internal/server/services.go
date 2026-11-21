@@ -148,7 +148,7 @@ func (s *Server) makeRoom(label string, need uint64, exceptPath, exceptService s
 			waitFreed(free)
 		case r != nil:
 			log.Printf("runner: %s needs about %s of the GPU and %s is free: stopping %s, unused since %s",
-				label, gb(need), gb(free), modelName(r.path), r.used.Format("15:04:05"))
+				label, gb(need), gb(free), logName(r.path), r.used.Format("15:04:05"))
 			s.runners.stopNow(r)
 			waitFreed(free)
 		default:

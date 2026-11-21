@@ -1,10 +1,15 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -305,3 +310,27 @@ func TestStreamCutShort(t *testing.T) {
 		}
 	}
 }
+
+// A caller who hangs up mid-reply is not the runner failing: nothing is said
+// in the reply's format and nothing logged against the model.
+func TestCutShortSaysNothingWhenTheCallerLeft(t *testing.T) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
+	c := &cutShort{ReadCloser: io.NopCloser(errReader{context.Canceled}), kind: "application/x-ndjson", model: "alpha"}
+	n, err := c.Read(make([]byte, 64))
+	if n != 0 || !errors.Is(err, context.Canceled) {
+		t.Errorf("Read = %d, %v; want the cancellation passed on", n, err)
+	}
+	if logged.Len() != 0 {
+		t.Errorf("logged %q for a caller who left", logged.String())
+	}
+	c = &cutShort{ReadCloser: io.NopCloser(errReader{io.ErrUnexpectedEOF}), kind: "application/x-ndjson", model: "alpha"}
+	if _, err := c.Read(make([]byte, 64)); err != nil || !strings.Contains(string(c.rest), "stopped answering mid-reply") {
+		t.Errorf("a runner that ended: err %v, rest %q; want the error in the reply's format", err, c.rest)
+	}
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }

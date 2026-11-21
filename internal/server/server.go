@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
@@ -169,6 +170,8 @@ func New(s *store.Store, opts engine.Options) *Server {
 	srv := &Server{store: s, opts: opts, open: openEngine, openEmbed: openEmbedder,
 		speech: SpeechOff, speechDefaults: SpeechModels()}
 	srv.cond = sync.NewCond(&srv.mu)
+	name := srv.storeName
+	nameOfPath.Store(&name)
 	srv.runners = &runnerSet{byPath: map[string]*runner{}, keepAlive: 5 * time.Minute, start: srv.startRunner}
 	srv.pulls = &pullSet{byRepo: map[string]*pull{}}
 	srv.pulls.start = srv.pulls.runPull
@@ -1146,6 +1149,18 @@ func modelName(path string) string {
 	return strings.TrimSuffix(filepath.Base(path), ".gguf")
 }
 
+// logName is the name a log line gives the model at path: the store's, which
+// for a model borrowed from Ollama is the name people ask for it by and not
+// the sha256 its file is called.
+func logName(path string) string {
+	if f := nameOfPath.Load(); f != nil {
+		return (*f)(path)
+	}
+	return modelName(path)
+}
+
+var nameOfPath atomic.Pointer[func(string) string]
+
 // ─── OpenAI dialect ──────────────────────────────────────────────────────────
 
 type openAIChatRequest struct {
@@ -1162,6 +1177,18 @@ type openAIChatRequest struct {
 	// ReasoningEffort is OpenAI's thinking knob: "none" turns thinking off,
 	// any other level is passed to models that take an effort.
 	ReasoningEffort string `json:"reasoning_effort"`
+
+	// ChatTemplateKwargs are the switches llama-server and vLLM pass to a
+	// model's template under this name. Three are read, the ones the
+	// templates kinfer serves have: enable_thinking (think, as "think"),
+	// reasoning_effort (as the field above, which wins) and
+	// preserve_thinking (true: every earlier turn keeps the reasoning sent
+	// back with it, not only those since the user's last question).
+	ChatTemplateKwargs *struct {
+		EnableThinking   *bool  `json:"enable_thinking"`
+		ReasoningEffort  string `json:"reasoning_effort"`
+		PreserveThinking *bool  `json:"preserve_thinking"`
+	} `json:"chat_template_kwargs"`
 
 	// StreamOptions is where a streaming caller asks for token counts. OpenAI
 	// sends usage on a stream only when include_usage is set, in one extra
@@ -1209,12 +1236,25 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	params.NoThink = thinkOff(req.Think)
 	params.Think = thinkOn(req.Think)
 	params.Effort = thinkLevel(req.Think)
-	switch req.ReasoningEffort {
+	effort := req.ReasoningEffort
+	if kw := req.ChatTemplateKwargs; kw != nil {
+		if kw.EnableThinking != nil && len(req.Think) == 0 {
+			params.NoThink, params.Think = !*kw.EnableThinking, *kw.EnableThinking
+		}
+		if effort == "" {
+			effort = kw.ReasoningEffort
+		}
+		params.KeepThinking = kw.PreserveThinking != nil && *kw.PreserveThinking
+	}
+	switch effort {
 	case "":
 	case "none":
 		params.NoThink, params.Think = true, false
 	default:
-		params.Effort, params.Think = req.ReasoningEffort, true
+		params.Effort = effort
+		if !params.NoThink {
+			params.Think = true
+		}
 	}
 	if req.Temperature != nil {
 		params.Temperature = float32(*req.Temperature)

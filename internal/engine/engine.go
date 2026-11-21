@@ -186,6 +186,11 @@ type GenParams struct {
 	// default. Templates without such a budget ignore it.
 	Effort string
 
+	// KeepThinking gives every earlier assistant turn the reasoning the
+	// caller sent back with it, where the default is the turns since the
+	// user's last question; see chat.Thinking.KeepAll.
+	KeepThinking bool
+
 	// Resume is the start of the reply, which the caller already has: the
 	// model goes on from its end, and only what follows is sent. The server
 	// sets it to carry a reply over to a reloaded model when the backend went
@@ -195,7 +200,7 @@ type GenParams struct {
 
 // thinking is the reasoning a job asked for, in the form templates take.
 func (p GenParams) thinking() chat.Thinking {
-	return chat.Thinking{Off: p.NoThink, On: p.Think, Effort: p.Effort}
+	return chat.Thinking{Off: p.NoThink, On: p.Think, Effort: p.Effort, KeepAll: p.KeepThinking}
 }
 
 // Stats are the token counts and timings for one reply.

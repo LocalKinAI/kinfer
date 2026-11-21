@@ -621,9 +621,8 @@ with the model's loading, then 0.7 s; a transcript 0.14 s; chat, speech and a
 transcript at once 0.6 s; streamed speech's first audio 0.15 s through the
 front server; a runner killed with -9, started again by the next request in
 1.2 s; idle runners stopped after `-keepalive`; the server's SIGTERM and its
-SIGKILL each ending its runners within 4 s. Not yet: the speech models are not
-counted in the memory a chat model is sized against when they start after it,
-and chat models are still loaded in the server itself.
+SIGKILL each ending its runners within 4 s. Since v0.7.0 chat models run in
+runners too, and room is made for each before it starts (below).
 
 ## Every model in a process of its own
 

@@ -57,6 +57,11 @@ type Thinking struct {
 	Off    bool
 	On     bool
 	Effort string
+
+	// KeepAll gives every earlier assistant turn its reasoning back, where
+	// the default is the turns since the user's last question (see
+	// withReasoning).
+	KeepAll bool
 }
 
 // Template renders a conversation and reports the model's stop markers.
@@ -111,6 +116,12 @@ type Template struct {
 	// it does so when nobody said (see thinkOnSuffix).
 	thinkOn         string
 	thinksByDefault bool
+
+	// rendersReasoning says the template writes an earlier turn's reasoning
+	// back as a think block, and efforts what it does with a reasoning
+	// effort; see withReasoning.
+	rendersReasoning bool
+	efforts          *efforts
 }
 
 // RenderWith renders the conversation for a reply that reasons as th says.
@@ -118,6 +129,7 @@ func (t *Template) RenderWith(msgs []Message, ts []tools.Tool, th Thinking) stri
 	if t.renderAll != nil {
 		return t.renderAll(msgs, ts, th)
 	}
+	msgs = t.withReasoning(msgs, th)
 	if th.Off {
 		return t.RenderNoThink(msgs, ts)
 	}
@@ -384,11 +396,13 @@ func FromTemplate(tmpl, path string) *Template {
 	}
 
 	return &Template{
-		Name:            "gguf",
-		toolFmt:         tools.Detect(tmpl),
-		noThink:         noThinkSuffix(tmpl),
-		thinkOn:         thinkOnSuffix(tmpl),
-		thinksByDefault: thinksByDefault(tmpl),
+		Name:             "gguf",
+		toolFmt:          tools.Detect(tmpl),
+		noThink:          noThinkSuffix(tmpl),
+		thinkOn:          thinkOnSuffix(tmpl),
+		thinksByDefault:  thinksByDefault(tmpl),
+		rendersReasoning: rendersReasoning(tmpl),
+		efforts:          readEfforts(tmpl),
 		// No stop strings. Generation ends on an end-of-generation token, which
 		// llama_vocab_is_eog reports for whatever terminator this model uses —
 		// a surer signal than matching text, and the only one available when

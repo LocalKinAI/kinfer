@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed — reasoning sent back, and reasoning effort, reach the prompt
+
+Found by a client's own measurements on Qwen3.8-27B: the reasoning it sent
+back with a tool call, and the effort it asked for, changed nothing in the
+prompt. llama.cpp's template call takes a role and a text for each message
+and nothing else, so only DeepSeek V4.1, which kinfer renders itself, took
+either. See [Reasoning models](docs/agents.md#reasoning-models).
+
+- **Reasoning sent back with an earlier assistant turn is given to the model**,
+  as `thinking` or `reasoning_content`, written as the template writes it. It
+  is kept for the turns since the user's last question, and dropped before
+  that. On the box's qwen3.8-27b a tool loop's prompt went from 39 tokens to
+  68; ornith-1.5:35b takes it the same way.
+- **A reasoning effort is written into the prompt** in the template's own
+  words: on qwen3.8-27b, `low` 43 tokens, `high` and `xhigh` 55, against 13
+  with none. `medium`, an unknown level, and no level at all write nothing,
+  so a request that names no level gets the prompt it got before.
+- `/v1/chat/completions` reads `chat_template_kwargs`: `enable_thinking`,
+  `reasoning_effort`, and `preserve_thinking` (true keeps the reasoning of
+  every turn).
+- Each template's prompts are tested against the same templates rendered by
+  Jinja, to the character: Qwen3.8-27B's, Flash-Next's and ornith's.
+- Not changed, as it would change replies nobody asked to have changed: the
+  templates write an empty think block into every earlier assistant turn, and
+  kinfer writes one only where reasoning was sent.
+
 ### Added — a process that hangs is ended, so that it is started again
 
 From the same review. See [Staying up under load](docs/serving.md#staying-up-under-load).
@@ -63,6 +89,12 @@ From the same review. See [Who may ask](docs/serving.md#who-may-ask).
 - A picture sent to a chat model was decoded whole by llama.cpp before its
   size was looked at. Its header is now read first, and more than 100 million
   pixels is refused, as embeddings' pictures have been since v0.8.0.
+- A caller who hung up in the middle of a reply was logged as "the model
+  stopped answering mid-reply". The model was well. Found in the box's log
+  after four days on the internal build: 53 such lines, none of them a fault.
+  A hang-up is no longer logged against the model.
+- Log lines named a model borrowed from Ollama by its file, `sha256-aaeb…`.
+  They now give the name people ask for it by.
 
 ## v0.8.1 — 2026-11-13
 

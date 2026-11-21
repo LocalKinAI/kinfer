@@ -259,7 +259,7 @@ func (s *Server) proxySpeechTo(w http.ResponseWriter, r *http.Request, kind, pat
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			log.Printf("speech: %s's runner: %v", modelName(path), err)
+			log.Printf("speech: %s's runner: %v", logName(path), err)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]string{
 				"message": fmt.Sprintf("the %s model %s stopped answering: %v", kindNames[kind], modelName(path), err)}})
 		},
@@ -517,9 +517,9 @@ func (rs *runnerSet) retire(r *runner) {
 	delete(rs.byPath, r.path)
 	rs.mu.Unlock()
 	if r.ask != nil && *r.ask == 0 {
-		log.Printf("runner: %s stopped as asked (keep_alive 0)", modelName(r.path))
+		log.Printf("runner: %s stopped as asked (keep_alive 0)", logName(r.path))
 	} else {
-		log.Printf("runner: %s idle, its runner stopped", modelName(r.path))
+		log.Printf("runner: %s idle, its runner stopped", logName(r.path))
 	}
 	r.p.stop()
 }
@@ -538,7 +538,7 @@ func (rs *runnerSet) watch(r *runner) {
 	}
 	rs.mu.Unlock()
 	if gone {
-		log.Printf("runner: %s's process exited; the next request starts it again", modelName(r.path))
+		log.Printf("runner: %s's process exited; the next request starts it again", logName(r.path))
 	}
 }
 
@@ -683,7 +683,7 @@ func (s *Server) startRunner(path string, chat bool) (*proc, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	name := modelName(path)
+	name := logName(path)
 	// What the runner says: kinfer's own log lines go to this server's log
 	// once it is up; llama.cpp's and Metal's chatter, and the banner, only
 	// into the last lines kept, which are told should it end unasked.
@@ -910,14 +910,14 @@ func (s *Server) PrepareSpeech() {
 		s.runners.mu.Unlock()
 		rn, release, err := s.runners.acquire(path)
 		if err != nil {
-			log.Printf("speech: %s could not be started: %v", modelName(path), err)
+			log.Printf("speech: %s could not be started: %v", logName(path), err)
 			continue
 		}
 		t0 := time.Now()
 		if err := warm(rn.p.base, kind, path); err != nil {
-			log.Printf("speech: %s did not load: %v", modelName(path), err)
+			log.Printf("speech: %s did not load: %v", logName(path), err)
 		} else {
-			log.Printf("speech: %s loaded in %v, kept", modelName(path), time.Since(t0).Round(time.Millisecond))
+			log.Printf("speech: %s loaded in %v, kept", logName(path), time.Since(t0).Round(time.Millisecond))
 		}
 		release()
 	}
