@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.9.0 — 2026-11-21
 
 ### Fixed — reasoning sent back, and reasoning effort, reach the prompt
 
@@ -97,6 +97,108 @@ From the same review. See [Who may ask](docs/serving.md#who-may-ask).
   A hang-up is no longer logged against the model.
 - Log lines named a model borrowed from Ollama by its file, `sha256-aaeb…`.
   They now give the name people ask for it by.
+
+### Run before release
+
+On the release binary, the same one on both machines; each machine's own
+kinfer service stopped for the run.
+
+- **Unit tests**, with the race detector on the server, the service manager
+  and the templates.
+- **The box** (Mac Studio M3 Ultra, 96 GB):
+  - Six models through the runners: qwen2.5-0.5b, ornith-1.5-35b, qwen3.8-27b
+    q4_k_m, qwen3.8:27b-mlx, Flash-Next and V4.1 alone. Of 97 checks 93
+    passed. The 4 that failed are the Responses check at a short limit, as in
+    every release.
+  - The service's own flags: 16 at once on ornith and on Flash-Next; 18 kept
+    tool calls, none empty; a 15k-token request to the 27B beside ornith in
+    65.5 s, then 1.4 s and 1.5 s.
+  - Pictures and sound embedded against Ollama: cosine 0.9999 on all ten.
+  - `kinfer service`: 9 of 9. v0.8.0's fixes again: the MLX pool with two
+    at once, the picture bomb, four given-up callers in a queue of four.
+  - Speech said and heard back, speech streamed, a 512² picture in 8.5 s.
+  - What this release adds:
+    - Effort in the prompt on the three Qwen3.8 models (11 tokens with none,
+      41 with low, 53 with high and xhigh, 11 with medium and with a level
+      nobody has; `chat_template_kwargs` the same as the field).
+    - Reasoning back in a tool loop on all five (299 tokens to 325; V4.1 346
+      to 368), dropped before the last question, kept with
+      `preserve_thinking`. V4.1 keeps its own rule there.
+    - A caller hanging up: nothing logged against the model.
+    - A runner killed with -9 mid-reply: the error in the reply, and the
+      next reply in 3.4 s.
+    - A 58 s reply under `-watchdog 30s`: not ended.
+    - No log line names a model by its file.
+  - The door, with a key set:
+    - From the box itself: no key needed; another site's page 403; a page
+      of this machine and an app's page let in; a service asked for other
+      than as JSON 415.
+    - From a Mac mini: 401 without the key or with a wrong one, 200 with it
+      as `Bearer` or as `x-api-key`; `/api/version` and `/health` open;
+      another site's page 403 even with the key.
+    - A missing speech model asked for from the mini: 404 with the
+      `kinfer pull` to run, and nothing fetched.
+- **The laptop** (MacBook Pro M5 Max, 48 GB):
+  - Four models: ornith-1.5:35b, qwen3.8:27b-mlx, Flash-Next and V4.1. Of 85
+    checks 81 passed. Three of the 4 that failed are the same Responses
+    check. The fourth is chat, speech and transcription loaded at once, where
+    the speech models' room takes ornith off the GPU: it fails on every
+    version since v0.7.2 on that laptop.
+  - Room made for a picture; a runner killed mid-reply; 16 at once on ornith
+    and on the MLX 27B; 20 kept tool calls, none empty.
+  - `kinfer run`: a daemon started, kept and stopped; `-local`.
+    `kinfer service`: 9 of 9.
+  - What this release adds, as on the box: the door from the machine itself,
+    effort and reasoning in the prompt on its four models, a hang-up, a
+    killed runner, a 56 s reply under `-watchdog 30s`.
+- **Speed against v0.8.1, model by model.**
+  - A fresh server for each run, the two versions alternated three times
+    each, v0.9.0 first. Every reply's md5 was the same on both versions.
+  - The table gives tok/s as v0.9.0 / v0.8.1. On the box, each model's first
+    run, which reads it from the disk, is left out.
+
+  | Machine | Model | Prompt | Long reply | Short reply |
+  |---|---|---|---|---|
+  | box | qwen2.5-0.5b | 12,554–12,559 / 12,497–12,530 | 295.9–296.2 / 294.9–298.3 | 317.6–317.8 / 316.1–317.4 |
+  | box | ornith-1.5-35b | 1,811–1,821 / 1,817–1,820 | 104.1–104.4 / 104.0–104.3 | 94.2 / 94.2–94.6 |
+  | box | qwen3.8-27b q4_k_m | 300.5 / 300.4–300.5 | 41.7 / 41.6–41.7 | 33.8 / 34.1 |
+  | box | qwen3.8:27b-mlx | 333.7–333.8 / 330.2–333.8 | 43.7–43.8 / 43.5–43.9 | 41.0 / 39.9–41.0 |
+  | box | Flash-Next | 753.7–754.7 / 754.3–754.5 | 42.9–43.0 / 42.7–43.0 | 43.4–43.5 / 42.8–43.5 |
+  | box | V4.1 alone | 236.2–238.2 / 233.1–236.4 | 14.1–14.5 / 13.6–14.1 | 18.0 / 17.5–18.1 |
+  | laptop | ornith-1.5:35b | 3,209–3,223 / 3,227–3,232 | 136.7–137.3 / 136.7–137.3 | 131.6–132.6 / 132.0–132.6 |
+  | laptop | qwen3.8:27b-mlx | 715–803 / 706–778 | 42.5–50.2 / 42.8–50.3 | 38.4–42.5 / 37.3–38.5 |
+  | laptop | Flash-Next | 770–928 / 765–810 | 26.5–27.3 / 26.5–27.7 | 29.5–31.6 / 29.0–31.3 |
+  | laptop | V4.1 | 223–248 / 227–274 | 10.0–10.5 / 8.7–10.1 | 12.6–14.6 / 12.6–13.1 |
+
+  - The box's 27B q4_k_m gave its short reply at 33.8 on every run of v0.9.0
+    and 34.1 on every run of v0.8.1, 0.9% apart; its long reply and its
+    prompt were the same. Not looked into.
+  - The laptop had its owner's programs open, a 4 GB virtual machine among
+    them, and its V4.1 is lower on both versions than v0.8.0's run found it.
+  - The box's media, best of three after a warm-up, as v0.9.0 / v0.8.1:
+    - 64 sentences embedded at once: 0.80–0.83 / 0.79–0.80 s
+    - a picture embedded: 0.123–0.124 / 0.122–0.123 s
+    - a sound embedded: 0.104–0.108 / 0.100–0.105 s
+    - a sentence spoken: 1.07–1.17 / 1.06–1.17 s
+    - transcribed: 0.19–0.20 / 0.19–0.20 s
+    - a 512² picture: 7.44 / 7.43–7.44 s
+- **The two machines:** V4.1 served by the box, with the laptop's worker over
+  Thunderbolt, found by `-peers auto`: 18.7–21.4 tok/s, and a 3,614-token
+  prompt read at 252 tok/s. v0.8.1, run the same way just after, gave
+  18.6–21.5 and 255. The laptop lent 29.6 GB, where it lent 34.1 GB for
+  v0.8.0's run.
+- **Agents:** `kinfer launch claude` (Claude Code 2.1.329) and
+  `kinfer launch codex` (Codex 0.155.1), from a Mac mini against the box with
+  a key set: both answered.
+- **Built from** the b11998 source every build since k1 was made from, kept
+  on disk. GitHub now serves another archive under that tag: the tag points
+  at another commit, and the earlier one is gone. The 3,971 files of the
+  earlier archive are the same byte for byte in the new one, which has three
+  more that the build does not use. `build-libs.sh` refuses the new archive,
+  as it was made to, so a Mac build from source needs the earlier one until
+  the script is told the new sha256.
+- **Not run:** Linux and Windows beyond building and packing; GPUs off the
+  Mac; `kinfer launch` for Pi, Hermes and OpenClaw.
 
 ## v0.8.1 — 2026-11-13
 
