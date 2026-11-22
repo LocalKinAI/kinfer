@@ -84,6 +84,25 @@ search's result names it (`tool_reference`) or the model has called it, and
 the search's result reads as the definitions of what it found. Before, every
 MCP tool of a setup was written into every prompt.
 
+### Measured — against Ollama 0.40.17 on MLX, and a quiet GPU
+
+On the Mac Studio (M3 Ultra), qwen3.8:27b-mlx from the same files, 2026-11-22:
+
+| | kinfer | Ollama 0.40.17 |
+|---|---|---|
+| one at a time, six kinds of request, mean | 52–54 tok/s | **64 tok/s** |
+| 4 at once, Ollama as it sets itself up (262,144 context: one at a time) | **70 tok/s** in all | 54 |
+| 4 at once, Ollama's context 32,768 (it takes four) | 70 | **104–116** |
+| 16 waiting, the same | 71 | **115–120** |
+
+Ollama drafts for every reply at once; kinfer on MLX drafts for a reply writing
+alone, and on a Chinese essay its drafts cost what they saved (26% taken, 33
+tok/s against Ollama's 52). Both are to be worked on.
+
+A GPU left quiet for 3 to 120 seconds reads the next prompt's first few hundred
+tokens 10–13% slower (0.03 to 0.1 s a request) and a 3,400-token prompt 0–1%
+slower; writing is not slower. Nothing is kept running to prevent it.
+
 ## v0.9.0 — 2026-11-21
 
 ### Fixed — reasoning sent back, and reasoning effort, reach the prompt
