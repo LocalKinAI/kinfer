@@ -42,6 +42,10 @@ type responsesRequest struct {
 	Reasoning *struct {
 		Effort string `json:"effort"`
 	} `json:"reasoning"`
+
+	// Text.format holds the reply to JSON: json_object, or json_schema with
+	// its schema (responsesFormat).
+	Text json.RawMessage `json:"text"`
 }
 
 type responsesTool struct {
@@ -232,7 +236,7 @@ func responsesTools(in []responsesTool) []tools.Tool {
 func responsesUsage(st engine.Stats) map[string]any {
 	return map[string]any{
 		"input_tokens":          st.PromptTokens,
-		"input_tokens_details":  map[string]any{"cached_tokens": 0},
+		"input_tokens_details":  map[string]any{"cached_tokens": st.CachedTokens},
 		"output_tokens":         st.EvalTokens,
 		"output_tokens_details": map[string]any{"reasoning_tokens": 0},
 		"total_tokens":          st.PromptTokens + st.EvalTokens,
@@ -293,6 +297,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			"message": err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	format, err := responsesFormat(req.Text)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{
+			"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
 	msgs, err := responsesToChat(&req)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{
@@ -312,6 +322,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !toolChoiceNone(req.ToolChoice) {
 		params.Tools = responsesTools(req.Tools)
 	}
+	params.Format = format
 	params.NoThink = req.Reasoning != nil && req.Reasoning.Effort == "none"
 	params.Think = req.Reasoning != nil && req.Reasoning.Effort != "" && req.Reasoning.Effort != "none"
 	if req.Temperature != nil {

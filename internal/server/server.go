@@ -469,6 +469,9 @@ type ollamaChatRequest struct {
 	Options  *ollamaOptions `json:"options"`
 	Tools    []tools.Tool   `json:"tools"`
 
+	// Format holds the reply to JSON: "json", or a JSON Schema (ollamaFormat).
+	Format json.RawMessage `json:"format"`
+
 	// Think is Ollama's switch for a reasoning model: false keeps it out of its
 	// think block (see thinkOff); true, a level string, or nothing at all lets
 	// it think and returns the thinking in message.thinking (see wantThinking).
@@ -668,6 +671,11 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	format, err := ollamaFormat(req.Format)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	// No messages: Ollama's way of loading a model ahead of use, and with
 	// keep_alive 0 of unloading it.
@@ -700,6 +708,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	msgs := toChatMessages(req.Messages)
 	params := applyOllamaOptions(engine.DefaultGenParams(), req.Options)
 	params.Tools = req.Tools
+	params.Format = format
 	params.NoThink = thinkOff(req.Think)
 	params.Think = thinkOn(req.Think)
 	params.Effort = thinkLevel(req.Think)
@@ -1174,6 +1183,10 @@ type openAIChatRequest struct {
 	Tools       []tools.Tool    `json:"tools"`
 	Think       json.RawMessage `json:"think"`
 
+	// ResponseFormat holds the reply to JSON: json_object, or json_schema
+	// with its schema (openAIFormat).
+	ResponseFormat json.RawMessage `json:"response_format"`
+
 	// ReasoningEffort is OpenAI's thinking knob: "none" turns thinking off,
 	// any other level is passed to models that take an effort.
 	ReasoningEffort string `json:"reasoning_effort"`
@@ -1202,11 +1215,15 @@ type openAIChatRequest struct {
 // usage is the OpenAI dialect's token accounting. Clients bill, budget and
 // trim context against it; an object of zeros tells a caller its whole
 // conversation cost nothing, which it then believes.
+//
+// prompt_tokens is the whole prompt, as OpenAI counts it, and
+// prompt_tokens_details.cached_tokens the part of it that was not read again.
 func usage(st engine.Stats) map[string]any {
 	return map[string]any{
-		"prompt_tokens":     st.PromptTokens,
-		"completion_tokens": st.EvalTokens,
-		"total_tokens":      st.PromptTokens + st.EvalTokens,
+		"prompt_tokens":         st.PromptTokens,
+		"completion_tokens":     st.EvalTokens,
+		"total_tokens":          st.PromptTokens + st.EvalTokens,
+		"prompt_tokens_details": map[string]any{"cached_tokens": st.CachedTokens},
 	}
 }
 
@@ -1221,6 +1238,11 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": err.Error()}})
 		return
 	}
+	format, err := openAIFormat(req.ResponseFormat)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
 
 	eng, release, err := s.acquire(req.Model)
 	if err != nil {
@@ -1233,6 +1255,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	params := engine.DefaultGenParams()
 	params.Tools = req.Tools
+	params.Format = format
 	params.NoThink = thinkOff(req.Think)
 	params.Think = thinkOn(req.Think)
 	params.Effort = thinkLevel(req.Think)

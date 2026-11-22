@@ -289,7 +289,9 @@ More in [docs/performance.md](docs/performance.md) and
 - With MTP drafting on MLX, Ollama 0.40.15 averaged 78 tok/s over six replies
   where kinfer averaged 72.5 (qwen3.8:27b-mlx on the MacBook Pro).
 - A mixture of experts on MLX writes 104 tok/s alone against Ollama's 125. With
-  four replies at once it is 188 against 112.
+  four replies at once it is 188 against 112, measured against Ollama
+  0.40.15, which took one request at a time on MLX. Since 0.40.17 it takes
+  several, and this has not been measured again.
 - Between 17 and about 48 conversations at once, Metal's larger step is not yet
   paid for: 24 at once write less than 16. Slot counts are 8, 16, 64 or 128.
 
@@ -586,7 +588,7 @@ release — after diffing its `llama.h`; see `internal/nativelib/libs/README.md`
 
 `scripts/build-libs.sh` instead builds b11998 from source with kinfer's patch
 (`patches/llama.cpp/b11998/`; about two minutes, cmake and Xcode's command line
-tools) into `darwin_arm64_b11998k8/`, replacing the release set. It matters
+tools) into `darwin_arm64_b11998k9/`, replacing the release set. It matters
 for a model whose experts or tables come from the SSD — see
 [When the experts do not fit in memory either](docs/big-models.md#when-the-experts-do-not-fit-in-memory-either);
 with the release set `-host-experts` and `-moe-cache` work as before and there is

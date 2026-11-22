@@ -92,6 +92,7 @@ type Sampler struct {
 	trigger, open, close     llama.Token
 	thinking, startsThinking bool
 	held                     bool
+	whole, mayThink          bool // a reply held from its start; its first token may still open a think block
 	redrawn                  int
 	nVocab                   int32
 	cur                      []llama.TokenData // allocated once held
@@ -110,6 +111,12 @@ type Grammar struct {
 
 	// Trigger is drawn freely; it and everything after it are held to Rules.
 	Trigger llama.Token
+
+	// Whole holds the reply from its first token, with no trigger: a reply
+	// that is to be JSON and nothing else. A think block comes before it and
+	// is not held: one the prompt opened (Thinking), or one the model opens
+	// with its first token.
+	Whole bool
 
 	// Open and Close are a think block's tokens, or NoToken, and Thinking
 	// says the reply starts inside one the prompt opened. Inside it a model
@@ -191,6 +198,9 @@ func (s *Sampler) saw(tok llama.Token) {
 		s.thinking = true
 	case tok == s.close:
 		s.thinking = false
+		if s.whole {
+			s.held = true
+		}
 	case tok == s.trigger && !s.thinking:
 		llama.SamplerAccept(s.grammar, tok)
 		s.held = true
@@ -210,7 +220,20 @@ func (s *Sampler) Constrain(g Grammar) error {
 	s.grammar, s.trigger, s.open, s.close = gs, g.Trigger, g.Open, g.Close
 	s.thinking, s.startsThinking, s.held = g.Thinking, g.Thinking, false
 	s.nVocab = llama.NVocab(g.Vocab)
+	s.whole = g.Whole
+	s.begin()
 	return nil
+}
+
+// begin sets a whole-reply grammar to the start of a reply: holding at once,
+// unless the reply starts in a think block, and letting the first token open
+// one.
+func (s *Sampler) begin() {
+	if !s.whole {
+		return
+	}
+	s.held = !s.startsThinking
+	s.mayThink = s.held && s.open != NoToken && s.close != NoToken
 }
 
 // drawHeld draws from logits under the grammar the way llama.cpp's own server
@@ -224,6 +247,17 @@ func (s *Sampler) Constrain(g Grammar) error {
 // told to accept one it rules out throws, which aborts the process.
 func (s *Sampler) drawHeld(logits []float32) llama.Token {
 	tok := s.pick(logits, false)
+	if s.mayThink {
+		// The first token of a reply held whole: a model that opens a think
+		// block of its own with it thinks first, and what follows the block's
+		// close is held.
+		s.mayThink = false
+		if tok == s.open {
+			s.held, s.thinking = false, true
+			llama.SamplerAccept(s.chain, tok)
+			return tok
+		}
+	}
 	one := llama.TokenData{ID: tok, Logit: 1}
 	llama.SamplerApply(s.grammar, &llama.TokenDataArray{Data: &one, Size: 1, Selected: -1})
 	if math.IsInf(float64(one.Logit), -1) {
@@ -265,6 +299,7 @@ func (s *Sampler) Reset() {
 	if s.grammar != 0 {
 		llama.SamplerReset(s.grammar)
 		s.thinking, s.held, s.redrawn = s.startsThinking, false, 0
+		s.begin()
 	}
 }
 

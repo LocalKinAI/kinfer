@@ -152,6 +152,7 @@ func (rt *retrying) ChatFull(ctx context.Context, msgs []chat.Message, p engine.
 func carriedOver(st, next engine.Stats) engine.Stats {
 	if st.PromptTokens == 0 {
 		st.PromptTokens, st.PromptEvalDuration = next.PromptTokens, next.PromptEvalDuration
+		st.CachedTokens = next.CachedTokens
 	} else {
 		st.ReloadDuration += next.PromptEvalDuration
 	}

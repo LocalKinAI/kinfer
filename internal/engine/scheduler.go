@@ -857,7 +857,37 @@ func (s *scheduler) occupy(sl *slot, j *job, tokens []llama.Token, reused int, c
 		if err := sl.sampler.Constrain(g); err != nil {
 			log.Printf("tool calls go unchecked: %v", err)
 		}
+	} else if g, ok := s.formatGrammar(j); ok {
+		if err := sl.sampler.Constrain(g); err != nil {
+			log.Printf("the reply's format goes unchecked: %v", err)
+		}
 	}
+}
+
+// formatGrammar is the grammar that holds a job's whole reply to the JSON its
+// request asked for (GenParams.Format): the reply can then be nothing but that
+// JSON, where a model left to itself adds a sentence before it, a markdown
+// fence round it, or a property the schema does not have. A think block comes
+// first and is not held.
+//
+// A request that declares tools is not held: its reply may be a call. Nor is a
+// resumed reply, whose start the grammar has not seen.
+func (s *scheduler) formatGrammar(j *job) (sampling.Grammar, bool) {
+	p := j.params
+	if len(p.Format) == 0 || len(p.Tools) > 0 || p.Resume != "" {
+		return sampling.Grammar{}, false
+	}
+	thinking := s.tpl.OpensThink(p.thinking())
+	if thinking && s.thinkClose == sampling.NoToken {
+		return sampling.Grammar{}, false
+	}
+	rules, err := tools.JSONGrammar(p.Format)
+	if err != nil {
+		log.Printf("the reply's format goes unchecked: %v", err)
+		return sampling.Grammar{}, false
+	}
+	return sampling.Grammar{Vocab: s.vocab, Rules: rules, Whole: true, Trigger: sampling.NoToken,
+		Open: s.thinkOpen, Close: s.thinkClose, Thinking: thinking}, true
 }
 
 // toolGrammar is the grammar that holds a job's tool calls to their form and
@@ -1365,7 +1395,7 @@ func (s *scheduler) release(sl *slot, err error) {
 		s.forget(sl.seq)
 	}
 	if sl.sampler != nil {
-		if held, n := sl.sampler.Held(); held {
+		if held, n := sl.sampler.Held(); held && len(sl.job.params.Tools) > 0 { // a reply held to a format is not a call
 			s.callsHeld.Add(1)
 			s.redrawn.Add(int64(n))
 		}
@@ -1378,6 +1408,7 @@ func (s *scheduler) release(sl *slot, err error) {
 	// measurements have to be handed over. A request that died during prefill
 	// reports its prompt and a zero eval, which is what happened.
 	sl.job.stats.PromptTokens = len(sl.prompt) + sl.media
+	sl.job.stats.CachedTokens = sl.reused
 	sl.job.stats.EvalTokens = sl.nGen
 	sl.job.stats.PromptEvalDuration = sl.promptEval
 	if !sl.evalStart.IsZero() {

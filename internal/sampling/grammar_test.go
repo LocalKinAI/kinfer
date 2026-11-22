@@ -326,3 +326,184 @@ func TestGrammarTakesEveryCallOf(t *testing.T) {
 	llama.SamplerApply(g, &llama.TokenDataArray{Data: &cur[0], Size: uint64(len(cur)), Selected: -1})
 	t.Logf("a draw that falls back to the grammar at a function's name: %v", time.Since(start))
 }
+
+// A reply held to a JSON Schema: what matches gets through and may end, what
+// does not is stopped at the token that breaks it.
+func TestGrammarHoldsAReplyToASchema(t *testing.T) {
+	v := testVocab(t)
+	schema := `{"type":"object","properties":{
+	  "name":{"type":"string"},
+	  "age":{"type":"integer"},
+	  "mood":{"enum":["happy","sad",3,null]},
+	  "tags":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":3},
+	  "home":{"$ref":"#/$defs/place"},
+	  "note":{"type":["string","null"]},
+	  "kids":{"type":"array","items":{"$ref":"#"}}},
+	  "required":["name","age"],
+	  "$defs":{"place":{"type":"object","properties":{"city":{"type":"string"},"zip":{"type":"number"}},"required":["city"],"additionalProperties":{"type":"boolean"}}}}`
+	rules, err := tools.JSONGrammar(json.RawMessage(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := []string{
+		`{"name":"Ada","age":36}`,
+		`{ "name": "Ada",` + "\n" + `  "age": -1 }`,
+		`{"name":"张伟","age":0,"mood":"sad","tags":["a","b","c"],"home":{"city":"北京","zip":1.5e3,"x":true,"y":false},"note":null}`,
+		`{"name":"a \"q\" \\ é","age":7,"mood":3,"note":"n","kids":[{"name":"b","age":1,"kids":[]}]}`,
+		`{"name":"x","age":1,"mood":null,"home":{"city":"c"}}`,
+		`{"name":"x","age":1,"tags":["only"],"kids":[{"name":"k","age":2},{"name":"l","age":3}]}`,
+	}
+	for _, text := range good {
+		if taken, of, canEnd := follow(t, v, rules, text); taken != of {
+			t.Errorf("a matching reply was cut off after %d of %d tokens:\n%s", taken, of, text)
+		} else if !canEnd {
+			t.Errorf("the turn may not end after:\n%s", text)
+		}
+	}
+	bad := map[string]string{
+		"prose before the object":         `Here you go: {"name":"x","age":1}`,
+		"a required property left out":    `{"name":"x"}`,
+		"properties out of their order":   `{"age":1,"name":"x"}`,
+		"a word for an integer":           `{"name":"x","age":"one"}`,
+		"a fraction for an integer":       `{"name":"x","age":1.5}`,
+		"a value outside the enum":        `{"name":"x","age":1,"mood":"angry"}`,
+		"a property the schema lacks":     `{"name":"x","age":1,"colour":"red"}`,
+		"no items where one is required":  `{"name":"x","age":1,"tags":[]}`,
+		"four items where three may be":   `{"name":"x","age":1,"tags":["a","b","c","d"]}`,
+		"a number among strings":          `{"name":"x","age":1,"tags":[1]}`,
+		"a place without its city":        `{"name":"x","age":1,"home":{"zip":1}}`,
+		"an extra that is not a boolean":  `{"name":"x","age":1,"home":{"city":"c","x":"yes"}}`,
+		"a child that is not this schema": `{"name":"x","age":1,"kids":[{"name":"k"}]}`,
+		"prose after the object":          `{"name":"x","age":1} Done.`,
+		"a markdown fence":                "```json\n{\"name\":\"x\",\"age\":1}",
+	}
+	for why, text := range bad {
+		if taken, of, canEnd := follow(t, v, rules, text); taken == of && canEnd {
+			t.Errorf("%s got through:\n%s", why, text)
+		}
+	}
+	// Unfinished, the turn may not end.
+	if _, _, canEnd := follow(t, v, rules, `{"name":"x"`); canEnd {
+		t.Error("the turn may end inside an unfinished object")
+	}
+
+	// "json", and no schema: any JSON object, and only an object.
+	for _, format := range []string{`"json"`, ``} {
+		rules, err := tools.JSONGrammar(json.RawMessage(format))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if taken, of, canEnd := follow(t, v, rules, `{"a":[1,{"b":null}],"c":"d"}`); taken != of || !canEnd {
+			t.Errorf("format %q: an object was cut off after %d of %d tokens", format, taken, of)
+		}
+		if taken, of, canEnd := follow(t, v, rules, `[1,2]`); taken == of && canEnd {
+			t.Errorf("format %q: an array got through as an object", format)
+		}
+	}
+
+	// All of an object's properties optional: any of them, in order, or none.
+	rules, err = tools.JSONGrammar(json.RawMessage(`{"type":"object","properties":{"a":{"type":"boolean"},"b":{"type":"boolean"},"c":{"type":"boolean"}},"additionalProperties":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{`{}`, `{"a":true}`, `{"b":true}`, `{"a":true,"c":false}`, `{"c":false,"zz":[1]}`, `{"zz":1,"yy":2}`, `{"a":true,"b":true,"c":true,"d":"e"}`} {
+		if taken, of, canEnd := follow(t, v, rules, text); taken != of || !canEnd {
+			t.Errorf("optional properties: %s was cut off after %d of %d tokens (may end: %v)", text, taken, of, canEnd)
+		}
+	}
+	if taken, of, canEnd := follow(t, v, rules, `{,"a":true}`); taken == of && canEnd {
+		t.Error("a comma before the first property got through")
+	}
+
+	for why, s := range map[string]string{
+		"a $ref to another document": `{"$ref":"http://example.com/s.json"}`,
+		"a $ref to nothing":          `{"$ref":"#/$defs/none"}`,
+		"a schema of false":          `false`,
+		"not a schema":               `[1]`,
+		"allOf of two":               `{"allOf":[{"type":"object"},{"type":"object"}]}`,
+	} {
+		if _, err := tools.JSONGrammar(json.RawMessage(s)); err == nil {
+			t.Errorf("%s was taken for a schema", why)
+		}
+	}
+}
+
+// A reply held whole: its first token is already the grammar's, a think block
+// the prompt opened or the model opens first is left alone, and what follows
+// the block's close is held.
+func TestWholeReplyIsHeldAfterAnyThinking(t *testing.T) {
+	v := testVocab(t)
+	one := func(text string) llama.Token {
+		toks, err := llama.Tokenize(v, text, false, true)
+		if err != nil || len(toks) != 1 {
+			t.Fatalf("%q is %d tokens", text, len(toks))
+		}
+		return toks[0]
+	}
+	brace, hello, open, shut := one("{"), one("Hello"), one("A"), one("B")
+	rules, err := tools.JSONGrammar(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := llama.NVocab(v)
+	wanting := func(tok llama.Token) []float32 { // the model wants tok most, and "{" next
+		l := make([]float32, n)
+		for i := range l {
+			l[i] = -30
+		}
+		l[brace], l[tok] = 5, 10
+		return l
+	}
+	newHeld := func(thinking bool) *Sampler {
+		s := New(Params{Temperature: 0}, n)
+		t.Cleanup(s.Close)
+		if err := s.Constrain(Grammar{Vocab: v, Rules: rules, Whole: true, Trigger: NoToken, Open: open, Close: shut, Thinking: thinking}); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	// Prose first: ruled out, and the object's brace drawn instead.
+	s := newHeld(false)
+	if !s.held {
+		t.Fatal("a whole reply is not held from its start")
+	}
+	if tok := s.drawHeld(wanting(hello)); tok != brace {
+		t.Errorf("prose where JSON belongs: token %d drawn, want the brace %d", tok, brace)
+	}
+
+	// The model opens a think block with its first token: let be, and held
+	// from the close on.
+	s = newHeld(false)
+	if tok := s.drawHeld(wanting(open)); tok != open || s.held {
+		t.Fatalf("a think block opened first: token %d, held %v", tok, s.held)
+	}
+	s.saw(hello) // thinking, freely
+	if s.held {
+		t.Fatal("held inside the think block")
+	}
+	if s.saw(shut); !s.held {
+		t.Fatal("not held after the think block closed")
+	}
+	if tok := s.drawHeld(wanting(hello)); tok != brace {
+		t.Errorf("after thinking: token %d drawn, want the brace", tok)
+	}
+	// Only the first token may open one: the same token later is prose.
+	if tok := s.drawHeld(wanting(open)); tok == open {
+		t.Error("a think block opened inside the JSON")
+	}
+
+	// The prompt opened the think block: nothing held until its close.
+	s = newHeld(true)
+	if s.held {
+		t.Fatal("held inside the think block the prompt opened")
+	}
+	if s.saw(shut); !s.held {
+		t.Fatal("not held after the prompt's think block closed")
+	}
+	// A new reply on the same sampler starts over.
+	s.Reset()
+	if s.held || !s.thinking {
+		t.Error("after Reset the reply does not start in its think block again")
+	}
+}

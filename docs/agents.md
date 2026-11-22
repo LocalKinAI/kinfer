@@ -81,7 +81,13 @@ things, and kinfer answers them:
 
 - `HEAD /api/hello`, which Claude Code opens a session with.
 - `POST /v1/messages/count_tokens`. Its count is the same as the request's
-  `usage.input_tokens`: 288 and 288 on ornith-1.5:35b.
+  prompt, which `usage` gives in two parts, `input_tokens` and
+  `cache_read_input_tokens`: 288 and 288 on ornith-1.5:35b.
+- Deferred tools. Claude Code sends its MCP tools with `defer_loading` and
+  finds one, when it wants it, with a tool search of its own, whose result
+  names the tools found (`tool_reference`). kinfer keeps a deferred tool out
+  of the prompt until such a result names it or the model has called it, and
+  gives the model the search's result as the definitions of what was found.
 - `GET /v1/models/{id}`, in both dialects' fields.
 
 Measured from the Mac mini against the box, with ornith-1.5:35b, on the same
@@ -121,6 +127,11 @@ cch=a5145;`). Nothing after a prompt's first difference can be adopted, so each
 turn of a session was read whole, system prompt and tools — tens of thousands of
 tokens. The stamp means nothing to a model, and kinfer pins it to `cch=00000;`
 before the prompt is rendered, as llama.cpp's server does (#21793).
+
+How much of a prompt was not read again is in each reply's usage:
+`prompt_tokens_details.cached_tokens` in the OpenAI dialect,
+`input_tokens_details.cached_tokens` in Responses, and in Anthropic's
+`cache_read_input_tokens`, beside an `input_tokens` that is the part read.
 
 ```
 $ kinfer serve -slots 8 -prefix 4
@@ -285,6 +296,37 @@ A reply carrying functions is not streamed. A tool call is JSON spread over many
 tokens, and streaming it would hand the client fragments of syntax; with
 functions on the table the reply is buffered and delivered once, parsed. Without
 them, streaming is unchanged.
+
+## A reply that is JSON
+
+An agent that asks for JSON wants to parse the reply, and a model left to
+itself now and then writes a sentence before it, a markdown fence round it, or
+a property nobody asked for. Asked in any of the four dialects, kinfer holds
+the reply to JSON as it is written, token by token, so nothing else can be:
+
+| Dialect | Any JSON object | A JSON Schema |
+|---|---|---|
+| `/api/chat` | `"format": "json"` | `"format": { …schema… }` |
+| `/v1/chat/completions` | `"response_format": {"type": "json_object"}` | `"response_format": {"type": "json_schema", "json_schema": {"schema": {…}}}` |
+| `/v1/responses` | `"text": {"format": {"type": "json_object"}}` | `"text": {"format": {"type": "json_schema", "schema": {…}}}` |
+| `/v1/messages` | | `"output_config": {"format": {"type": "json_schema", "schema": {…}}}` |
+
+What a reply is held to is the schema's shape: the types, an object's
+properties in the order the schema declares them, the required ones always
+and the others or not, an array's items and `minItems` and `maxItems`, `enum`
+and `const`, `anyOf` and `oneOf`, a list of types, and `$ref` into the
+schema's own `$defs`, itself included. An object takes the properties it
+declares and no others unless it says `additionalProperties`. What a grammar
+cannot hold to is left to the model, and the reply is still JSON of the right
+shape: a string's `pattern`, `format` and length, a number's range. A schema
+that cannot be held to at all (a `$ref` to another document, `allOf` of
+several schemas) is a 400 that says so, except in `/v1/messages`, where the
+schema is also stated in the system prompt and stays stated.
+
+A reasoning model thinks first, as it would have, and what follows its think
+block is held. Not held: a reply to a request that declares tools, which may
+be a call instead; and a model served on MLX, whose replies are not held to
+grammars (tool calls neither).
 
 ## Reasoning models
 

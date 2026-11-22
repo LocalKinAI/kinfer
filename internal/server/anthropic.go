@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +70,10 @@ type anthropicBlock struct {
 	Content json.RawMessage `json:"content"`
 	IsError bool            `json:"is_error"`
 
+	// ToolName is a tool_reference block's: the tool a client-side tool
+	// search found, in the result of that search.
+	ToolName string `json:"tool_name"`
+
 	// Source is an image block's picture: {"type": "base64", "data": …}, or
 	// a "url", which kinfer does not fetch.
 	Source *struct {
@@ -79,9 +84,88 @@ type anthropicBlock struct {
 }
 
 type anthropicTool struct {
+	Type        string          `json:"type"`
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
+
+	// DeferLoading marks a tool the model is not to be shown until a tool
+	// search has found it: Claude Code sends its MCP tools so, hundreds of
+	// them in some setups, and names the ones found in tool_reference blocks.
+	DeferLoading bool `json:"defer_loading"`
+}
+
+// loadedTools are the deferred tools this conversation has loaded: the ones a
+// tool search's result names (tool_reference) and the ones the model has
+// already called.
+func loadedTools(req *anthropicRequest) map[string]bool {
+	loaded := map[string]bool{}
+	for _, m := range req.Messages {
+		blocks, err := anthropicBlocks(m.Content)
+		if err != nil {
+			continue // anthropicToChat reports it
+		}
+		for _, b := range blocks {
+			switch b.Type {
+			case "tool_use":
+				loaded[b.Name] = true
+			case "tool_result":
+				for _, name := range toolReferences(b.Content) {
+					loaded[name] = true
+				}
+			}
+		}
+	}
+	return loaded
+}
+
+// toolReferences are the tools a tool result's content names as found.
+func toolReferences(content json.RawMessage) []string {
+	blocks, err := anthropicBlocks(content)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, b := range blocks {
+		if b.Type == "tool_reference" && b.ToolName != "" {
+			names = append(names, b.ToolName)
+		}
+	}
+	return names
+}
+
+// referencedTools is what a tool search's result reads as to the model: the
+// definitions of the tools it found, as JSON, where the result stands in the
+// conversation. A name the request does not declare is left out.
+func referencedTools(names []string, declared []anthropicTool) string {
+	type def struct {
+		Type        string          `json:"type"`
+		Name        string          `json:"name"`
+		Description string          `json:"description,omitempty"`
+		Parameters  json.RawMessage `json:"parameters,omitempty"`
+	}
+	var defs []def
+	for _, name := range names {
+		for _, t := range declared {
+			if t.Name == name {
+				d := def{Type: "function", Name: name, Description: t.Description}
+				var b bytes.Buffer
+				if len(t.InputSchema) > 0 && json.Compact(&b, t.InputSchema) == nil {
+					d.Parameters = b.Bytes()
+				}
+				defs = append(defs, d)
+				break
+			}
+		}
+	}
+	if len(defs) == 0 {
+		return ""
+	}
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false)
+	enc.Encode(defs)
+	return strings.TrimSuffix(out.String(), "\n")
 }
 
 // anthropicBlocks reads content in either shape the API allows wherever content
@@ -148,8 +232,9 @@ func anthropicToChat(req *anthropicRequest) ([]chat.Message, error) {
 	}
 	system = pinBillingStamp(system)
 	if oc := req.OutputConfig; oc != nil && oc.Format != nil && oc.Format.Type == "json_schema" && len(oc.Format.Schema) > 0 {
-		// Nothing here holds a model to a schema while it samples, so the
-		// schema is stated instead. Claude Code uses this for a session title:
+		// The schema is stated, for a model whose replies cannot be held to
+		// one while it samples (MLX), and for one that can, which then knows
+		// what the properties are for. Claude Code uses this for a session title:
 		// a model that ignores it costs a title, not a turn.
 		system = strings.TrimSpace(system + "\n\nRespond with only a JSON object matching this JSON Schema, and nothing else:\n" + string(oc.Format.Schema))
 	}
@@ -226,6 +311,9 @@ func anthropicToChat(req *anthropicRequest) ([]chat.Message, error) {
 				if b.IsError {
 					result = "Error: " + result
 				}
+				if defs := referencedTools(toolReferences(b.Content), req.Tools); defs != "" {
+					result = strings.TrimSpace(result + "\n\n" + defs)
+				}
 				out = append(out, chat.Message{Role: "tool", Content: result})
 			}
 		}
@@ -237,10 +325,25 @@ func anthropicToChat(req *anthropicRequest) ([]chat.Message, error) {
 // anthropicTools keeps the tools a local model can be asked to call. Server
 // tools — web_search_…, code_execution_… — have no input schema and run on
 // Anthropic's side; there is nothing here to run them.
-func anthropicTools(in []anthropicTool) []tools.Tool {
+//
+// A deferred tool (defer_loading) is kept out until the conversation has
+// loaded it: with every one of a setup's MCP tools written into the prompt, a
+// turn carried tens of thousands of tokens of tools nobody had asked for. When
+// the request asks for Anthropic's own tool search (tool_search_tool_…), which
+// nothing here runs, no tool could ever be loaded, so all are kept.
+func anthropicTools(in []anthropicTool, loaded map[string]bool) []tools.Tool {
 	var out []tools.Tool
+	deferring := true
+	for _, t := range in {
+		if strings.HasPrefix(t.Type, "tool_search_tool") {
+			deferring = false
+		}
+	}
 	for _, t := range in {
 		if t.Name == "" || len(t.InputSchema) == 0 {
+			continue
+		}
+		if t.DeferLoading && deferring && !loaded[t.Name] {
 			continue
 		}
 		out = append(out, tools.Tool{Type: "function", Function: tools.Function{
@@ -264,8 +367,14 @@ func anthropicStopReason(r reply) string {
 	}
 }
 
+// anthropicUsage counts as Anthropic does: input_tokens is the part of the
+// prompt that was read, cache_read_input_tokens the part that was held from
+// before, and the prompt is the two together. Claude Code adds them up for how
+// full the context is, so the sum must stay the whole prompt.
 func anthropicUsage(st engine.Stats) map[string]any {
-	return map[string]any{"input_tokens": st.PromptTokens, "output_tokens": st.EvalTokens}
+	cached := min(st.CachedTokens, st.PromptTokens)
+	return map[string]any{"input_tokens": st.PromptTokens - cached, "output_tokens": st.EvalTokens,
+		"cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}
 }
 
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -295,7 +404,15 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	params := engine.DefaultGenParams()
 	if !toolChoiceNone(req.ToolChoice) {
-		params.Tools = anthropicTools(req.Tools)
+		params.Tools = anthropicTools(req.Tools, loadedTools(&req))
+	}
+	if oc := req.OutputConfig; oc != nil && oc.Format != nil && oc.Format.Type == "json_schema" && len(oc.Format.Schema) > 0 {
+		// Stated in the system prompt (anthropicToChat), and held to where
+		// the model's replies can be. A schema that cannot be held to is
+		// left stated: Claude Code asks this way for a session's title.
+		if _, err := tools.JSONGrammar(oc.Format.Schema); err == nil {
+			params.Format = oc.Format.Schema
+		}
 	}
 	params.NoThink = req.Thinking != nil && req.Thinking.Type == "disabled"
 	params.Think = req.Thinking != nil && req.Thinking.Type != "" && req.Thinking.Type != "disabled"
@@ -474,7 +591,7 @@ func (s *Server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 
 	params := engine.DefaultGenParams()
 	if !toolChoiceNone(req.ToolChoice) {
-		params.Tools = anthropicTools(req.Tools)
+		params.Tools = anthropicTools(req.Tools, loadedTools(&req))
 	}
 	params.NoThink = req.Thinking != nil && req.Thinking.Type == "disabled"
 	params.Think = req.Thinking != nil && req.Thinking.Type != "" && req.Thinking.Type != "disabled"

@@ -1,5 +1,89 @@
 # Changelog
 
+## Unreleased
+
+From a look at what Ollama, Strata, ds4, llama.cpp, MLX and the newer Mac
+engines changed in three weeks: first what it found wrong here.
+
+### Fixed — speech had fallen behind the port it was made from
+
+kinfer's Qwen3-TTS and Qwen3-ASR are ports of mlx-audio's, made from its
+0.5.0. Three faults mlx-audio has since fixed were here too, and the tests
+had not seen them: their sentences were 67 to 70 frames, under the 72 at
+which the first one begins.
+
+- **Speech longer than 5.76 s drifted from the model's own decoder.** The
+  decoder was trained looking back 72 frames and looked back over
+  everything (mlx-audio #1117). On 343 frames of real codes the audio was
+  cos 0.925 against the corrected decoder over its first 24 s, and is
+  1.0000000 now, whole or streamed in pieces of any size.
+- **Each frame whose first code is 0 cut 80 ms from the end** of a whole
+  decode: code 0 was taken for padding (mlx-audio #1116). Two of those 343
+  frames were such.
+- **The whole text is in the prompt**, as Qwen's own CustomVoice and
+  VoiceDesign read it, where one text token was given a frame (mlx-audio
+  #1036, there for a sentence that came out at half the speed on some
+  seeds). Here the same sentence over 30 seeds ran 7.84-12.56 s before and
+  8.08-10.72 s after on the 0.6B CustomVoice, and 8.56-11.84 s against
+  8.88-12.24 s over 20 seeds on the 1.7B VoiceDesign: no slow one either
+  way, so what this buys is the reference's prompt, to the last value. Every
+  sentence is spoken a little otherwise than before.
+- **A long recording lost most of itself, and said nothing of it.** kinfer
+  read a recording in one pass, however long. Qwen3-ASR reads twenty minutes
+  whole, and twenty-five; given an hour (550 numbered sentences) it wrote
+  down the first 160, seventeen and a half minutes, and ended its reply. Not a
+  bound reached, not an error: all 47,115 tokens of sound were in its prompt.
+  mlx-audio cuts a recording every twenty minutes where it is quietest, and
+  now so does this, and joins the pieces' transcripts: the hour comes back
+  whole, streamed too.
+- **A transcript's bound is its own sound's length**, half its tokens of
+  sound, where it was 8,192 for any recording: ten seconds of sound could be
+  followed by forty of invention. One that reaches its bound says
+  `"truncated": true`, where the part came back as if it were the whole.
+  It does reach it: the same hour compressed to AAC, each piece but the last
+  went on counting sentences past its end, in mlx-audio as here (828
+  sentences of 550 here, 861 there with its 8,192 a piece). What was said
+  is all there, more follows it, and the reply says it was cut. The same
+  hour uncompressed, mlx-audio wrote down as 550.
+
+### Fixed — a NaN in a recurrent state stayed for good
+
+llama.cpp cleared a recurrent state by multiplying it by zero, and a NaN
+times zero is a NaN: once one was in, every reply after it was wrong until
+the model was loaded again. Upstream found it on Qwen3.8-Flash-Next over RPC
+with a q8_0 KV cache, which is how kinfer runs a model across two Macs
+(upstream #31913; patch 0009, libraries b11998k9).
+
+### Added — what was cached, in the usage
+
+`prompt_tokens_details.cached_tokens` (OpenAI), `input_tokens_details.cached_tokens`
+(Responses, which said 0 always) and `cache_read_input_tokens` (Anthropic,
+with `input_tokens` the part that was read, so the two still add up to the
+prompt): the part of a prompt the prefix pool or the conversation's earlier
+turn already held.
+
+### Added — a reply held to JSON
+
+`format` in `/api/chat`, `response_format` in `/v1/chat/completions`,
+`text.format` in `/v1/responses` and `output_config.format` in `/v1/messages`:
+any JSON object, or a JSON Schema, and the reply is held to it token by
+token, so it cannot open with a sentence, sit in a markdown fence, or carry a
+property the schema lacks. Before, only a tool call's arguments were held, and
+`/v1/messages` stated the schema in the prompt and hoped. A reasoning model
+thinks first and what follows is held. A schema that cannot be held to is a
+400 that says why. GGUF models; see
+[A reply that is JSON](docs/agents.md#a-reply-that-is-json). On the box,
+qwen2.5-0.5b, which left to itself answered the same question in prose, and
+ornith-1.5-35b, thinking first where it was let, kept to a schema of six
+properties in every dialect, at temperature 1.2 as at 0.
+
+### Added — Claude Code's deferred tools
+
+A tool sent with `defer_loading` is kept out of the prompt until a tool
+search's result names it (`tool_reference`) or the model has called it, and
+the search's result reads as the definitions of what it found. Before, every
+MCP tool of a setup was written into every prompt.
+
 ## v0.9.0 — 2026-11-21
 
 ### Fixed — reasoning sent back, and reasoning effort, reach the prompt

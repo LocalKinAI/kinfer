@@ -765,6 +765,7 @@ func (e *Engine) prefill(j *job, drafting bool) *mlxmodel.Qwen35Cache {
 		c.Free()
 		c, read = p.cache.(*mlxmodel.Qwen35Cache).Clone(), len(p.tokens)
 		e.reusedTok.Add(int64(read))
+		j.stats.CachedTokens = read
 	}
 	// A reply that will draft has the head read its prompt too; one pooled
 	// without it does not draft (HeadReady), since the head would draft

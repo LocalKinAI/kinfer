@@ -9,6 +9,7 @@ package engine
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -191,6 +192,13 @@ type GenParams struct {
 	// user's last question; see chat.Thinking.KeepAll.
 	KeepThinking bool
 
+	// Format holds the reply to JSON: the string "json" for any JSON object,
+	// or a JSON Schema for a value matching it (tools.JSONGrammar says what of
+	// a schema a reply can be held to). Empty holds it to nothing. A model
+	// whose replies cannot be held (MLX) writes as it would have, and so does
+	// a request that declares tools, whose reply may be a call instead.
+	Format json.RawMessage
+
 	// Resume is the start of the reply, which the caller already has: the
 	// model goes on from its end, and only what follows is sent. The server
 	// sets it to carry a reply over to a reloaded model when the backend went
@@ -229,6 +237,13 @@ type Stats struct {
 	// unchanged count against a tiny PromptEvalDuration — which is the saving,
 	// stated, rather than a prompt that appears not to have existed.
 	PromptTokens int
+
+	// CachedTokens is the part of PromptTokens that was not read again: what
+	// the prefix pool, or the conversation's own earlier turn, already held.
+	// The OpenAI, Responses and Anthropic dialects each have a field for it,
+	// and an agent that budgets by them, or a person looking at why a turn
+	// was slow, sees whether the cache was hit.
+	CachedTokens int
 
 	// EvalTokens is how many tokens the model generated.
 	EvalTokens int
