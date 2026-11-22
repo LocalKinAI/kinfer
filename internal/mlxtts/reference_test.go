@@ -368,12 +368,16 @@ func TestTeacherForced(t *testing.T) {
 		outer.Close()
 		t.Logf("%s: %d frames teacher-forced: talker logits worst cos %.7f max |Δ| %.3g, %d first codes drawn otherwise; code predictor worst cos %.7f max |Δ| %.3g, %d of %d codes otherwise",
 			name, len(codes), worstT, maxT, flipsT, worstC, maxC, flipsC, len(codes)*15)
-		// One bfloat16 step on a logit, now and then, is two MLX builds'
-		// rounding; anything more is a mistake. Rounding flips a first code
-		// only on a near tie: none in the 0.6B CustomVoice's three sentences,
-		// one in the 1.7B VoiceDesign's 73 frames of Chinese (kinfer's MLX
-		// 0.32.5 against the box's Python 0.32.2).
-		if worstT < 0.9999 || flipsT > len(codes)/50 || worstC < 0.999 {
+		// A bfloat16 step on a logit, here and there, is rounding, and anything
+		// more is a mistake. How much rounding is, with the whole text in the
+		// prompt (28 positions for the Chinese sentence), is what
+		// TestPrefillRounding prints: this model's own first logits move by
+		// 0.19-0.23 (cos 0.99995-0.99997) with nothing changed but the size of
+		// the passes the prompt is read in, and against mlx-audio 0.6.7 they
+		// are 0.19-0.26 off (0.99993-0.99997). Over 70 frames each read with
+		// the frames before it in its cache, the worst was 0.9994 and three
+		// first codes of 70 fell otherwise, each on a near tie.
+		if worstT < 0.999 || flipsT > len(codes)/20 || worstC < 0.998 {
 			t.Errorf("%s: the logits are further from mlx-audio's than rounding", name)
 		}
 	}
@@ -433,5 +437,122 @@ func TestSeededRuns(t *testing.T) {
 			}
 		}
 		fmt.Printf("seed %d: %d frames (%.1f s) %016x\n", sd, res.Frames, float64(res.Frames)/12.5, h)
+	}
+}
+
+// With KINFER_TTS_MODEL and KINFER_TTS_LONG (long_ref.py's output from an
+// mlx-audio with its #1116 and #1117), the decoder is checked on codes longer
+// than its 72-frame window, some of them with a first code of 0: whole, and in
+// pieces of several sizes. The decoder without the window, as it was, is
+// measured beside it.
+func TestLongDecodeAgainstMLXAudio(t *testing.T) {
+	dir, refs := os.Getenv("KINFER_TTS_MODEL"), os.Getenv("KINFER_TTS_LONG")
+	if dir == "" || refs == "" {
+		t.Skip("KINFER_TTS_MODEL and KINFER_TTS_LONG not set")
+	}
+	libs, err := mlxengine.Libraries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mlx.Open(libs); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	if m.codec.cfg.Window != 72 {
+		t.Fatalf("the decoder's window read as %d, want 72", m.codec.cfg.Window)
+	}
+	for _, name := range []string{"real", "zeros"} {
+		gc, _ := readNpy(t, filepath.Join(refs, name+"_codes.npy"))
+		want, _ := readNpy(t, filepath.Join(refs, name+"_audio.npy"))
+		cs := codesOf(gc)
+		pcm := m.decode(cs)
+		if len(pcm) != len(want) || len(pcm) != len(cs)*m.codec.perFrame {
+			t.Fatalf("%s: %d frames decoded to %d samples, mlx-audio %d", name, len(cs), len(pcm), len(want))
+		}
+		// mlx-audio decodes 300 frames at a time, each later piece from a fresh
+		// state with 25 frames before it; this decoder carries its state on.
+		// So the two are the same audio up to frame 300 and close after it.
+		head := min(len(cs), 300) * m.codec.perFrame
+		d, c := compare(pcm[:head], want[:head])
+		t.Logf("%s: %d frames, whole, the first 300: max |Δ| %.3g cos %.7f", name, len(cs), d, c)
+		if c < 0.9999 {
+			t.Errorf("%s: whole decode cos %.6f against mlx-audio", name, c)
+		}
+		if head < len(pcm) {
+			d, c := compare(pcm[head:], want[head:])
+			t.Logf("%s: past frame 300, where mlx-audio starts again: max |Δ| %.3g cos %.7f", name, d, c)
+		}
+		for _, piece := range []int{1, 7, 50, 73} {
+			st := newCodecState(m.codec.cfg.Layers)
+			var streamed []float32
+			for i := 0; i < len(cs); i += piece {
+				streamed = append(streamed, m.decodePiece(cs[i:min(i+piece, len(cs))], st)...)
+			}
+			st.free()
+			d, c := compare(streamed, pcm)
+			t.Logf("%s: in pieces of %d against whole: %d samples max |Δ| %.3g cos %.7f", name, piece, len(streamed), d, c)
+			if len(streamed) != len(want) || c < 0.9999 {
+				t.Errorf("%s: pieces of %d: %d samples, cos %.6f", name, piece, len(streamed), c)
+			}
+		}
+		w := m.codec.cfg.Window
+		m.codec.cfg.Window = 0
+		old := m.decode(cs)
+		m.codec.cfg.Window = w
+		d, c = compare(old[:head], want[:head])
+		t.Logf("%s: without the window, as before, the first 300: max |Δ| %.3g cos %.7f", name, d, c)
+	}
+}
+
+// With KINFER_TTS_MODEL: the first step's logits with the prompt read in one
+// pass and in passes of other sizes. The model's weights are 8-bit and its
+// arithmetic bfloat16, so a pass of another size, taking other kernels, rounds
+// otherwise: this prints by how much, which is what "rounding" is against
+// mlx-audio's logits too.
+func TestPrefillRounding(t *testing.T) {
+	dir := os.Getenv("KINFER_TTS_MODEL")
+	if dir == "" {
+		t.Skip("KINFER_TTS_MODEL not set")
+	}
+	libs, err := mlxengine.Libraries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mlx.Open(libs); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	sc := mlx.NewScope()
+	defer sc.Close()
+	req := Request{Text: "你好，我是你的家庭助手，今天天气不错，我们出去走走吧。", Voice: "serena", Language: "chinese"}
+	prompt, _, _, err := m.inputs(req.withDefaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	P, hid := prompt.Shape()[1], m.cfg.Talker.Hidden
+	run := func(piece int) (logits, hidden []float32) {
+		cache := newCache(m.cfg.Talker.Layers)
+		var l, h mlx.Array
+		for at := 0; at < P; at += piece {
+			n := min(piece, P-at)
+			l, h = m.talker.step(mlx.Slice(prompt, []int{0, at, 0}, []int{1, at + n, hid}), n, cache)
+			mlx.Eval(append(cache.arrays(), l, h)...)
+		}
+		return f32(l), f32(h)
+	}
+	wl, wh := run(P)
+	for _, piece := range []int{10, 4, 1} {
+		l, h := run(piece)
+		d, c := compare(l, wl)
+		dh, ch := compare(h, wh)
+		t.Logf("%d positions in passes of %d against one pass: logits max |Δ| %.3g cos %.7f; hidden max |Δ| %.3g cos %.7f", P, piece, d, c, dh, ch)
 	}
 }

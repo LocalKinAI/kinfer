@@ -294,3 +294,25 @@ func TestTranscriptionCarriesFeelings(t *testing.T) {
 		t.Errorf("stream done: %v", last)
 	}
 }
+
+// A transcript cut at its bound says so, and one the model ended does not.
+func TestTranscriptionSaysWhenItWasCut(t *testing.T) {
+	srv, reg := newTestServer(t, "asr")
+	defer srv.Close()
+	f := hearing(t, srv, reg, "asr", "language English", "<asr_text>", "Hello from")
+	var out map[string]any
+	w := transcribe(t, srv, wav(2), map[string]string{"model": "asr"})
+	if json.Unmarshal(w.Body.Bytes(), &out); w.Code != http.StatusOK || out["truncated"] != nil {
+		t.Fatalf("a whole transcript: %d %s", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	f.truncated = true
+	f.mu.Unlock()
+	for _, format := range []string{"json", "verbose_json"} {
+		out = nil
+		w = transcribe(t, srv, wav(2), map[string]string{"model": "asr", "response_format": format})
+		if json.Unmarshal(w.Body.Bytes(), &out); w.Code != http.StatusOK || out["truncated"] != true || out["text"] != "Hello from" {
+			t.Errorf("%s, cut: %d %s", format, w.Code, w.Body.String())
+		}
+	}
+}

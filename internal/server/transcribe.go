@@ -311,6 +311,15 @@ func (s *Server) audioText(w http.ResponseWriter, r *http.Request, translate boo
 	}
 	heard, text := splitTranscript(reply, language)
 	extra := feelings(r.Context(), eng, sound)
+	if st.Truncated {
+		// The transcript reached its bound before the model ended it: the
+		// caller is told, where before it got the part as if it were the whole.
+		log.Printf("%s: the transcript was cut at %d tokens before the model ended it", logName(model), st.EvalTokens)
+		if extra == nil {
+			extra = map[string]any{}
+		}
+		extra["truncated"] = true
+	}
 	if sse != nil {
 		if !sse.started && text != "" {
 			sse.emit(text)

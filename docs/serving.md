@@ -433,6 +433,14 @@ curl -F file=@meeting.wav -F model=Qwen3-ASR-1.7B-Q8_0 localhost:11591/v1/audio/
   takes as its system message.
 - `response_format`: `json` (the default), `text` or `verbose_json`, which adds
   the language heard and, for a WAV, the duration. `temperature` defaults to 0.
+  A transcript is bounded, so that a reply that repeats itself, or writes on
+  past the end of what it heard, ends: on MLX at half the recording's length
+  in tokens of sound (13 a second, where speech writes 3 to 6), on GGUF at
+  8,192 tokens. One that reaches its bound says `"truncated": true` in JSON.
+- On MLX a recording longer than twenty minutes is read twenty minutes at a
+  time, cut where it is quietest within five seconds of each mark, as
+  mlx-audio reads one, and the pieces' transcripts are joined. Qwen3-ASR
+  given an hour in one pass wrote down seventeen minutes of it and stopped.
 - `stream=true` sends the transcript as it is written, as OpenAI streams one:
   server-sent events of `{"type":"transcript.text.delta","delta":…}`, then
   `{"type":"transcript.text.done","text":…,"usage":…}`. The "language

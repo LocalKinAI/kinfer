@@ -25,6 +25,10 @@ type Result struct {
 	ForcedLanguage string
 }
 
+// minTranscript is the least a transcript's bound is: a recording of a few
+// words still gets room for the language it opens with and a sentence.
+const minTranscript = 256
+
 // prefillChunk is how many positions a prefill pass reads, as mlx-lm's
 // prefill_step_size.
 const prefillChunk = 2048
@@ -51,10 +55,11 @@ func (m *Model) prompt(system, language string, audio int) (pre, post []int32) {
 // list.
 func (m *Model) Language(name string) string { return m.languages[strings.ToLower(name)] }
 
-// Transcribe writes down what pcm, 16 kHz mono, says. language, when not "",
-// starts the reply as Qwen3-ASR is told one; onToken, when not nil, gets the
-// text as it is written.
-func (m *Model) Transcribe(ctx context.Context, pcm []float32, system, language string, maxTokens int, onToken func(string)) (res Result, err error) {
+// transcribe writes down what pcm, 16 kHz mono, says, read in one pass (see
+// Transcribe, which cuts a long recording into several). language, when not
+// "", starts the reply as Qwen3-ASR is told one; onToken, when not nil, gets
+// the text as it is written.
+func (m *Model) transcribe(ctx context.Context, pcm []float32, system, language string, maxTokens int, onToken func(string)) (res Result, err error) {
 	defer mlx.Recover(&err)
 	if language != "" {
 		if l := m.Language(language); l != "" {
@@ -100,6 +105,19 @@ func (m *Model) Transcribe(ctx context.Context, pcm []float32, system, language 
 	defer audio.Free()
 	n := audio.Shape()[0]
 	res.AudioTokens = n
+	// A transcript's bound is there to stop a reply that goes wrong: one that
+	// repeats itself, or one that writes on past the end of what it heard, as
+	// Qwen3-ASR does now and then when what was said is easy to go on from
+	// (550 numbered sentences, compressed to AAC: each twenty-minute piece
+	// but the last went on counting, here and in mlx-audio alike). Speech
+	// writes 3 to 6 tokens a second and takes 13 of sound, so half the sound's
+	// count is the bound, which for twenty minutes is what mlx-audio allows a
+	// piece (8,192). A fixed 8,192 let a ten-second recording run on for
+	// forty seconds of invention. A transcript that reaches its bound is told
+	// as cut (Truncated).
+	if bound := max(minTranscript, n/2); maxTokens <= 0 || maxTokens > bound {
+		maxTokens = bound
+	}
 	res.Encode = time.Since(t0)
 	mark("encoded")
 

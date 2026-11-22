@@ -70,6 +70,11 @@ type Result struct {
 // inputs is mlx-audio's _prepare_generation_inputs: the prompt's embeddings
 // [1, P, hidden], the text read one token a frame after it [1, T, hidden], and
 // the pad read once the text is through [1, 1, hidden].
+//
+// The whole text is in the prompt, as Qwen's own CustomVoice and VoiceDesign
+// read it, and every frame after reads the pad. mlx-audio gave the model one
+// text token a frame until its #1036, and this did after it: the same sentence
+// could then come out at half the speed, 18 s where another seed gave 9.
 func (m *Model) inputs(r Request) (prompt, trailing, pad mlx.Array, err error) {
 	tc := m.cfg.Talker
 	t := m.talker
@@ -142,10 +147,10 @@ func (m *Model) inputs(r Request) (prompt, trailing, pad mlx.Array, err error) {
 		parts = append(parts, it)
 	}
 	L := len(ids)
-	parts = append(parts, part(text, 0, 3), combined, mlx.Add(part(text, 3, 4), part(codec, n-1, n)))
+	full := mlx.Add(mlx.Concatenate(1, part(text, 3, L-5), eos), part(codec, n-2, n-1)) // each beside the codec's pad
+	parts = append(parts, part(text, 0, 3), combined, full, mlx.Add(pad, part(codec, n-1, n)))
 	prompt = mlx.Concatenate(1, parts...)
-	trailing = mlx.Concatenate(1, part(text, 4, L-5), eos)
-	return prompt, trailing, pad, nil
+	return prompt, pad, pad, nil
 }
 
 // Speak says r.Text. onAudio is handed the audio, [-1, 1] at 24 kHz: all of
@@ -364,8 +369,9 @@ func (m *Model) frame(in mlx.Array, L int, window, text mlx.Array, cache *kvCach
 const decodePieceFrames = 50
 
 // decode is the audio of codes as mlx-audio's speech_tokenizer.decode makes
-// it, trimmed as it trims: to 1,920 samples for each frame whose first code
-// is above 0.
+// it: 1,920 samples for each frame. A frame whose first code is 0 is a frame
+// like any other; mlx-audio counted only those above 0 until its #1116, and
+// this did after it, so each such frame cut 80 ms from the end.
 func (m *Model) decode(codes [][]int32) []float32 {
 	var pcm []float32
 	st := newCodecState(m.codec.cfg.Layers)
@@ -373,13 +379,7 @@ func (m *Model) decode(codes [][]int32) []float32 {
 	for start := 0; start < len(codes); start += decodePieceFrames {
 		pcm = append(pcm, m.decodePiece(codes[start:min(start+decodePieceFrames, len(codes))], st)...)
 	}
-	valid := 0
-	for _, c := range codes {
-		if c[0] > 0 {
-			valid++
-		}
-	}
-	if n := valid * m.codec.perFrame; n > 0 && n < len(pcm) {
+	if n := len(codes) * m.codec.perFrame; n > 0 && n < len(pcm) {
 		pcm = pcm[:n]
 	}
 	return pcm

@@ -134,10 +134,6 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p engine.Gen
 	if r := p.Resume; strings.HasPrefix(r, "language ") && strings.HasSuffix(r, "<asr_text>") {
 		language = strings.TrimSuffix(strings.TrimPrefix(r, "language "), "<asr_text>")
 	}
-	most := p.MaxTokens
-	if most <= 0 {
-		most = 8192
-	}
 	e.waiting.Add(1)
 	e.mu.Lock()
 	e.waiting.Add(-1)
@@ -161,7 +157,9 @@ func (e *Engine) ChatFull(ctx context.Context, msgs []chat.Message, p engine.Gen
 		e.eval.Add(int64(h.Tokens))
 		return reply, engine.Stats{EvalTokens: h.Tokens, PromptEvalDuration: h.Took}, nil
 	}
-	res, err := e.m.Transcribe(ctx, pcm, system, language, most, onToken)
+	// The bound is the recording's own (see transcribe): the 8,192 tokens the
+	// server asks of every engine are for those that do not know the sound.
+	res, err := e.m.Transcribe(ctx, pcm, system, language, 0, onToken)
 	e.prompt.Add(int64(res.PromptTokens))
 	e.eval.Add(int64(res.Tokens))
 	return res.Text, engine.Stats{Truncated: res.Truncated, PromptTokens: res.PromptTokens, EvalTokens: res.Tokens,

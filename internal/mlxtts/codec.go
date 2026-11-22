@@ -38,6 +38,7 @@ type codecConfig struct {
 	Semantic      int     `json:"num_semantic_quantizers"`
 	Eps           float32 `json:"rms_norm_eps"`
 	RopeTheta     float32 `json:"rope_theta"`
+	Window        int     `json:"sliding_window"`
 	UpsampleRates []int   `json:"upsample_rates"`
 	UpsamplingRat []int   `json:"upsampling_ratios"`
 }
@@ -396,12 +397,58 @@ func gelu(x mlx.Array) mlx.Array {
 	return mlx.Divide(mlx.Multiply(x, mlx.AddScalar(e, 1)), mlx.ScalarAs(2, x.Dtype()))
 }
 
+// window is what a pass of L frames at offset may attend to: the keys from
+// start on, and the mask over them ([L, end-start], 0 where there is none to
+// give: one frame, or every frame so far inside the window).
+//
+// The decoder was trained looking back sliding_window frames (72, 5.76 s) and
+// no further: a frame attends to itself and the 71 before it. mlx-audio's port
+// looked back over everything until its #1117, and so did this one after it:
+// past 5.76 s the audio drifted from the reference decoder's (relative L2
+// 0.25 on a 13.4 s clip, by that fix's measurement).
+func window(offset, L, W int) (start int, mask []float32) {
+	end := offset + L
+	if W <= 0 || end <= W {
+		return 0, nil
+	}
+	start = max(0, offset-(W-1))
+	if L == 1 {
+		return start, nil
+	}
+	S := end - start
+	mask = make([]float32, L*S)
+	ninf := float32(math.Inf(-1))
+	for i := range L {
+		q := offset + i
+		for j := range S {
+			if k := start + j; k > q || k <= q-W {
+				mask[i*S+j] = ninf
+			}
+		}
+	}
+	return start, mask
+}
+
 // transformer is the decoder's: x [1, L, latent] at the cache's offset.
 func (cd *codec) transformer(x mlx.Array, c *kvCache) mlx.Array {
 	cfg := cd.cfg
 	h := cd.inProj.apply(x)
 	L := h.Shape()[1]
 	H, D := cfg.Heads, cfg.HeadDim
+	start, maskRows := window(c.offset, L, cfg.Window)
+	end := c.offset + L
+	var mask mlx.Array
+	if maskRows != nil {
+		mask = mlx.FromFloat32(maskRows, L, end-start)
+	}
+	attendIn := func(q, k, v mlx.Array) mlx.Array {
+		if start == 0 && mask == 0 {
+			return attend(q, k, v, L, D)
+		}
+		k = mlx.Slice(k, []int{0, 0, start, 0}, []int{1, cfg.KVHeads, end, D})
+		v = mlx.Slice(v, []int{0, 0, start, 0}, []int{1, cfg.KVHeads, end, D})
+		return mlx.SDPA(q, k, v, float32(math.Pow(float64(D), -0.5)), "", mask)
+	}
 	cos := mlx.Slice(cd.cos, []int{c.offset, 0}, []int{c.offset + L, D})
 	sin := mlx.Slice(cd.sin, []int{c.offset, 0}, []int{c.offset + L, D})
 	rot := func(t mlx.Array) mlx.Array {
@@ -417,7 +464,7 @@ func (cd *codec) transformer(x mlx.Array, c *kvCache) mlx.Array {
 		v := mlx.Transpose(mlx.Reshape(l.v.apply(a), 1, L, cfg.KVHeads, D), 0, 2, 1, 3)
 		q, k = rot(q), rot(k)
 		k, v = c.update(i, k, v, L, cfg.KVHeads, D, mlx.Float32)
-		o := l.o.apply(mlx.Reshape(mlx.Transpose(attend(q, k, v, L, D), 0, 2, 1, 3), 1, L, H*D))
+		o := l.o.apply(mlx.Reshape(mlx.Transpose(attendIn(q, k, v), 0, 2, 1, 3), 1, L, H*D))
 		h = mlx.Add(h, mlx.Multiply(l.attnScale, o))
 		a = rmsNorm(h, l.postNorm, cfg.Eps)
 		m := l.down.apply(mlx.Multiply(mlx.SiLU(l.gate.apply(a)), l.up.apply(a)))
