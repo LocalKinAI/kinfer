@@ -376,6 +376,7 @@ func TestGrammarHoldsAReplyToASchema(t *testing.T) {
 		"a child that is not this schema": `{"name":"x","age":1,"kids":[{"name":"k"}]}`,
 		"prose after the object":          `{"name":"x","age":1} Done.`,
 		"a markdown fence":                "```json\n{\"name\":\"x\",\"age\":1}",
+		"blank lines after the object":    "{\"name\":\"x\",\"age\":1}\n\n  ",
 	}
 	for why, text := range bad {
 		if taken, of, canEnd := follow(t, v, rules, text); taken == of && canEnd {

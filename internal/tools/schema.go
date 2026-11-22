@@ -35,7 +35,9 @@ func JSONGrammar(schema json.RawMessage) (string, error) {
 		}
 	}
 	var b strings.Builder
-	b.WriteString("root ::= jws " + root + " jws\n")
+	// Nothing may follow the value: with white space allowed there, a model
+	// that has closed its object goes on writing blank lines to the limit.
+	b.WriteString("root ::= jws " + root + "\n")
 	b.WriteString(g.rules.String())
 	b.WriteString(`jint ::= "-"? ( "0" | [1-9] [0-9]{0,18} )` + "\n")
 	b.WriteString(jsonRules)
