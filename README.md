@@ -514,7 +514,7 @@ Why llama.cpp is bound directly, and the five bugs that decided it:
 ```bash
 kinfer fit                    # what this machine can actually run
 kinfer can-run <hf-repo>      # whether a model on Hugging Face will run here
-kinfer pull <repo>[:quant]    # Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M, or an MLX repo: mlx-community/Qwen3.8-27B-4bit
+kinfer pull <repo>[:quant]    # Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M, or an MLX repo: mlx-community/Qwen3.8-27B-4bit, thinkingmachines/Inkling-2-Mini
 kinfer pull speech            # this machine's default speech models
 kinfer list                   # what is installed, Ollama's models included
 kinfer rm <model>             # delete one

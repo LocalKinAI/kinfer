@@ -92,11 +92,7 @@ func IsInkling(path string) bool {
 // InklingReadsPictures reports whether path holds an Inkling 2 model with its
 // vision tower.
 func InklingReadsPictures(path string) bool {
-	if !IsInkling(path) {
-		return false
-	}
-	_, err := os.Stat(filepath.Join(path, "model.visual.proj_out.weight.safetensors"))
-	return err == nil
+	return IsInkling(path) && mlxmodel.Inkling2HasEyes(path)
 }
 
 // OpenInkling loads the Inkling 2 model in dir.

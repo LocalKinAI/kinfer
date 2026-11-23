@@ -187,14 +187,26 @@ second, the head's keys and values for it were dropped without being freed —
 ### Added — Inkling 2 Mini, on MLX
 
 Thinking Machines' Inkling 2 Mini (26B parameters, 20 GB, Apache 2.0,
-released 2026-11-20) is served from Ollama's copy of it — `ollama pull
-inkling-2-mini`, then the model is `inkling-2-mini` in kinfer too, nothing
-downloaded twice. It is a model unlike the others here: 24 layers of which the
+released 2026-11-20) comes either way: `kinfer pull
+thinkingmachines/Inkling-2-Mini` fetches the publisher's own files from
+Hugging Face (18.2 GB; the 0.6 GB file of its draft head, which kinfer does
+not read, is left), or, where Ollama has it — `ollama pull inkling-2-mini` —
+the model is `inkling-2-mini` in kinfer too, nothing downloaded twice. It is a
+model unlike the others here: 24 layers of which the
 middle 12 run three times a token, a residual stream kept in blocks that
 every layer mixes for itself, attention with a bias for each distance back in
 place of rotary positions, convolutions over the last four tokens, and 128
 experts a layer of which a token uses 8. kinfer reads the publisher's
-weights as Ollama stores them, the experts in NVFP4 and MXFP8 as they are.
+weights, the experts in NVFP4 and MXFP8 as they are.
+
+The two copies are the same bytes under different labels: the publisher's one
+file put together again from Ollama's 1,244 has the sha256 Hugging Face
+publishes for it, and the model loaded from either gives the same 200,058
+scores after a prompt and the same features for a picture, to the last bit.
+MLX does not open the publisher's file — the experts' scales are labelled
+F8_E4M3, a format it has no name for — so kinfer reads that file itself and
+gives the experts' bytes the labels Ollama's copy gives them. It loads in 5
+to 11 s that way, against 2 from Ollama's copy, which MLX maps.
 
 - The prompt is the publisher's chat template, character for character on
   fifteen conversations rendered with it (tools declared, calls and their

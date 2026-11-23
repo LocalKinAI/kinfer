@@ -71,7 +71,7 @@ func InklingPixel(v int, channel int) float32 {
 
 // loadInkEyes loads the vision tower of the model in dir, or nil when the
 // model has none.
-func loadInkEyes(dir string, hidden int) (*inkEyes, error) {
+func loadInkEyes(dir string, w *inkWeights, hidden int) (*inkEyes, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err != nil {
 		return nil, err
@@ -82,8 +82,8 @@ func loadInkEyes(dir string, hidden int) (*inkEyes, error) {
 	if err := json.Unmarshal(raw, &top); err != nil {
 		return nil, fmt.Errorf("%s/config.json: %w", dir, err)
 	}
-	files, _ := filepath.Glob(filepath.Join(dir, "model.visual.*.safetensors"))
-	if top.Vision == nil || len(files) == 0 {
+	const prefix = "model.visual."
+	if top.Vision == nil || !w.has(prefix+"proj_out.weight") {
 		return nil, nil
 	}
 	c := *top.Vision
@@ -91,33 +91,13 @@ func loadInkEyes(dir string, hidden int) (*inkEyes, error) {
 		c.Width%c.Heads != 0 || (c.Width/c.Heads)%4 != 0 || c.MLPRatio <= 0 || c.Grid <= 0 || c.Eps <= 0 || c.ProjBias {
 		return nil, fmt.Errorf("%s: an Inkling 2 vision tower of this kind is not read", dir)
 	}
-	tensors := map[string]mlx.Array{}
-	defer func() {
-		for _, v := range tensors {
-			v.Free()
-		}
-	}()
-	for _, f := range files {
-		t, err := mlx.LoadSafetensors(f)
-		if err != nil {
-			return nil, err
-		}
-		for k, v := range t {
-			tensors[k] = v
-		}
-	}
 	e := &inkEyes{cfg: c}
-	const prefix = "model.visual."
 	take := func(name string, shape ...int) mlx.Array {
-		a, ok := tensors[prefix+name]
-		if !ok {
-			panic(&mlx.Error{Msg: "weight " + prefix + name + " missing"})
-		}
+		a := w.take(prefix + name)
+		e.all = append(e.all, a)
 		if got := a.Shape(); fmt.Sprint(got) != fmt.Sprint(shape) {
 			panic(&mlx.Error{Msg: fmt.Sprintf("weight %s%s is %v, not %v", prefix, name, got, shape)})
 		}
-		delete(tensors, prefix+name)
-		e.all = append(e.all, a)
 		return a
 	}
 	linear := func(stem string, out, in int) [2]mlx.Array {

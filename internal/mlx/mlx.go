@@ -287,6 +287,23 @@ func fromData(p unsafe.Pointer, n int, shape []int, dt Dtype) Array {
 	return a
 }
 
+// FromBytes copies data, the bytes of an array of dtype dt and the given
+// shape as a file keeps them, into a new array. Like a tensor mapped from a
+// file it belongs to no scope: the caller frees it.
+func FromBytes(data []byte, dt Dtype, shape ...int) Array {
+	s32 := make([]int32, len(shape))
+	for i, d := range shape {
+		s32[i] = int32(d)
+	}
+	a := arrayNewData(unsafe.Pointer(unsafe.SliceData(data)), unsafe.SliceData(s32), int32(len(s32)), dt)
+	runtime.KeepAlive(s32)
+	runtime.KeepAlive(data)
+	if a == 0 {
+		check(1)
+	}
+	return a
+}
+
 // Scalar makes a 0-d float32 array.
 func Scalar(v float32) Array { a := arrayNewF32(v); track(a); return a }
 

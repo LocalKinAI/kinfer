@@ -127,7 +127,7 @@ func cmdCanRun(args []string) error {
 	if set, ok := hub.MLXFiles(files); len(quants) == 0 && ok && servedOnMLX(arch) {
 		// What a model on MLX holds in memory is its weights as they are.
 		var size int64
-		for _, f := range set {
+		for _, f := range mlxSet(arch, set) {
 			if strings.HasSuffix(f.Name, ".safetensors") {
 				size += f.Size
 			}

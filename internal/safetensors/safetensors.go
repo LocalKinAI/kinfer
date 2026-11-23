@@ -95,6 +95,21 @@ func (f *File) Read(name string) ([]byte, error) {
 	return b, nil
 }
 
+// ReadInto reads a tensor's bytes into b, which must be as long as they are.
+func (f *File) ReadInto(name string, b []byte) error {
+	info, ok := f.Tensors[name]
+	if !ok {
+		return fmt.Errorf("no tensor %s", name)
+	}
+	if int64(len(b)) != info.Offsets[1]-info.Offsets[0] {
+		return fmt.Errorf("%s is %d bytes, not %d", name, info.Offsets[1]-info.Offsets[0], len(b))
+	}
+	if _, err := f.f.ReadAt(b, f.start+info.Offsets[0]); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	return nil
+}
+
 // Close closes the file.
 func (f *File) Close() error { return f.f.Close() }
 

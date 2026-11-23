@@ -173,7 +173,22 @@ func pullSpeech(conns int) error {
 // (mlxmodel), a speech recognition model's (mlxasr) or a text to speech
 // model's (mlxtts).
 func servedOnMLX(arch string) bool {
-	return mlxmodel.Serves(arch) || mlxasr.Serves(arch) || mlxtts.Serves(arch)
+	return mlxmodel.Serves(arch) || arch == mlxmodel.InklingModelType || mlxasr.Serves(arch) || mlxtts.Serves(arch)
+}
+
+// mlxSet is the files of an MLX repo that a pull fetches: all of them, but
+// for Inkling 2 the file of its draft head, 0.6 GB that kinfer does not read.
+func mlxSet(arch string, set []hub.File) []hub.File {
+	if arch != mlxmodel.InklingModelType {
+		return set
+	}
+	var kept []hub.File
+	for _, f := range set {
+		if f.Name != mlxmodel.InklingDraftFile {
+			kept = append(kept, f)
+		}
+	}
+	return kept
 }
 
 // mlxExperts checks that an MoE repo keeps its experts as the MLX engine
@@ -201,7 +216,7 @@ func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, 
 		return err
 	}
 	if !servedOnMLX(arch) {
-		return fmt.Errorf("%s is safetensors of model_type %q, which kinfer does not serve on MLX (Qwen3.5 and Qwen3.8, qwen3_5 and qwen3_5_moe, the speech models Qwen3-ASR and SenseVoice, qwen3_asr and sensevoice, and Qwen3-TTS CustomVoice, qwen3_tts, it does); a GGUF of it may run on llama.cpp: kinfer can-run %s",
+		return fmt.Errorf("%s is safetensors of model_type %q, which kinfer does not serve on MLX (Qwen3.5 and Qwen3.8, qwen3_5 and qwen3_5_moe, Inkling 2, inkling2_loop, the speech models Qwen3-ASR and SenseVoice, qwen3_asr and sensevoice, and Qwen3-TTS CustomVoice, qwen3_tts, it does); a GGUF of it may run on llama.cpp: kinfer can-run %s",
 			ref.Repo, arch, ref.Repo)
 	}
 	if err := mlxExperts(ctx, ref.Repo, arch); err != nil {
@@ -211,7 +226,7 @@ func pullMLX(ctx context.Context, st *store.Store, ref hub.Ref, set []hub.File, 
 		return err
 	}
 
-	return pullDir(ctx, st, ref, set, conns, "served on MLX")
+	return pullDir(ctx, st, ref, mlxSet(arch, set), conns, "served on MLX")
 }
 
 // pullImage fetches a picture model as mflux saves one (mlximage serves

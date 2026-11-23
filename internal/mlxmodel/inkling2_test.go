@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/LocalKinAI/kinfer/internal/mlx"
+	"github.com/LocalKinAI/kinfer/internal/safetensors"
 )
 
 // TestInkling2Greedy reads KINFER_INK_TOKENS (token ids, comma separated)
@@ -1045,5 +1046,111 @@ func TestInkling2Picture(t *testing.T) {
 	}
 	if _, err := m.ForwardSpans(prompt[:4], []Inkling2Span{{At: 3, Features: f}}, m.NewCache()); err == nil {
 		t.Error("features past the end of a pass are taken")
+	}
+}
+
+// The publisher's file labels the experts' bytes its own way; they are read
+// under the labels Ollama's copy gives them, and nothing else is relabelled.
+func TestInklingPublishedLabels(t *testing.T) {
+	info := func(dtype string, bytes int64, shape ...int) safetensors.Info {
+		return safetensors.Info{Dtype: dtype, Shape: shape, Offsets: [2]int64{0, bytes}}
+	}
+	for _, c := range []struct {
+		name  string
+		info  safetensors.Info
+		dt    mlx.Dtype
+		shape []int
+	}{
+		{"model.llm.layers.0.mlp.experts.w13_weight", info("U8", 128*2304*1152, 128, 2304, 1152), mlx.Uint32, []int{128, 2304, 288}},
+		{"model.llm.layers.0.mlp.experts.w13_weight_scale", info("F8_E4M3", 128*2304*144, 128, 2304, 144), mlx.Uint8, []int{128, 2304, 144}},
+		{"model.llm.layers.20.mlp.experts.w2_weight", info("F8_E4M3", 128*2304*1152, 128, 2304, 1152), mlx.Uint32, []int{128, 2304, 288}},
+		{"model.llm.layers.20.mlp.experts.w2_weight_scale", info("U8", 128*2304*36, 128, 2304, 36), mlx.Uint8, []int{128, 2304, 36}},
+		{"model.llm.layers.0.mlp.experts.w2_weight_amax", info("F32", 128*4, 128), mlx.Float32, []int{128}},
+		{"model.llm.layers.0.attn_norm.weight", info("BF16", 2304*2, 2304), mlx.Bfloat16, []int{2304}},
+	} {
+		dt, shape, err := inkLabel(c.name, c.info)
+		if err != nil || dt != c.dt || fmt.Sprint(shape) != fmt.Sprint(c.shape) {
+			t.Errorf("%s: %v %v, %v; want %v %v", c.name, dt, shape, err, c.dt, c.shape)
+		}
+	}
+	for what, c := range map[string]safetensors.Info{
+		"a weight of no whole words":     info("U8", 2*3*6, 2, 3, 6),
+		"bytes that are not the shape's": info("BF16", 10, 2304),
+		"a format not read":              info("F64", 16, 2),
+	} {
+		name := "model.llm.layers.0.attn_norm.weight"
+		if strings.HasPrefix(what, "a weight of no") {
+			name = "model.llm.layers.0.mlp.experts.w2_weight"
+		}
+		if _, _, err := inkLabel(name, c); err == nil {
+			t.Errorf("%s is taken", what)
+		}
+	}
+}
+
+// TestInkling2PublishedFile loads the model from Ollama's copy
+// (KINFER_INK_MODEL) and from the publisher's own files as kinfer pull
+// fetches them (KINFER_INK_PUBLISHED), one after the other, and holds the
+// second to the first: the same scores after a prompt, to the last bit, and
+// the same picture's features.
+func TestInkling2PublishedFile(t *testing.T) {
+	lib, dirs := os.Getenv("KINFER_MLX_LIB"), []string{os.Getenv("KINFER_INK_MODEL"), os.Getenv("KINFER_INK_PUBLISHED")}
+	if lib == "" || dirs[0] == "" || dirs[1] == "" {
+		t.Skip("KINFER_MLX_LIB, KINFER_INK_MODEL and KINFER_INK_PUBLISHED not all set")
+	}
+	if err := mlx.Open(lib); err != nil {
+		t.Fatal(err)
+	}
+	prompt := []int32{200000, 5, 17, 300, 4000, 12, 99, 31000, 7, 200002}
+	var scores, features [2][]float32
+	for i, dir := range dirs {
+		start := time.Now()
+		m, err := LoadInkling2(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%s loaded in %v: %.1f GB, pictures %v", dir, time.Since(start).Round(time.Millisecond), float64(m.Bytes())/1e9, m.ReadsPictures())
+		if got := Inkling2HasEyes(dir); got != m.ReadsPictures() {
+			t.Errorf("%s: Inkling2HasEyes says %v, the loaded model %v", dir, got, m.ReadsPictures())
+		}
+		c := m.NewCache()
+		lg, err := m.Forward([][]int32{prompt}, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scores[i] = mlx.Astype(lg, mlx.Float32).Float32s()
+		lg.Free()
+		c.Free()
+		if m.ReadsPictures() {
+			tile := m.PictureTile()
+			px := make([]float32, 2*tile*2*tile*3)
+			for j := range px {
+				px[j] = InklingPixel((j*7)%256, j%3)
+			}
+			f, err := m.EncodePicture(px, 2, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			features[i] = mlx.Astype(f, mlx.Float32).Float32s()
+			f.Free()
+		}
+		m.Free()
+	}
+	for what, pair := range map[string][2][]float32{"scores after a prompt": scores, "a picture's features": features} {
+		if len(pair[0]) != len(pair[1]) || len(pair[0]) == 0 {
+			t.Errorf("%s: %d numbers from one, %d from the other", what, len(pair[0]), len(pair[1]))
+			continue
+		}
+		differ := 0
+		for i := range pair[0] {
+			if pair[0][i] != pair[1][i] {
+				differ++
+			}
+		}
+		if differ > 0 {
+			t.Errorf("%s: %d of %d numbers differ", what, differ, len(pair[0]))
+		} else {
+			t.Logf("%s: all %d numbers the same", what, len(pair[0]))
+		}
 	}
 }

@@ -169,6 +169,9 @@ type inkLayer struct {
 
 const inkResidualEps = 1e-6
 
+// InklingModelType is config.json's model_type for this architecture.
+const InklingModelType = "inkling2_loop"
+
 // ServesInkling2 reports whether a config.json's architecture is this one.
 func ServesInkling2(dir string) bool {
 	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
@@ -178,7 +181,28 @@ func ServesInkling2(dir string) bool {
 	var c struct {
 		ModelType string `json:"model_type"`
 	}
-	return json.Unmarshal(raw, &c) == nil && c.ModelType == "inkling2_loop"
+	return json.Unmarshal(raw, &c) == nil && c.ModelType == InklingModelType
+}
+
+// Inkling2HasEyes reports whether the Inkling 2 in dir comes with its vision
+// tower, without opening its weights: the publisher's own file always carries
+// it; a copy with a file a tensor has it when the tower's files are there.
+func Inkling2HasEyes(dir string) bool {
+	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		return false
+	}
+	var c struct {
+		Vision json.RawMessage `json:"vision_config"`
+	}
+	if json.Unmarshal(raw, &c) != nil || len(c.Vision) == 0 || string(c.Vision) == "null" {
+		return false
+	}
+	if each, _ := filepath.Glob(filepath.Join(dir, "model.llm.*.safetensors")); len(each) > 0 {
+		_, err := os.Stat(filepath.Join(dir, "model.visual.proj_out.weight.safetensors"))
+		return err == nil
+	}
+	return true
 }
 
 func readInkling2Config(dir string) (*Inkling2Config, error) {
@@ -239,34 +263,21 @@ func (c *Inkling2Config) visits() []inkVisit {
 	return plan
 }
 
-// LoadInkling2 loads the model in dir, a directory of one safetensors file a
+// LoadInkling2 loads the model in dir: a directory of one safetensors file a
 // tensor, named as the publisher names them (model.llm.…), as kinfer makes of
-// Ollama's copy.
+// Ollama's copy, or the publisher's own files as kinfer pull fetches them
+// (inkWeights).
 func LoadInkling2(dir string) (m *Inkling2, err error) {
 	defer mlx.Recover(&err)
 	c, err := readInkling2Config(dir)
 	if err != nil {
 		return nil, err
 	}
-	files, _ := filepath.Glob(filepath.Join(dir, "model.llm.*.safetensors"))
-	if len(files) == 0 {
-		return nil, fmt.Errorf("no model.llm.*.safetensors in %s", dir)
+	w, err := openInkWeights(dir)
+	if err != nil {
+		return nil, err
 	}
-	raw := map[string]mlx.Array{}
-	for _, f := range files {
-		t, err := mlx.LoadSafetensors(f)
-		if err != nil {
-			return nil, err
-		}
-		for k, v := range t {
-			raw[k] = v
-		}
-	}
-	defer func() {
-		for _, v := range raw {
-			v.Free()
-		}
-	}()
+	defer w.close()
 
 	m = &Inkling2{Config: c, plan: c.visits(), positions: map[int]mlx.Array{},
 		logitCap: c.LogitCap, routeScale: c.RouteScale, gateCap: c.GateCap, upCap: c.UpCap, normEps: c.NormEps,
@@ -278,29 +289,15 @@ func LoadInkling2(dir string) (m *Inkling2, err error) {
 		m.all = append(m.all, a)
 		return a
 	}
-	has := func(name string) bool { _, ok := raw[prefix+name]; return ok }
-	take := func(name string) mlx.Array {
-		a, ok := raw[prefix+name]
-		if !ok {
-			panic(&mlx.Error{Msg: "weight " + prefix + name + " missing"})
-		}
-		delete(raw, prefix+name)
-		return keep(a)
-	}
+	has := func(name string) bool { return w.has(prefix + name) }
+	take := func(name string) mlx.Array { return keep(w.take(prefix + name)) }
 	// made is an array worked out from weights, kept; its sources are freed
 	// once it is evaluated.
 	made := func(a mlx.Array, from ...mlx.Array) mlx.Array {
 		tmp = append(tmp, from...)
 		return keep(a)
 	}
-	src := func(name string) mlx.Array {
-		a, ok := raw[prefix+name]
-		if !ok {
-			panic(&mlx.Error{Msg: "weight " + prefix + name + " missing"})
-		}
-		delete(raw, prefix+name)
-		return a
-	}
+	src := func(name string) mlx.Array { return w.take(prefix + name) }
 	f32 := func(name string) mlx.Array {
 		a := src(name)
 		return made(mlx.Astype(a, mlx.Float32), a)
@@ -466,7 +463,7 @@ func LoadInkling2(dir string) (m *Inkling2, err error) {
 	for _, a := range m.all {
 		m.bytes += int64(a.Nbytes())
 	}
-	if m.eyes, err = loadInkEyes(dir, c.HiddenSize); err != nil {
+	if m.eyes, err = loadInkEyes(dir, w, c.HiddenSize); err != nil {
 		m.Free()
 		return nil, err
 	}

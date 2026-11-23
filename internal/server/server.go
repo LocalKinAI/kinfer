@@ -1107,11 +1107,12 @@ func describe(path string) modelFacts {
 			TextConfig struct {
 				ModelType string `json:"model_type"`
 				MaxPos    int    `json:"max_position_embeddings"`
+				MaxLen    int    `json:"model_max_length"` // Inkling 2's, as its publisher writes it
 			} `json:"text_config"`
 		}
 		if b, err := os.ReadFile(filepath.Join(path, "config.json")); err == nil && json.Unmarshal(b, &cfg) == nil {
 			f.arch = cmp.Or(cfg.TextConfig.ModelType, cfg.ModelType)
-			f.trained = cmp.Or(cfg.TextConfig.MaxPos, cfg.MaxPos)
+			f.trained = cmp.Or(cfg.TextConfig.MaxPos, cfg.MaxPos, cfg.TextConfig.MaxLen)
 		}
 	} else if sh, err := store.ReadShape(path); err == nil {
 		f.embeds, f.arch, f.trained, f.template = sh.Embeds(), sh.Arch, sh.TrainedCtx, sh.ChatTemplate
