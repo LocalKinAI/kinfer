@@ -1,11 +1,19 @@
 package mlxengine
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/LocalKinAI/kinfer/internal/chat"
+	"github.com/LocalKinAI/kinfer/internal/engine"
+	"github.com/LocalKinAI/kinfer/internal/mlxmodel"
 	"github.com/LocalKinAI/kinfer/internal/tools"
 )
 
@@ -22,6 +30,7 @@ func TestInklingRenderMatchesTheTemplate(t *testing.T) {
 		Messages []struct {
 			Role, Content, Thinking string
 			Calls                   []tools.Call
+			Pictures                int
 		}
 		Tools  []tools.Tool
 		Effort string
@@ -33,7 +42,11 @@ func TestInklingRenderMatchesTheTemplate(t *testing.T) {
 	for _, c := range cases {
 		var msgs []chat.Message
 		for _, m := range c.Messages {
-			msgs = append(msgs, chat.Message{Role: m.Role, Content: m.Content, Thinking: m.Thinking, ToolCalls: m.Calls})
+			msg := chat.Message{Role: m.Role, Content: strings.ReplaceAll(m.Content, "<PICTURE>", engine.ImageMarker), Thinking: m.Thinking, ToolCalls: m.Calls}
+			for i := 0; i < m.Pictures; i++ {
+				msg.Images = append(msg.Images, []byte{byte(i)})
+			}
+			msgs = append(msgs, msg)
 		}
 		p, err := inkRender(msgs, c.Tools, chat.Thinking{Effort: c.Effort})
 		if err != nil {
@@ -115,5 +128,78 @@ func TestInklingReplyIsWrittenOutAsText(t *testing.T) {
 	content, calls := tools.Hermes.Parse(answer)
 	if thinking != "why" || content != "" || len(calls) != 1 || calls[0].Name != "f" || string(calls[0].Arguments) != `{"on":true}` {
 		t.Errorf("parsed back: thinking %q, content %q, calls %v", thinking, content, calls)
+	}
+}
+
+// Pictures are the caller's to send rightly: as many as there are places, and
+// to the user's or a tool's message.
+func TestInklingRenderRefusesMisplacedPictures(t *testing.T) {
+	pic := []byte{1}
+	for what, msgs := range map[string][]chat.Message{
+		"a picture with no place":   {{Role: "user", Content: "look", Images: [][]byte{pic}}},
+		"a place with no picture":   {{Role: "user", Content: "look " + engine.ImageMarker}},
+		"a picture from the model":  {{Role: "user", Content: "hi"}, {Role: "assistant", Content: engine.ImageMarker, Images: [][]byte{pic}}},
+		"a picture in the system's": {{Role: "system", Content: engine.ImageMarker, Images: [][]byte{pic}}, {Role: "user", Content: "hi"}},
+	} {
+		_, err := inkRender(msgs, nil, chat.Thinking{})
+		var bad engine.PictureError
+		if !errors.As(err, &bad) {
+			t.Errorf("%s: %v, not a picture's error", what, err)
+		}
+	}
+}
+
+// A picture is laid out in whole tiles: as it is when it is small, what is
+// past its edge padded; made smaller, its shape kept, when it would be more
+// than inkPictureTokens tiles.
+func TestInklingPictureIsLaidOutInTiles(t *testing.T) {
+	make := func(w, h int, fill color.Color) []byte {
+		img := image.NewNRGBA(image.Rect(0, 0, w, h))
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				img.Set(x, y, fill)
+			}
+		}
+		var b bytes.Buffer
+		if err := png.Encode(&b, img); err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+	const tile = 40
+	red := color.NRGBA{255, 0, 0, 255}
+	px, rows, cols, err := inkPixels(make(90, 41, red), tile)
+	if err != nil || rows != 2 || cols != 3 || len(px) != 2*tile*3*tile*3 {
+		t.Fatalf("90 × 41: %d × %d tiles, %d values, %v; want 2 × 3", rows, cols, len(px), err)
+	}
+	at := func(x, y, ch int) float32 { return px[3*(y*cols*tile+x)+ch] }
+	for ch, v := range []int{255, 0, 0} {
+		if got, want := at(89, 40, ch), mlxmodel.InklingPixel(v, ch); got != want {
+			t.Errorf("the picture's last pixel, channel %d: %v, want %v", ch, got, want)
+		}
+		for _, xy := range [][2]int{{90, 0}, {0, 41}, {119, 79}} {
+			if got, want := at(xy[0], xy[1], ch), mlxmodel.InklingPixel(-1, ch); got != want {
+				t.Errorf("past the edge at %v, channel %d: %v, want %v", xy, ch, got, want)
+			}
+		}
+	}
+	// What shows through is a checkerboard of two greys, 8 pixels a square.
+	px, rows, cols, err = inkPixels(make(40, 40, color.NRGBA{0, 0, 0, 0}), tile)
+	if err != nil || rows != 1 || cols != 1 {
+		t.Fatalf("40 × 40: %d × %d tiles, %v", rows, cols, err)
+	}
+	if a, b := at(0, 0, 0), at(8, 0, 0); a != mlxmodel.InklingPixel(204, 0) || b != mlxmodel.InklingPixel(153, 0) {
+		t.Errorf("a clear picture's first two squares are %v and %v", a, b)
+	}
+	for _, c := range []struct{ w, h, rows, cols int }{
+		{4000, 3000, 27, 36}, {3000, 4000, 36, 27}, {1280, 1280, 32, 32}, {1320, 1280, 31, 32}, {100000, 40, 1, 1024}, {41, 20000, 500, 2},
+	} {
+		_, rows, cols, err := inkPixels(make(c.w, c.h, red), tile)
+		if err != nil || rows != c.rows || cols != c.cols || rows*cols > inkPictureTokens {
+			t.Errorf("%d × %d: %d × %d tiles, %v; want %d × %d", c.w, c.h, rows, cols, err, c.rows, c.cols)
+		}
+	}
+	if a, b := inkPictureID([]byte("one")), inkPictureID([]byte("two")); a >= 0 || b >= 0 || a == b {
+		t.Errorf("two pictures stand in a prompt as %d and %d", a, b)
 	}
 }

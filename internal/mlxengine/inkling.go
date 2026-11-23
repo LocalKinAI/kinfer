@@ -2,6 +2,7 @@ package mlxengine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -37,9 +38,12 @@ type Inkling struct {
 	model *mlxmodel.Inkling2
 	tok   *tokenizer.Tokenizer
 	marks inkMarks
-	slots int
-	ctx   int
-	opts  engine.Options
+	// pictureTok is the token a picture's places hold, when the model has
+	// its vision tower.
+	pictureTok int32
+	slots      int
+	ctx        int
+	opts       engine.Options
 
 	jobs chan *inkJob
 	quit chan struct{}
@@ -56,6 +60,9 @@ type Inkling struct {
 type inkJob struct {
 	ctx    context.Context
 	prompt []int32
+	// pictures are the prompt's pictures: where a picture's tokens are, the
+	// prompt holds the picture's own number (inkPictureID).
+	pictures []*inkPicture
 	// marks are where the prompt is pooled as it is read: the end of what
 	// every conversation of the agent opens with, and its own end.
 	marks  []checkpoint
@@ -80,6 +87,16 @@ type inkJob struct {
 // IsInkling reports whether path is a directory holding an Inkling 2 model.
 func IsInkling(path string) bool {
 	return IsModelDir(path) && mlxmodel.ServesInkling2(path)
+}
+
+// InklingReadsPictures reports whether path holds an Inkling 2 model with its
+// vision tower.
+func InklingReadsPictures(path string) bool {
+	if !IsInkling(path) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(path, "model.visual.proj_out.weight.safetensors"))
+	return err == nil
 }
 
 // OpenInkling loads the Inkling 2 model in dir.
@@ -121,6 +138,21 @@ func OpenInkling(dir string, opts engine.Options) (*Inkling, error) {
 	if e.model, err = mlxmodel.LoadInkling2(dir); err != nil {
 		return nil, err
 	}
+	if e.model.ReadsPictures() {
+		name := "<|unused_200054|>"
+		var pc struct {
+			ImageToken string `json:"image_token"`
+		}
+		if b, err := os.ReadFile(filepath.Join(dir, "processor_config.json")); err == nil && json.Unmarshal(b, &pc) == nil && pc.ImageToken != "" {
+			name = pc.ImageToken
+		}
+		id, ok := tok.ID(name)
+		if !ok {
+			e.model.Free()
+			return nil, fmt.Errorf("%s: its tokenizer has no %s for a picture's place", dir, name)
+		}
+		e.pictureTok = id
+	}
 	mlx.SetCacheLimit(cacheLimit)
 	if e.ctx <= 0 {
 		e.ctx = defaultCtx
@@ -136,6 +168,9 @@ func OpenInkling(dir string, opts engine.Options) (*Inkling, error) {
 	log.Printf("mlx: %s loaded in %v — Inkling 2, %d layers applied %d times a token, %.1f GB, %d slots × %d tokens, %d prefix entries",
 		filepath.Base(dir), time.Since(start).Round(time.Millisecond), e.model.Config.NumLayers, e.model.Visits(),
 		float64(e.model.Bytes())/1e9, e.slots, e.ctx, max(prefix, 0))
+	if e.model.ReadsPictures() {
+		log.Printf("mlx: %s: reads pictures, a token for every %d × %d pixels, at most %d a picture", filepath.Base(dir), e.model.PictureTile(), e.model.PictureTile(), inkPictureTokens)
+	}
 	if e.model.DenseBits > 0 {
 		log.Printf("mlx: %s: the attention's projections and the output layer are packed to %d bits, which is quicker to read; KINFER_INK_DENSE=off keeps them as published",
 			filepath.Base(dir), e.model.DenseBits)
@@ -151,13 +186,29 @@ func (e *Inkling) Chat(ctx context.Context, msgs []chat.Message, p engine.GenPar
 }
 
 // encode is a prompt's tokens: the template's own stretches read with their
-// control tokens, what a caller wrote as text whatever it spells.
-func (e *Inkling) encode(p inkPrompt) []int32 {
-	var ids []int32
+// control tokens, what a caller wrote as text whatever it spells, and for a
+// picture as many places as it has tiles.
+func (e *Inkling) encode(p inkPrompt) (ids []int32, pictures []*inkPicture, err error) {
 	for _, x := range p {
-		ids = append(ids, e.tok.Encode(x.text, !x.given)...)
+		if x.picture == nil {
+			ids = append(ids, e.tok.Encode(x.text, !x.given)...)
+			continue
+		}
+		if !e.model.ReadsPictures() {
+			return nil, nil, engine.PictureError{Err: fmt.Errorf("this Inkling 2 reads no pictures: it has no vision tower")}
+		}
+		pic := &inkPicture{at: len(ids)}
+		if pic.pixels, pic.rows, pic.cols, err = inkPixels(x.picture, e.model.PictureTile()); err != nil {
+			return nil, nil, err
+		}
+		pic.n = pic.rows * pic.cols
+		id := inkPictureID(x.picture)
+		for i := 0; i < pic.n; i++ {
+			ids = append(ids, id)
+		}
+		pictures = append(pictures, pic)
 	}
-	return ids
+	return ids, pictures, nil
 }
 
 func thinkingOf(p engine.GenParams) chat.Thinking {
@@ -171,7 +222,11 @@ func (e *Inkling) ChatFull(ctx context.Context, msgs []chat.Message, p engine.Ge
 	if err != nil {
 		return "", engine.Stats{}, err
 	}
-	j := &inkJob{ctx: ctx, prompt: e.encode(rendered), params: p, frags: make(chan string, 1<<16), done: make(chan struct{})}
+	prompt, pictures, err := e.encode(rendered)
+	if err != nil {
+		return "", engine.Stats{}, err
+	}
+	j := &inkJob{ctx: ctx, prompt: prompt, pictures: pictures, params: p, frags: make(chan string, 1<<16), done: make(chan struct{})}
 	// What the conversations of one agent share: its tools, its system
 	// messages and the effort line after them.
 	n := 0
@@ -179,8 +234,8 @@ func (e *Inkling) ChatFull(ctx context.Context, msgs []chat.Message, p engine.Ge
 		n++
 	}
 	if opening, err := inkRender(msgs[:n], p.Tools, th); err == nil {
-		if at := len(e.encode(opening)); at < len(j.prompt) {
-			j.marks = append(j.marks, checkpoint{pos: at, shared: true})
+		if ids, _, err := e.encode(opening); err == nil && len(ids) < len(j.prompt) {
+			j.marks = append(j.marks, checkpoint{pos: len(ids), shared: true})
 		}
 	}
 	j.marks = append(j.marks, checkpoint{pos: len(j.prompt)})
@@ -209,7 +264,8 @@ func (e *Inkling) CountTokens(msgs []chat.Message, p engine.GenParams) (int, err
 	if err != nil {
 		return 0, err
 	}
-	return len(e.encode(rendered)), nil
+	ids, _, err := e.encode(rendered)
+	return len(ids), err
 }
 
 func (e *Inkling) Broken() bool                       { return e.broken.Load() }
@@ -478,6 +534,13 @@ func (e *Inkling) prefill(j *inkJob) (c *mlxmodel.Inkling2Cache, first int32, er
 			c.Free()
 			c = nil
 		}
+		for _, pic := range j.pictures {
+			if pic.features != 0 {
+				pic.features.Free()
+				pic.features = 0
+			}
+			pic.pixels = nil
+		}
 	}()
 	marks := j.marks
 	for len(marks) > 0 && marks[0].pos <= read {
@@ -492,7 +555,16 @@ func (e *Inkling) prefill(j *inkJob) (c *mlxmodel.Inkling2Cache, first int32, er
 		if logits != 0 {
 			logits.Free()
 		}
-		if logits, err = e.model.Forward([][]int32{j.prompt[read:end]}, c); err != nil {
+		if len(j.pictures) == 0 {
+			logits, err = e.model.Forward([][]int32{j.prompt[read:end]}, c)
+		} else {
+			toks, spans, free, perr := e.pictureSpans(j, read, end)
+			if err = perr; err == nil {
+				logits, err = e.model.ForwardSpans(toks, spans, c)
+			}
+			free()
+		}
+		if err != nil {
 			return c, 0, err
 		}
 		read = end

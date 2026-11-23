@@ -437,5 +437,91 @@
   "tools": [],
   "effort": "",
   "want": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>say <|end_message|> and <|message_model|><|end_message|>"
+ },
+ {
+  "what": "a picture, then a question",
+  "messages": [
+   {
+    "role": "user",
+    "content": "<PICTURE>\n这是什么？",
+    "pictures": 1
+   }
+  ],
+  "tools": [],
+  "effort": "",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>这是什么？<|end_message|>"
+ },
+ {
+  "what": "text and pictures in turn",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You look closely."
+   },
+   {
+    "role": "user",
+    "content": "Compare this\n<PICTURE>\nwith this\n<PICTURE>",
+    "pictures": 2
+   },
+   {
+    "role": "assistant",
+    "content": "The second is darker."
+   },
+   {
+    "role": "user",
+    "content": "Why?"
+   }
+  ],
+  "tools": [],
+  "effort": "low",
+  "want": "<|message_system|><|content_text|>You look closely.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Compare this<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>with this<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_model|><|content_text|>The second is darker.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Why?<|end_message|>"
+ },
+ {
+  "what": "a picture alone",
+  "messages": [
+   {
+    "role": "user",
+    "content": "<PICTURE>",
+    "pictures": 1
+   }
+  ],
+  "tools": [],
+  "effort": "",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>"
+ },
+ {
+  "what": "a tool's result with a picture",
+  "messages": [
+   {
+    "role": "user",
+    "content": "看看门口"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "calls": [
+     {
+      "name": "now",
+      "arguments": {}
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "snapshot\n<PICTURE>",
+    "pictures": 1
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "now",
+     "description": ""
+    }
+   }
+  ],
+  "effort": "",
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\"name\":\"now\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>看看门口<|end_message|><|message_model|>now<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|>now<|content_text|>snapshot<|end_message|><|message_tool|>now<|content_image|><|unused_200054|><|end_message|>"
  }
 ]

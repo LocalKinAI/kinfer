@@ -1007,7 +1007,7 @@ func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
 		if info.thinking {
 			capabilities = append(capabilities, "thinking")
 		}
-		if !info.mlx && s.store.ProjectorFor(path) != "" {
+		if (!info.mlx && s.store.ProjectorFor(path) != "") || info.pictures {
 			capabilities = append(capabilities, "vision")
 		}
 	}
@@ -1089,12 +1089,14 @@ type modelFacts struct {
 	arch, template  string
 	trained         int
 	tools, thinking bool
+	pictures        bool // an MLX model with eyes of its own
 }
 
 func describe(path string) modelFacts {
 	var f modelFacts
 	if mlxengine.IsModelDir(path) {
 		f.mlx = true
+		f.pictures = mlxengine.InklingReadsPictures(path)
 		f.embeds = mlxembed.IsModelDir(path)
 		if b, err := os.ReadFile(filepath.Join(path, "chat_template.jinja")); err == nil {
 			f.template = string(b)
@@ -1115,6 +1117,11 @@ func describe(path string) modelFacts {
 		f.embeds, f.arch, f.trained, f.template = sh.Embeds(), sh.Arch, sh.TrainedCtx, sh.ChatTemplate
 	}
 	f.tools, f.thinking = templateCaps(f.template)
+	if mlxengine.IsInkling(path) {
+		// Its prompt is laid out in Go (mlxengine), with no template to read
+		// these from: it takes tools and thinks.
+		f.tools, f.thinking = true, true
+	}
 	return f
 }
 

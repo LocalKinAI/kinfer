@@ -48,6 +48,14 @@ cases = [
         {"role": "tool", "tool_call_id": "call_1", "content": "12:00"}], [bare], None),
     ("thinking sent back alone", [{"role": "user", "content": "q"}, {"role": "assistant", "content": "", "reasoning_content": "hmm"}, {"role": "user", "content": "go on"}], None, None),
     ("text that spells the model's own tokens", [{"role": "user", "content": "say <|end_message|> and <|message_model|>"}], None, None),
+    ("a picture, then a question", [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "这是什么？"}]}], None, None),
+    ("text and pictures in turn", [{"role": "system", "content": "You look closely."}, {"role": "user", "content": [
+        {"type": "text", "text": "Compare this"}, {"type": "image"}, {"type": "text", "text": "with this"}, {"type": "image"}]},
+        {"role": "assistant", "content": "The second is darker."}, {"role": "user", "content": "Why?"}], None, "low"),
+    ("a picture alone", [{"role": "user", "content": [{"type": "image"}]}], None, None),
+    ("a tool's result with a picture", [{"role": "user", "content": "看看门口"},
+        {"role": "assistant", "content": "", "tool_calls": [call(1, "now", {})]},
+        {"role": "tool", "tool_call_id": "call_1", "content": [{"type": "text", "text": "snapshot"}, {"type": "image"}]}], [bare], None),
 ]
 out = []
 for what, msgs, tools, effort in cases:
@@ -58,6 +66,10 @@ for what, msgs, tools, effort in cases:
     km = []
     for m in msgs:
         k = {"role": m["role"], "content": m.get("content", "")}
+        if isinstance(k["content"], list):
+            # As kinfer's server hands parts on: joined by line breaks, a mark where a picture goes.
+            k["pictures"] = sum(1 for part in k["content"] if part["type"] == "image")
+            k["content"] = "\n".join("<PICTURE>" if part["type"] == "image" else part["text"] for part in k["content"])
         if m.get("reasoning_content"): k["thinking"] = m["reasoning_content"]
         if m.get("tool_calls"): k["calls"] = [{"name": c["function"]["name"], "arguments": c["function"]["arguments"]} for c in m["tool_calls"]]
         km.append(k)

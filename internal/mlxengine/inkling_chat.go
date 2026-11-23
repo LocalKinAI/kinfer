@@ -29,6 +29,7 @@ const (
 	inkTool        = "<|message_tool|>"
 	inkText        = "<|content_text|>"
 	inkThinking    = "<|content_thinking|>"
+	inkImage       = "<|content_image|>"
 	inkDeclare     = "<|content_xml|>"
 	inkInvoke      = "<|content_invoke_tool_json|>"
 	inkToolText    = "<|content_invoke_tool_text|>"
@@ -38,17 +39,25 @@ const (
 )
 
 // inkPiece is a stretch of a prompt: the template's own, whose tokens are
-// read as tokens, or something a caller wrote, which is text whatever it
-// spells.
+// read as tokens, something a caller wrote, which is text whatever it
+// spells, or a picture's place.
 type inkPiece struct {
-	text  string
-	given bool
+	text    string
+	given   bool
+	picture []byte
 }
+
+// inkPicturePlace is what the template writes where a picture goes; the
+// picture's tokens, one a tile, take its place.
+const inkPicturePlace = "<|unused_200054|>"
 
 type inkPrompt []inkPiece
 
 func (p *inkPrompt) own(s string)   { *p = append(*p, inkPiece{text: s}) }
 func (p *inkPrompt) given(s string) { *p = append(*p, inkPiece{text: s, given: true}) }
+func (p *inkPrompt) shows(pic []byte) {
+	*p = append(*p, inkPiece{text: inkPicturePlace, picture: pic})
+}
 
 func (p inkPrompt) String() string {
 	var b strings.Builder
@@ -131,8 +140,12 @@ func inkRender(msgs []chat.Message, ts []tools.Tool, th chat.Thinking) (inkPromp
 		if !said && m.Role != "system" {
 			sayEffort()
 		}
-		if len(m.Images) > 0 || strings.Contains(m.Content, engine.ImageMarker) {
-			return nil, fmt.Errorf("pictures are not read by kinfer's Inkling 2 yet")
+		parts := strings.Split(m.Content, engine.ImageMarker)
+		if len(parts)-1 != len(m.Images) {
+			return nil, engine.PictureError{Err: fmt.Errorf("a message has %d pictures and %d places for them", len(m.Images), len(parts)-1)}
+		}
+		if len(m.Images) > 0 && m.Role != "user" && m.Role != "tool" {
+			return nil, engine.PictureError{Err: fmt.Errorf("Inkling 2 reads pictures in a user's or a tool's message, not in the %s's", m.Role)}
 		}
 		head := func(content string) {
 			p.own(role)
@@ -149,7 +162,30 @@ func inkRender(msgs []chat.Message, ts []tools.Tool, th chat.Thinking) (inkPromp
 				p.own(inkEnd)
 			}
 		}
-		if m.Content != "" || !(m.Role == "assistant" && (len(m.ToolCalls) > 0 || m.Thinking != "")) {
+		switch {
+		case len(m.Images) > 0:
+			// A frame for each stretch of text and each picture, in order.
+			// The line break a picture is joined to the text by is the
+			// server's, not the caller's.
+			for i, text := range parts {
+				if i > 0 {
+					text = strings.TrimPrefix(text, "\n")
+				}
+				if i < len(parts)-1 {
+					text = strings.TrimSuffix(text, "\n")
+				}
+				if text != "" {
+					head(inkText)
+					p.given(text)
+					p.own(inkEnd)
+				}
+				if i < len(parts)-1 {
+					head(inkImage)
+					p.shows(m.Images[i])
+					p.own(inkEnd)
+				}
+			}
+		case m.Content != "" || !(m.Role == "assistant" && (len(m.ToolCalls) > 0 || m.Thinking != "")):
 			head(inkText)
 			p.given(m.Content)
 			p.own(inkEnd)

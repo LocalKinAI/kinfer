@@ -1,4 +1,4 @@
-package mlxembed
+package picture
 
 import (
 	"image"
@@ -6,13 +6,13 @@ import (
 	"math"
 )
 
-// resizeRGB scales img to w×h with a Catmull-Rom kernel, as packed RGB, its
+// ResizeRGB scales img to w×h with a Catmull-Rom kernel, as packed RGB, its
 // alpha dropped rather than composited (the reference converts to RGB before
 // it resizes). It follows golang.org/x/image/draw's Kernel.Scale, which Ollama
 // resizes with: the kernel widened by the factor when shrinking, each output
 // pixel's weights normalized, rows first into a float buffer, then columns,
 // on 16-bit premultiplied values rounded back to 8 bits at the end.
-func resizeRGB(img image.Image, w, h int) []uint8 {
+func ResizeRGB(img image.Image, w, h int) []uint8 {
 	b := img.Bounds()
 	sw, sh := b.Dx(), b.Dy()
 	opaque := isOpaque(img)

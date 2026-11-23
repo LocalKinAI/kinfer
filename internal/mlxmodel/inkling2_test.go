@@ -908,3 +908,142 @@ func TestInkling2BatchStepTime(t *testing.T) {
 			B, float64(el.Microseconds())/1000/steps, float64(B*steps)/el.Seconds(), ms(recording), ms(starting), ms(waiting))
 	}
 }
+
+// TestInkling2Picture has the vision tower read a picture and the text model
+// read what it made, with the model in KINFER_INK_MODEL: the features are as
+// many as the picture's tiles and the same each time; they change what the
+// model writes next; and a prompt read in several passes, a cut in the middle
+// of the picture, scores what one pass scores as nearly as a cut allows.
+func TestInkling2Picture(t *testing.T) {
+	lib, dir := os.Getenv("KINFER_MLX_LIB"), os.Getenv("KINFER_INK_MODEL")
+	if lib == "" || dir == "" {
+		t.Skip("KINFER_MLX_LIB and KINFER_INK_MODEL not both set")
+	}
+	if err := mlx.Open(lib); err != nil {
+		t.Fatal(err)
+	}
+	m, err := LoadInkling2(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	if !m.ReadsPictures() {
+		t.Skip("this Inkling 2 has no vision tower")
+	}
+	tile := m.PictureTile()
+	const rows, cols = 3, 5
+	// A picture of stripes and a gradient: every tile differs.
+	px := make([]float32, rows*tile*cols*tile*3)
+	for y := 0; y < rows*tile; y++ {
+		for x := 0; x < cols*tile; x++ {
+			v := [3]int{(x * 255) / (cols * tile), (y * 255) / (rows * tile), 255 * ((x / 16) % 2)}
+			for ch := range v {
+				px[3*(y*cols*tile+x)+ch] = InklingPixel(v[ch], ch)
+			}
+		}
+	}
+	start := time.Now()
+	f, err := m.EncodePicture(px, rows, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Free()
+	t.Logf("a picture of %d × %d tiles read in %v", rows, cols, time.Since(start).Round(time.Millisecond))
+	if s := f.Shape(); len(s) != 2 || s[0] != rows*cols || s[1] != m.hidden {
+		t.Fatalf("features are %v, want [%d %d]", s, rows*cols, m.hidden)
+	}
+	vals := mlx.Astype(f, mlx.Float32).Float32s()
+	var most float64
+	for _, v := range vals {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			t.Fatal("a feature is not a number")
+		}
+		most = math.Max(most, math.Abs(float64(v)))
+	}
+	if most == 0 {
+		t.Fatal("the features are all zero")
+	}
+	again, err := m.EncodePicture(px, rows, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range mlx.Astype(again, mlx.Float32).Float32s() {
+		if v != vals[i] {
+			t.Fatalf("the same picture read twice differs at %d: %v, %v", i, vals[i], v)
+		}
+	}
+	again.Free()
+
+	// <|message_user|><|content_image|> picture <|end_message|>, as numbers
+	// any tokens will do for: the picture's places hold token 1.
+	n := rows * cols
+	prompt := append([]int32{200000, 200001}, make([]int32, n)...)
+	for i := range prompt[2:] {
+		prompt[2+i] = 1
+	}
+	prompt = append(prompt, 200002, 200003)
+	scores := func(passes [][2]int, withPicture bool) []float32 {
+		c := m.NewCache()
+		defer c.Free()
+		var lg mlx.Array
+		for _, p := range passes {
+			var spans []Inkling2Span
+			var cut mlx.Array
+			if lo, hi := max(p[0], 2), min(p[1], 2+n); withPicture && lo < hi {
+				cut = mlx.Slice(f, []int{lo - 2, 0}, []int{hi - 2, m.hidden})
+				spans = []Inkling2Span{{At: lo - p[0], Features: cut}}
+			}
+			if lg != 0 {
+				lg.Free()
+			}
+			if lg, err = m.ForwardSpans(prompt[p[0]:p[1]], spans, c); err != nil {
+				t.Fatal(err)
+			}
+			if cut != 0 {
+				cut.Free()
+			}
+		}
+		defer lg.Free()
+		return mlx.Astype(lg, mlx.Float32).Float32s()
+	}
+	best := func(s []float32) (at int) {
+		for i, v := range s {
+			if v > s[at] {
+				at = i
+			}
+		}
+		return at
+	}
+	whole := scores([][2]int{{0, len(prompt)}}, true)
+	halves := scores([][2]int{{0, 2 + n/2}, {2 + n/2, len(prompt)}}, true)
+	blind := scores([][2]int{{0, len(prompt)}}, false)
+	blindHalves := scores([][2]int{{0, 2 + n/2}, {2 + n/2, len(prompt)}}, false)
+	thirds := scores([][2]int{{0, 1}, {1, 3}, {3, len(prompt) - 1}, {len(prompt) - 1, len(prompt)}}, true)
+	var apart, blindApart, textApart, thirdsApart float64
+	for i := range whole {
+		apart = math.Max(apart, math.Abs(float64(whole[i]-halves[i])))
+		blindApart = math.Max(blindApart, math.Abs(float64(whole[i]-blind[i])))
+		textApart = math.Max(textApart, math.Abs(float64(blind[i]-blindHalves[i])))
+		thirdsApart = math.Max(thirdsApart, math.Abs(float64(whole[i]-thirds[i])))
+	}
+	// A prompt of these few odd tokens is read a little differently in two
+	// passes than in one, picture or none — the scores' last bits choose
+	// other experts — so the cut inside the picture is held to what a cut
+	// costs without one, and to far less than the picture itself is worth.
+	t.Logf("scores after the prompt: one pass and two differ by at most %.3f, one and four by %.3f; without a picture a cut makes %.3f; the picture's features are worth %.2f",
+		apart, thirdsApart, textApart, blindApart)
+	for what, d := range map[string]float64{"two": apart, "four": thirdsApart} {
+		if d > math.Max(2*textApart, 0.5) || d*3 > blindApart {
+			t.Errorf("read in %s passes the scores are %.3f from one pass's", what, d)
+		}
+	}
+	if best(whole) != best(halves) || best(whole) != best(thirds) {
+		t.Errorf("the likeliest token is %d in one pass, %d in two, %d in four", best(whole), best(halves), best(thirds))
+	}
+	if best(whole) == best(blind) && blindApart < 1 {
+		t.Errorf("the picture's features change the scores by only %.3f", blindApart)
+	}
+	if _, err := m.ForwardSpans(prompt[:4], []Inkling2Span{{At: 3, Features: f}}, m.NewCache()); err == nil {
+		t.Error("features past the end of a pass are taken")
+	}
+}

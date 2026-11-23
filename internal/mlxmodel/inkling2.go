@@ -42,6 +42,11 @@ type Inkling2 struct {
 	DenseBits int
 	unembedQ  Linear
 
+	// eyes is the vision tower, nil when the model has none; spans is the
+	// pictures of the pass being recorded (ForwardSpans).
+	eyes  *inkEyes
+	spans []Inkling2Span
+
 	embed, unembed          mlx.Array
 	embedNorm, outNorm      mlx.Array
 	outQuery                mlx.Array
@@ -461,6 +466,16 @@ func LoadInkling2(dir string) (m *Inkling2, err error) {
 	for _, a := range m.all {
 		m.bytes += int64(a.Nbytes())
 	}
+	if m.eyes, err = loadInkEyes(dir, c.HiddenSize); err != nil {
+		m.Free()
+		return nil, err
+	}
+	if m.eyes != nil {
+		mlx.Eval(m.eyes.all...)
+		for _, a := range m.eyes.all {
+			m.bytes += int64(a.Nbytes())
+		}
+	}
 	return m, nil
 }
 
@@ -479,7 +494,12 @@ func (m *Inkling2) Free() {
 	for _, a := range m.positions {
 		a.Free()
 	}
-	m.all, m.positions = nil, nil
+	if m.eyes != nil {
+		for _, a := range m.eyes.all {
+			a.Free()
+		}
+	}
+	m.all, m.positions, m.eyes = nil, nil, nil
 }
 
 // Inkling2Cache is one sequence's state: for every visit of a layer, its
@@ -646,7 +666,7 @@ func (s inkStream) sources() []mlx.Array {
 // hiddenStates is the model's normed output for tokens [B, L], [B, L, hidden].
 func (m *Inkling2) hiddenStates(tokens mlx.Array, cache *Inkling2Cache) mlx.Array {
 	c := m.Config
-	state := inkStream{partial: inkRMS(mlx.Take(m.embed, tokens, 0), m.embedNorm, m.normEps)}
+	state := inkStream{partial: m.placed(inkRMS(mlx.Take(m.embed, tokens, 0), m.embedNorm, m.normEps))}
 	var prelude inkStream
 	var previous []mlx.Array
 	for i, v := range m.plan {

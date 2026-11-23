@@ -255,11 +255,39 @@ Ollama rounds each expert's input to NVFP4 as the publisher's reference does;
 kinfer leaves the inputs as they are, and the two write the same text until
 two tokens are all but equally likely.
 
-Not yet: pictures (the model reads them; kinfer's port does not), drafting
-with the model's draft head — its experts are chosen token by token, so
-checking a draft reads another token's worth of them, and on this machine it
-would pay only where four drafts in five are kept — and a reply held to
-JSON.
+On a MacBook Pro (M5 Max, 48 GB), quiet, the same build writes 62 tok/s
+alone, 92 for two at once, 131 for four and 154–165 for eight, and reads a
+3,300-token prompt at 1,200 tok/s.
+
+It reads pictures, with the vision tower the checkpoint carries (23 layers,
+0.6 GB more in memory). A picture is not made one size: it is cut as it is
+into tiles of 40 × 40 pixels, a token each, so a 640 × 480 camera frame is 192
+tokens and the text in a screenshot stays readable. A picture that would be
+more than 1,024 tokens — past about 1,280 × 1,280 — is made smaller first, its
+shape kept; Ollama sends any size on as it is, and a phone's photo would be
+7,500 tokens there. Pictures go in a user's or a tool's message, any number
+of them, in all four dialects; WebP, HEIC and TIFF are read as the embedding
+model reads them. A conversation's next turn does not read its pictures
+again (a 1,000-token picture: 1.3 s the first turn, 0.1 s the next).
+
+- The prompt with pictures is the publisher's template on four more
+  conversations, and on nine pictures with known answers — lines of English
+  and Chinese to copy, shapes in the four corners, a 4,000 × 3,000 picture, a
+  size that is no whole number of tiles, a transparent background, camera
+  frames from the game — kinfer and Ollama 0.40.17 count the same prompt
+  tokens and give the same answers.
+- `/api/show` now lists Inkling's `vision`, `tools` and `thinking`; it listed
+  `completion` alone, and a client that asks before sending tools sent none.
+
+Picture decoding and resizing moved from the embedding model's package to one
+of their own (`internal/picture`) for both to use; EmbeddingGemma's vectors
+for seven pictures, WebP and TIFF among them, are number for number what they
+were.
+
+Not yet: drafting with the model's draft head — its experts are chosen token
+by token, so checking a draft reads another token's worth of them, and on
+this machine it would pay only where four drafts in five are kept — and a
+reply held to JSON.
 
 ### Fixed — a tool's boolean came back as the text "True"
 
