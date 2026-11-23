@@ -77,6 +77,11 @@ type fileFormat struct {
 const (
 	qwen35Pattern = `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 	qwen2Pattern  = `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+	// o200kPattern is OpenAI's o200k_base split, which Thinking Machines'
+	// Inkling tokenizer uses: words keep their case runs and a contraction
+	// after them, digits go three at a time, and a slash stays with the
+	// punctuation before it.
+	o200kPattern = `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 )
 
 // Load reads tokenizer.json at path.
@@ -190,6 +195,8 @@ func pretokenizer(raw json.RawMessage) (func(string) []string, error) {
 				split = func(s string) []string { return scan(s, true) }
 			case qwen2Pattern:
 				split = func(s string) []string { return scan(s, false) }
+			case o200kPattern:
+				split = scanO200k
 			default:
 				return nil, fmt.Errorf("pre-tokenizer pattern %q is not supported", p.Pattern.Regex)
 			}

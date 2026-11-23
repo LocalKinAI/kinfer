@@ -436,6 +436,7 @@ type optInt struct {
 var (
 	opQuantizedMatmul func(res *Array, x, w, scales, biases Array, transpose bool, group, bits optInt, mode string, s Stream) int32
 	opDequantize      func(res *Array, w, scales, biases Array, group, bits optInt, mode string, globalScale Array, dt optDtype, s Stream) int32
+	opQuantize        func(res *vector, w Array, group, bits optInt, mode string, globalScale Array, s Stream) int32
 	opGatherQMM       func(res *Array, x, w, scales, biases, lhs, rhs Array, transpose bool, group, bits optInt, mode string, globalScale Array, sorted bool, s Stream) int32
 	opGatherMM        func(res *Array, a, b, lhs, rhs Array, sorted bool, s Stream) int32
 )
@@ -445,7 +446,7 @@ func bindQuant(lib uintptr) error {
 		fn   any
 		name string
 	}{
-		{&opQuantizedMatmul, "mlx_quantized_matmul"}, {&opDequantize, "mlx_dequantize"},
+		{&opQuantizedMatmul, "mlx_quantized_matmul"}, {&opDequantize, "mlx_dequantize"}, {&opQuantize, "mlx_quantize"},
 		{&opGatherQMM, "mlx_gather_qmm"}, {&opGatherMM, "mlx_gather_mm"},
 	} {
 		if _, err := dl.Sym(lib, b.name); err != nil {
@@ -479,6 +480,15 @@ func GatherQMM(x, w, scales, biases, rhs Array, group, bits int, mode string, so
 func GatherMM(a, b, rhs Array, sorted bool) Array {
 	r := arrayNew()
 	return out(opGatherMM(&r, a, b, 0, rhs, sorted, gpu), r)
+}
+
+// Quantize packs w [out, in] the way MLX's QuantizedLinear stores a weight:
+// the packed weight, its per-group scales and, in affine mode, its biases.
+func Quantize(w Array, group, bits int, mode string) []Array {
+	res := vecNew()
+	defer vecFree(res)
+	check(opQuantize(&res, w, optInt{Value: int32(group), Has: 1}, optInt{Value: int32(bits), Has: 1}, mode, 0, gpu))
+	return fromVector(res)
 }
 
 // Dequantize unpacks quantized w to the scales' dtype.

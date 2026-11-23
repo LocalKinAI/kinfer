@@ -184,6 +184,98 @@ Fixed on the way: when a reply that had been drafting alone was joined by a
 second, the head's keys and values for it were dropped without being freed —
 33 MB at 8,000 tokens of context, each time.
 
+### Added — Inkling 2 Mini, on MLX
+
+Thinking Machines' Inkling 2 Mini (26B parameters, 20 GB, Apache 2.0,
+released 2026-11-20) is served from Ollama's copy of it — `ollama pull
+inkling-2-mini`, then the model is `inkling-2-mini` in kinfer too, nothing
+downloaded twice. It is a model unlike the others here: 24 layers of which the
+middle 12 run three times a token, a residual stream kept in blocks that
+every layer mixes for itself, attention with a bias for each distance back in
+place of rotary positions, convolutions over the last four tokens, and 128
+experts a layer of which a token uses 8. kinfer reads the publisher's
+weights as Ollama stores them, the experts in NVFP4 and MXFP8 as they are.
+
+- The prompt is the publisher's chat template, character for character on
+  fifteen conversations rendered with it (tools declared, calls and their
+  results, thinking sent back, the effort levels); a caller's text that
+  spells one of the model's control tokens stays text. Its tokenizer's split
+  (OpenAI's o200k_base) is new to kinfer's tokenizer: 2,023 texts in a dozen
+  scripts tokenize as Hugging Face's library tokenizes them.
+- The reply's frames come out as every other model's reply does — thinking,
+  text, calls of tools — in all four dialects, streamed or not. `think` and
+  the effort levels set the model's "thinking effort"; the model thinks a
+  little even at none, as its card says, and that thinking is not shown.
+- A conversation's next turn reads only what is new: the prompt as read is
+  kept, and what an agent's conversations all open with — tools, system
+  prompt — is kept on its own.
+
+- Replies write together, a token each a step: rows of different lengths
+  share each layer's keys and values right-aligned, a reply that ends leaves
+  its row to the next. Each writes what it writes alone, until two tokens are
+  all but equally likely.
+
+On the Mac Studio (M3 Ultra), a quiet GPU, against Ollama 0.40.17 running the
+same files:
+
+| | kinfer | Ollama 0.40.17 |
+|---|---|---|
+| writing, six kinds of request | 47 tok/s, every kind | 23–38, mean 31 |
+| 2, 4, 8 replies at once, in all | 77, 119–124, 154–162 tok/s | 29–30 (it takes them one at a time) |
+| four one-sentence answers, thinking off | 10–12 s | 16.8 s |
+| reading a 3,300-token prompt | 890 tok/s | 820 |
+| twelve tool requests, thinking off / on | 10–11 / 11–12 right | 9 / 12 right |
+
+(Of the tool requests kinfer's runs missed, each was a call with an English
+argument put into Chinese — "bedroom" as 卧室 — which the tools' Chinese
+descriptions invite and a stricter reading than the call deserves counts
+against it.)
+
+A step of this model written out in MLX's operations is 19,000 of them, and
+ran at 15 tok/s. Kernels that each do a part of a layer in one operation —
+the convolutions with the residual sums after them, the router with its
+choice and the experts' activation, the residual mixes and the loop's gates
+with their norms, everything between the attention's projections and its
+softmax, and the softmax with its biases and sink — bring it to 2,700, each
+checked against the operations it stands for. What is left is the weights:
+taking the parts out one at a time, the experts are 8 ms of a 21 ms step and
+the attention 7, and they read 66 and 54 MB a layer application, 48 times a
+token. That is also why replies together cost so little more: 21 ms a step
+for one row, 29 for four, 43 for eight. A prompt's tokens are read 512 at a
+pass with each expert's weights read once for all the tokens that chose it.
+
+The attention's projections and the output layer, which the publisher keeps
+in bfloat16, are packed to 8 bits when the model is loaded: 47 → 52 tok/s
+alone, 119 → 125 for four at once. The model then no longer computes exactly
+what the published weights compute; its answers to the tests here — tool
+calls, translation, arithmetic, summaries in Chinese — read the same.
+`KINFER_INK_DENSE=off` keeps them as published, and `4` packs them further
+(55 tok/s). The figures in the table are with the weights as published.
+Ollama rounds each expert's input to NVFP4 as the publisher's reference does;
+kinfer leaves the inputs as they are, and the two write the same text until
+two tokens are all but equally likely.
+
+Not yet: pictures (the model reads them; kinfer's port does not), drafting
+with the model's draft head — its experts are chosen token by token, so
+checking a draft reads another token's worth of them, and on this machine it
+would pay only where four drafts in five are kept — and a reply held to
+JSON.
+
+### Fixed — a tool's boolean came back as the text "True"
+
+Qwen writes a boolean parameter of a tool call the way Python prints it,
+True or False. A GGUF model's reply is held to a grammar that allows only
+true and false there; an MLX model's is not, and qwen3.8:27b on MLX answered
+"turn off the bedroom light" with `"on": "False"` — a string, which a caller
+testing it takes for on. A call's arguments are now read against the request's
+own declarations, in all four dialects, streamed or not: a parameter declared
+boolean that says True or False in any case is given as the boolean. A
+parameter declared anything else, a function the request did not declare,
+and any other word are left as the model wrote them. On twelve tool requests
+in Chinese and English the 27B on MLX went from 8 right to 11 (the twelfth
+it answers, with thinking off, by repeating the question); ornith on GGUF is
+12 of 12 before and after.
+
 ### Measured — against Ollama 0.40.17 on MLX, and a quiet GPU
 
 On the Mac Studio (M3 Ultra), qwen3.8:27b-mlx from the same files, 2026-11-22,

@@ -1,0 +1,441 @@
+[
+ {
+  "what": "one question",
+  "messages": [
+   {
+    "role": "user",
+    "content": "你好"
+   }
+  ],
+  "tools": [],
+  "effort": "",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>你好<|end_message|>"
+ },
+ {
+  "what": "a system prompt",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [],
+  "effort": "",
+  "want": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "what": "two system prompts and no question",
+  "messages": [
+   {
+    "role": "system",
+    "content": "A"
+   },
+   {
+    "role": "system",
+    "content": "B"
+   }
+  ],
+  "tools": [],
+  "effort": "",
+  "want": "<|message_system|><|content_text|>A<|end_message|><|message_system|><|content_text|>B<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+ },
+ {
+  "what": "several turns",
+  "messages": [
+   {
+    "role": "user",
+    "content": "1+1?"
+   },
+   {
+    "role": "assistant",
+    "content": "2"
+   },
+   {
+    "role": "user",
+    "content": "And 2+2?\n\nThanks."
+   }
+  ],
+  "tools": [],
+  "effort": "",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>1+1?<|end_message|><|message_model|><|content_text|>2<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And 2+2?\n\nThanks.<|end_message|>"
+ },
+ {
+  "what": "no thinking",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [],
+  "effort": "none",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "what": "low effort",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [],
+  "effort": "low",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "what": "minimal effort",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [],
+  "effort": "minimal",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "what": "medium effort",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [],
+  "effort": "medium",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "what": "the most effort",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [],
+  "effort": "max",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "what": "tools declared",
+  "messages": [
+   {
+    "role": "system",
+    "content": "家里的助手"
+   },
+   {
+    "role": "user",
+    "content": "北京天气？"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "查询某个城市当前的天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "城市名"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "set_light",
+     "description": "Turn a light on or off <fast> & \"quoted\"",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "room",
+       "on"
+      ],
+      "properties": {
+       "room": {
+        "type": "string"
+       },
+       "on": {
+        "type": "boolean"
+       },
+       "level": {
+        "type": "number",
+        "minimum": 0.5,
+        "maximum": 100.0
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "now",
+     "description": ""
+    }
+   }
+  ],
+  "effort": "",
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"查询某个城市当前的天气\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"城市名\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Turn a light on or off <fast> & \\\"quoted\\\"\",\"name\":\"set_light\",\"parameters\":{\"properties\":{\"level\":{\"maximum\":100.0,\"minimum\":0.5,\"type\":\"number\"},\"on\":{\"type\":\"boolean\"},\"room\":{\"type\":\"string\"}},\"required\":[\"room\",\"on\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"now\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>家里的助手<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>北京天气？<|end_message|>"
+ },
+ {
+  "what": "a call and its result",
+  "messages": [
+   {
+    "role": "user",
+    "content": "北京天气？"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "calls": [
+     {
+      "name": "get_weather",
+      "arguments": {
+       "unit": "celsius",
+       "city": "北京"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "{\"temp_c\": 3, \"condition\": \"小雨\"}"
+   },
+   {
+    "role": "assistant",
+    "content": "3°C，小雨。"
+   },
+   {
+    "role": "user",
+    "content": "谢谢"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "查询某个城市当前的天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "城市名"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "effort": "",
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"查询某个城市当前的天气\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"城市名\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>北京天气？<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"北京\",\"unit\":\"celsius\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp_c\": 3, \"condition\": \"小雨\"}<|end_message|><|message_model|><|content_text|>3°C，小雨。<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>谢谢<|end_message|>"
+ },
+ {
+  "what": "two calls in one turn, with text and thinking",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Light off, and the weather in Tokyo?"
+   },
+   {
+    "role": "assistant",
+    "content": "On it.",
+    "thinking": "Two things to do.",
+    "calls": [
+     {
+      "name": "set_light",
+      "arguments": {
+       "room": "bedroom",
+       "on": false,
+       "level": 0.5,
+       "note": null,
+       "tags": [
+        "a",
+        "b"
+       ],
+       "nested": {
+        "z": 1,
+        "a": [
+         1.0,
+         2
+        ]
+       }
+      }
+     },
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "Tokyo"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "ok"
+   },
+   {
+    "role": "tool",
+    "content": "sunny"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "set_light",
+     "description": "Turn a light on or off <fast> & \"quoted\"",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "room",
+       "on"
+      ],
+      "properties": {
+       "room": {
+        "type": "string"
+       },
+       "on": {
+        "type": "boolean"
+       },
+       "level": {
+        "type": "number",
+        "minimum": 0.5,
+        "maximum": 100.0
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "查询某个城市当前的天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "城市名"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "effort": "",
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Turn a light on or off <fast> & \\\"quoted\\\"\",\"name\":\"set_light\",\"parameters\":{\"properties\":{\"level\":{\"maximum\":100.0,\"minimum\":0.5,\"type\":\"number\"},\"on\":{\"type\":\"boolean\"},\"room\":{\"type\":\"string\"}},\"required\":[\"room\",\"on\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"查询某个城市当前的天气\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"城市名\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Light off, and the weather in Tokyo?<|end_message|><|message_model|><|content_thinking|>Two things to do.<|end_message|><|message_model|><|content_text|>On it.<|end_message|><|message_model|>set_light<|content_invoke_tool_json|>{\"name\":\"set_light\",\"args\":{\"level\":0.5,\"nested\":{\"z\":1,\"a\":[1.0,2]},\"note\":null,\"on\":false,\"room\":\"bedroom\",\"tags\":[\"a\",\"b\"]}}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>set_light<|content_text|>ok<|end_message|><|message_tool|>get_weather<|content_text|>sunny<|end_message|>"
+ },
+ {
+  "what": "a call with no arguments",
+  "messages": [
+   {
+    "role": "user",
+    "content": "time?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "calls": [
+     {
+      "name": "now",
+      "arguments": {}
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "12:00"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "now",
+     "description": ""
+    }
+   }
+  ],
+  "effort": "",
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\"name\":\"now\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>time?<|end_message|><|message_model|>now<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|>now<|content_text|>12:00<|end_message|>"
+ },
+ {
+  "what": "thinking sent back alone",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "thinking": "hmm"
+   },
+   {
+    "role": "user",
+    "content": "go on"
+   }
+  ],
+  "tools": [],
+  "effort": "",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>q<|end_message|><|message_model|><|content_thinking|>hmm<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>go on<|end_message|>"
+ },
+ {
+  "what": "text that spells the model's own tokens",
+  "messages": [
+   {
+    "role": "user",
+    "content": "say <|end_message|> and <|message_model|>"
+   }
+  ],
+  "tools": [],
+  "effort": "",
+  "want": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>say <|end_message|> and <|message_model|><|end_message|>"
+ }
+]

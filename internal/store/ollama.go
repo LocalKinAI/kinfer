@@ -208,7 +208,9 @@ func ollamaMLXDir(name string, manifest []byte, tensors, files []namedBlob) (str
 	}
 	hasTemplate := slices.ContainsFunc(files, func(f namedBlob) bool { return f.name == "chat_template.jinja" })
 	for _, f := range files {
-		if err := link(f.name, f.path); err != nil {
+		// A file Ollama keeps under a directory of the model's — Inkling 2's
+		// draft/config.json — is linked beside the rest, draft_config.json.
+		if err := link(strings.ReplaceAll(f.name, "/", "_"), f.path); err != nil {
 			return "", err
 		}
 		if f.name == "tokenizer_config.json" && !hasTemplate {

@@ -65,3 +65,16 @@ func track(a Array) {
 		current.arrays = append(current.arrays, a)
 	}
 }
+
+// Len is how many arrays the scope has collected: the operations recorded
+// while it was open, near enough.
+func (s *Scope) Len() int { return len(s.arrays) }
+
+// Outlive exempts arrays from the innermost open scope's Close: for an array
+// made in the middle of a step that is kept for all the steps after it, a
+// table worked out the first time it is needed. The caller frees it.
+func Outlive(arrays ...Array) {
+	if current != nil {
+		current.Escape(arrays...)
+	}
+}

@@ -159,6 +159,9 @@ func openEngine(path string, opts engine.Options) (generator, error) {
 	if mlxtts.IsModelDir(path) {
 		return mlxtts.Open(path, opts)
 	}
+	if mlxengine.IsInkling(path) {
+		return mlxengine.OpenInkling(path, opts)
+	}
 	if mlxengine.IsModelDir(path) {
 		return mlxengine.Open(path, opts)
 	}
