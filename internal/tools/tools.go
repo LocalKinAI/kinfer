@@ -305,6 +305,86 @@ func (f Format) Parse(reply string) (content string, calls []Call) {
 	return strings.TrimSpace(text.String()), calls
 }
 
+// ParseFor is Parse for a reply to a request that declared ts, with each
+// call's arguments brought to the type its function declares where the model
+// wrote that type as text.
+//
+// It is for one thing: a parameter declared boolean that the model wrote the
+// way Python prints it. Qwen writes True and False in a <parameter>, which
+// read as text is the string "True" — and a caller that asks for a boolean
+// and tests it gets a string that is true whichever it says. Where a grammar
+// holds the reply (FunctionXMLGrammar) the model cannot write that; an engine
+// without one can, and did: qwen3.8:27b on MLX turned a light "on": "False".
+// A parameter declared anything else, a function the request did not
+// declare, and a string that is not one of the two words are left as written.
+func (f Format) ParseFor(reply string, ts []Tool) (content string, calls []Call) {
+	content, calls = f.Parse(reply)
+	for i := range calls {
+		calls[i].Arguments = asDeclared(calls[i], ts)
+	}
+	return content, calls
+}
+
+// asDeclared is c's arguments with the booleans its function declares, and
+// the model wrote as "True" or "False" in any case, made booleans. Nothing
+// else is touched, and arguments with nothing to change come back as they
+// were, byte for byte.
+func asDeclared(c Call, ts []Tool) json.RawMessage {
+	var params json.RawMessage
+	for _, t := range ts {
+		if t.Function.Name == c.Name {
+			params = t.Function.Parameters
+			break
+		}
+	}
+	props, err := properties(params)
+	if err != nil || len(props) == 0 {
+		return c.Arguments
+	}
+	boolean := map[string]bool{}
+	for _, p := range props {
+		var s struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(p.schema, &s) == nil && s.Type == "boolean" {
+			boolean[p.name] = true
+		}
+	}
+	if len(boolean) == 0 {
+		return c.Arguments
+	}
+	fields := objectFields(c.Arguments)
+	changed := false
+	for i, fd := range fields {
+		var text string
+		if !boolean[fd.key] || json.Unmarshal(fd.value, &text) != nil {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "true":
+			fields[i].value, changed = json.RawMessage("true"), true
+		case "false":
+			fields[i].value, changed = json.RawMessage("false"), true
+		}
+	}
+	if !changed {
+		return c.Arguments
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, fd := range fields {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		k, _ := json.Marshal(fd.key)
+		b.Write(k)
+		b.WriteByte(':')
+		b.Write(fd.value)
+	}
+	b.WriteByte('}')
+	return json.RawMessage(b.String())
+}
+
 func (f Format) parseBody(body string) (Call, bool) {
 	if f == FunctionXML {
 		return parseFunctionXML(body)

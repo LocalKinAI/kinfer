@@ -740,7 +740,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		// block, and a <tool_call> it merely considered there is not one it
 		// made.
 		thinking, answer := chat.SplitThinking(text)
-		content, calls := eng.ToolFormat().Parse(answer)
+		content, calls := eng.ToolFormat().ParseFor(answer, req.Tools)
 		reason := doneReason(st)
 		if len(calls) > 0 {
 			reason = "tool_calls"
@@ -853,7 +853,7 @@ func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	}.withTimings(st, load, time.Since(start))
 	if len(req.Tools) > 0 && genErr == nil {
 		_, answer := chat.SplitThinking(text)
-		if _, cs := eng.ToolFormat().Parse(answer); len(cs) > 0 {
+		if _, cs := eng.ToolFormat().ParseFor(answer, req.Tools); len(cs) > 0 {
 			final.Message.ToolCalls = wireCalls(cs)
 			final.DoneReason = "tool_calls"
 		}
@@ -1312,7 +1312,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		thinking, answer := chat.SplitThinking(text)
-		content, calls := eng.ToolFormat().Parse(answer)
+		content, calls := eng.ToolFormat().ParseFor(answer, req.Tools)
 
 		msg := map[string]any{"role": "assistant", "content": content}
 		if wantThinking(req.Think) && thinking != "" {
@@ -1435,7 +1435,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			chunk(map[string]any{"content": rest}, nil)
 		}
 		_, answer := chat.SplitThinking(text)
-		if _, cs := eng.ToolFormat().Parse(answer); len(cs) > 0 {
+		if _, cs := eng.ToolFormat().ParseFor(answer, req.Tools); len(cs) > 0 {
 			// OpenAI streams calls as deltas carrying an index; all of them fit
 			// in one delta here because they are only known once complete.
 			wire := make([]any, len(cs))

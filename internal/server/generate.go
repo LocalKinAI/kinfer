@@ -60,7 +60,7 @@ func generate(ctx context.Context, eng generator, msgs []chat.Message, p engine.
 	thinking, answer := chat.SplitThinking(text)
 	r := reply{Thinking: thinking, Content: answer, Stats: st}
 	if withTools {
-		r.Content, r.Calls = eng.ToolFormat().Parse(answer)
+		r.Content, r.Calls = eng.ToolFormat().ParseFor(answer, p.Tools)
 	}
 	return r, nil
 }

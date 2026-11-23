@@ -274,3 +274,58 @@ func TestNoneParsesNothing(t *testing.T) {
 		t.Error("the reply was altered")
 	}
 }
+
+// A boolean a model wrote as Python prints it is a boolean to the caller, and
+// nothing else about the call changes.
+func TestParseForMakesDeclaredBooleansBooleans(t *testing.T) {
+	light := Tool{Type: "function", Function: Function{Name: "set_light", Parameters: json.RawMessage(
+		`{"type":"object","properties":{"room":{"type":"string"},"on":{"type":"boolean"},"brightness":{"type":"integer"},"note":{"type":"string"},"maybe":{"type":["boolean","null"]}},"required":["room","on"]}`)}}
+	ts := []Tool{light}
+
+	for _, c := range []struct {
+		what, reply, want string
+		f                 Format
+	}{
+		{"True in a parameter", "<tool_call>\n<function=set_light>\n<parameter=room>\n客厅\n</parameter>\n<parameter=on>\nTrue\n</parameter>\n<parameter=brightness>\n30\n</parameter>\n</function>\n</tool_call>",
+			`{"brightness":30,"on":true,"room":"客厅"}`, FunctionXML},
+		{"False in a parameter", "<tool_call>\n<function=set_light>\n<parameter=room>\nbedroom\n</parameter>\n<parameter=on>\nFalse\n</parameter>\n</function>\n</tool_call>",
+			`{"on":false,"room":"bedroom"}`, FunctionXML},
+		{"already a boolean", "<tool_call>\n<function=set_light>\n<parameter=room>\nbedroom\n</parameter>\n<parameter=on>\nfalse\n</parameter>\n</function>\n</tool_call>",
+			`{"on":false,"room":"bedroom"}`, FunctionXML},
+		{"a string parameter that says True stays a string", "<tool_call>\n<function=set_light>\n<parameter=room>\nstudy\n</parameter>\n<parameter=on>\ntrue\n</parameter>\n<parameter=note>\nTrue\n</parameter>\n</function>\n</tool_call>",
+			`{"note":"True","on":true,"room":"study"}`, FunctionXML},
+		{"another word is left for the caller to refuse", "<tool_call>\n<function=set_light>\n<parameter=room>\nstudy\n</parameter>\n<parameter=on>\nyes\n</parameter>\n</function>\n</tool_call>",
+			`{"on":"yes","room":"study"}`, FunctionXML},
+		{"a parameter of two types is not guessed at", "<tool_call>\n<function=set_light>\n<parameter=room>\nstudy\n</parameter>\n<parameter=on>\ntrue\n</parameter>\n<parameter=maybe>\nTrue\n</parameter>\n</function>\n</tool_call>",
+			`{"maybe":"True","on":true,"room":"study"}`, FunctionXML},
+		{"JSON arguments keep their order", `<tool_call>{"name": "set_light", "arguments": {"room": "客厅", "on": "False", "brightness": 10}}</tool_call>`,
+			`{"room":"客厅","on":false,"brightness":10}`, Hermes},
+	} {
+		_, calls := c.f.ParseFor(c.reply, ts)
+		if len(calls) != 1 {
+			t.Errorf("%s: %d calls", c.what, len(calls))
+			continue
+		}
+		if got := string(calls[0].Arguments); got != c.want {
+			t.Errorf("%s:\n got %s\nwant %s", c.what, got, c.want)
+		}
+	}
+
+	// A function the request did not declare, and arguments with nothing to
+	// change, come back exactly as Parse gives them.
+	for _, reply := range []string{
+		"<tool_call>\n<function=other>\n<parameter=on>\nTrue\n</parameter>\n</function>\n</tool_call>",
+		`<tool_call>{"name": "set_light", "arguments": {"room":  "客厅",   "on": true}}</tool_call>`,
+	} {
+		for _, f := range []Format{FunctionXML, Hermes} {
+			_, plain := f.Parse(reply)
+			_, typed := f.ParseFor(reply, ts)
+			if len(plain) != len(typed) || (len(plain) == 1 && string(plain[0].Arguments) != string(typed[0].Arguments)) {
+				t.Errorf("%v %q: ParseFor changed %v to %v", f, reply, plain, typed)
+			}
+		}
+	}
+	if _, calls := FunctionXML.ParseFor("<tool_call>\n<function=set_light>\n<parameter=on>\nTrue\n</parameter>\n</function>\n</tool_call>", nil); len(calls) != 1 || string(calls[0].Arguments) != `{"on":"True"}` {
+		t.Errorf("with no tools declared: %v", calls)
+	}
+}
