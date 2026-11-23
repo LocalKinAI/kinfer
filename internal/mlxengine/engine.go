@@ -99,6 +99,8 @@ type Engine struct {
 	// ahead and behind count the passes that were recorded before the one
 	// before them was read, and the ones that had to be recorded after.
 	ahead, behind atomic.Int64
+	// together is whether replies writing at once draft too (passDepth).
+	together bool
 }
 
 type job struct {
@@ -225,6 +227,10 @@ func Open(dir string, opts engine.Options) (*Engine, error) {
 			e.depth.fixed = e.drafts
 			log.Printf("draft: a reply writing alone drafts up to %d tokens a step with the model's MTP head — -draft -1 turns it off", e.drafts)
 		}
+	}
+	e.together = e.drafts > 0 && os.Getenv("KINFER_MLX_DRAFT_TOGETHER") != "off"
+	if e.together {
+		log.Printf("draft: replies writing together draft too, as many tokens each as keep a pass within %d rows (KINFER_MLX_DRAFT_TOGETHER=off: only a reply alone drafts)", passRows)
 	}
 	log.Printf("mlx: %s loaded in %v — %d layers, %d slots × %d tokens, %d prefix entries, template %s",
 		filepath.Base(dir), time.Since(start).Round(time.Millisecond), model.Config.NumHiddenLayers,
@@ -373,15 +379,11 @@ func (e *Engine) run() {
 		e.model.Free()
 	}()
 
-	// pending is the step in flight: its tokens, still on the GPU, one per
-	// batch row. While it is pending the next step can already be recorded
-	// with those tokens as its input, so the GPU never waits for the host.
-	var pending mlx.Array
-	defer func() {
-		if pending != 0 {
-			pending.Free()
-		}
-	}()
+	// pending is the step in flight: its tokens, still on the GPU. While it
+	// is pending the next step can already be recorded with those tokens as
+	// its input, so the GPU never waits for the host.
+	var pending *flight
+	defer func() { pending.free() }()
 	fail := func(err error) {
 		for _, j := range rows {
 			if j != nil {
@@ -389,27 +391,22 @@ func (e *Engine) run() {
 			}
 		}
 		rows = nil
-		if pending != 0 {
-			pending.Free()
-			pending = 0
-		}
+		pending.free()
+		pending = nil
 		batch.Free()
 	}
 	// settle reads the pending step's tokens and hands each row its own.
 	settle := func() {
-		if pending == 0 {
+		if pending == nil {
 			return
 		}
 		t := time.Now()
-		toks, err := readTokens(pending)
-		pending.Free()
-		pending = 0
+		err := e.land(batch, rows, pending)
+		pending = nil
 		e.prof.add(&e.prof.step, t)
 		if err != nil {
 			fail(err)
-			return
 		}
-		e.leave(batch, rows, toks)
 	}
 	active := func() int {
 		n := 0
@@ -449,8 +446,10 @@ func (e *Engine) run() {
 			// flight is finished first and the next one starts from the host.
 			settle()
 			t := time.Now()
+			// A reply that may draft, alone or with the others, has the head
+			// read its prompt too.
 			alone := e.drafts > 0 && active() == 0 && len(e.jobs) == 0
-			c := e.prefill(j, alone)
+			c := e.prefill(j, alone || e.together)
 			e.prof.add(&e.prof.prefill, t)
 			if c == nil {
 				continue
@@ -465,6 +464,9 @@ func (e *Engine) run() {
 			t = time.Now()
 			// Room for this burst: the rows in use, this one, and the
 			// replies queued behind it.
+			if batch.Len() == 0 {
+				batch.Drafting = e.together
+			}
 			r, err := batch.Add(c, min(e.slots, active()+1+len(e.jobs)))
 			e.prof.add(&e.prof.join, t)
 			if err != nil {
@@ -517,19 +519,94 @@ func (e *Engine) run() {
 			fail(err)
 			continue
 		}
-		if pending == 0 {
+		if pending == nil {
 			pending = next
 			continue
 		}
-		toks, err := readTokens(pending)
-		pending.Free()
+		err = e.land(batch, rows, pending)
 		pending = next
 		if err != nil {
 			fail(err)
+		}
+	}
+}
+
+// passRows is the most rows — replies times the tokens each reads — a pass of
+// replies drafting together has. On the M3 Ultra, with Qwen3.8-27B, eight
+// rows through the weights cost little more than four and twelve nearly twice
+// as much: MLX multiplies up to eight rows by quantized weights with one
+// kernel and more with another.
+const passRows = 8
+
+// passDepth is how many tokens each row of b drafts in its next pass: as many
+// as keep the pass within passRows, so three for two replies, one for three or
+// four, none for more. None either while a reply has penalties on: they read
+// the tokens before each one, which a pass recorded ahead does not have.
+func (e *Engine) passDepth(b *mlxmodel.Qwen35Batch, rows []*job) int {
+	if !b.Drafting || b.Len() == 0 {
+		return 0
+	}
+	d := min(e.drafts, passRows/b.Len()-1)
+	if d <= 0 {
+		return 0
+	}
+	for _, j := range rows {
+		if j != nil && sampling.PenaltiesOn(j.params.Params) {
+			return 0
+		}
+	}
+	return d
+}
+
+// A flight is a step of the batch recorded and started, not yet read: toks
+// are the tokens it writes, one a row for a plain step; for a pass that
+// checks drafts, each row's at each of the L positions it read, with how
+// many of its drafts each row kept and the token each reads next.
+type flight struct {
+	toks, kept, next mlx.Array
+	L                int
+}
+
+func (f *flight) free() {
+	if f == nil {
+		return
+	}
+	for _, a := range []mlx.Array{f.toks, f.kept, f.next} {
+		if a != 0 {
+			a.Free()
+		}
+	}
+	*f = flight{}
+}
+
+// land reads f and gives each row what it wrote, releasing the rows whose
+// reply ended.
+func (e *Engine) land(batch *mlxmodel.Qwen35Batch, rows []*job, f *flight) (err error) {
+	defer f.free()
+	defer mlx.Recover(&err)
+	toks := f.toks.Int32s()
+	if f.kept == 0 {
+		e.leave(batch, rows, toks)
+		return nil
+	}
+	kept := f.kept.Int32s()
+	for r, j := range rows {
+		if j == nil {
 			continue
 		}
-		e.leave(batch, rows, toks)
+		n := int(kept[r])
+		e.drafted.Add(int64(f.L - 1))
+		for i := 0; i <= n; i++ {
+			if !e.accept(j, toks[r*f.L+i]) {
+				batch.Release(r)
+				rows[r] = nil
+				n = i
+				break
+			}
+		}
+		e.accepted.Add(int64(n))
 	}
+	return nil
 }
 
 // maxDrafts is the most tokens a step drafts when -draft does not say; how
@@ -892,11 +969,6 @@ func (e *Engine) closing() bool {
 	}
 }
 
-func readTokens(a mlx.Array) (toks []int32, err error) {
-	defer mlx.Recover(&err)
-	return a.Int32s(), nil
-}
-
 // leave gives each row its token and releases the rows whose reply ended.
 func (e *Engine) leave(batch *mlxmodel.Qwen35Batch, rows []*job, toks []int32) {
 	for r, j := range rows {
@@ -1004,10 +1076,11 @@ func (e *Engine) prefill(j *job, drafting bool) *mlxmodel.Qwen35Cache {
 	return c
 }
 
-// step records one decode step for rows and starts it, returning its tokens
-// unevaluated. in is the previous step's tokens when they are still on the
-// GPU, or 0 to take each row's last token from the host.
-func (e *Engine) step(b *mlxmodel.Qwen35Batch, rows []*job, in mlx.Array) (next mlx.Array, err error) {
+// step records one decode step for rows and starts it, returning it in
+// flight. in is the step before it when that is still on the GPU — its
+// tokens are then this one's input without the host having seen them — or
+// nil to take each row's last token from the host.
+func (e *Engine) step(b *mlxmodel.Qwen35Batch, rows []*job, in *flight) (f *flight, err error) {
 	defer mlx.Recover(&err)
 	s := mlx.NewScope()
 	defer s.Close()
@@ -1021,9 +1094,12 @@ func (e *Engine) step(b *mlxmodel.Qwen35Batch, rows []*job, in mlx.Array) (next 
 		}
 	}
 	var y mlx.Array
-	if in != 0 {
-		y = mlx.Reshape(in, len(rows), 1)
-	} else {
+	switch {
+	case in != nil && in.next != 0:
+		y = in.next
+	case in != nil:
+		y = mlx.Reshape(in.toks, len(rows), 1)
+	default:
 		last := make([]int32, len(rows))
 		for r, j := range rows {
 			if j != nil {
@@ -1032,27 +1108,43 @@ func (e *Engine) step(b *mlxmodel.Qwen35Batch, rows []*job, in mlx.Array) (next 
 		}
 		y = mlx.FromInt32(last, len(rows), 1)
 	}
-	logits := b.Step(y)
-	params := make([]sampling.Params, len(rows))
-	hist := make([][]int32, len(rows))
-	rngs := make([]*rand.Rand, len(rows))
+	d := e.passDepth(b, rows)
+	L := d + 1
+	var logits mlx.Array
+	if b.Plain() {
+		logits = b.Step(y)
+	} else {
+		logits = b.Pass(y, d)
+	}
+	// Each row samples at every position it read, as it would there.
+	params := make([]sampling.Params, len(rows)*L)
+	hist := make([][]int32, len(rows)*L)
+	rngs := make([]*rand.Rand, len(rows)*L)
 	for r, j := range rows {
 		if j == nil {
 			j = model
 		}
-		params[r], hist[r], rngs[r] = j.params.Params, j.history(), j.rng
+		for i := 0; i < L; i++ {
+			params[r*L+i], hist[r*L+i], rngs[r*L+i] = j.params.Params, j.history(), j.rng
+		}
 	}
-	next = sampleGraph(logits, params, hist, rngs)
-	s.Keep(next)
+	f = &flight{toks: sampleGraph(logits, params, hist, rngs)}
+	out := []mlx.Array{f.toks}
+	if !b.Plain() {
+		f.next, f.kept = b.Settle(f.toks)
+		f.L = L
+		out = append(out, f.next, f.kept)
+	}
+	s.Keep(out...)
 	// A few rows' step fits in a few command buffers, so the one after it can
 	// be queued while it runs; a wide batch keeps the GPU busy as it is, and
 	// what its buffers would hold meanwhile is no longer small.
-	if out := append([]mlx.Array{next}, b.Arrays()...); len(rows) <= stepRows {
+	if out = append(out, b.Arrays()...); len(rows)*L <= stepRows {
 		mlx.AsyncEvalStep(out...)
 	} else {
 		mlx.AsyncEval(out...)
 	}
-	return next, nil
+	return f, nil
 }
 
 func (e *Engine) sample(logits mlx.Array, rows []*job) (toks []int32, err error) {

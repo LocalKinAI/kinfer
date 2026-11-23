@@ -144,6 +144,46 @@ reply drafted to another depth can differ from the same reply drafted to
 five where two tokens were all but equally likely, which is why it is not
 the default.
 
+### Faster — replies writing together on MLX draft too
+
+Until now only a reply with an MLX model to itself drafted with the model's
+MTP head; a second request ended that for both. Now two to four replies
+writing together draft as well: every pass each reads the token it is sure of
+and its drafts after it, all of them through the weights once, and each keeps
+the drafts that are what it would have written itself. A pass is kept to
+eight rows — replies times the tokens each reads — because on the Mac Studio
+eight rows through a 27B model's weights cost little more than four (40 ms
+against 38) and twelve nearly twice as much: so three drafts each for two
+replies, one each for three or four, none for five or more, whose steps are
+as they were. The pass after is recorded and started before this one is
+read, as a plain step is, with what each row kept worked out on the GPU.
+
+On the Mac Studio (M3 Ultra), qwen3.8:27b-mlx, 4 slots, a quiet GPU, in
+tok/s in all, before → now:
+
+| | before | now |
+|---|---|---|
+| 2 at once, Chinese essays | 65 | 80–86 |
+| 3 at once, Chinese essays | 88 | 101 |
+| 4 at once, Chinese essays | 99 | 126 |
+| 2 at once, an essay and code | 57 | 105 |
+| 4 at once, four kinds of request | 91 | 130 |
+| 8 at once (8 slots) | 173 | 172 |
+
+One at a time is unchanged — the same 12 replies to the character, and the
+same fingerprints as the code before on five models. Replies writing together
+were never to the character what each is alone (two tokens all but equally
+likely fall either way with the size of the batch, before as now), and are
+not now. Requests with a repeat or presence penalty do not draft together:
+the penalty reads the tokens before each one, which a pass recorded ahead
+does not have. A prompt is read with the head whenever the model drafts, not
+only for a reply that starts alone. `KINFER_MLX_DRAFT_TOGETHER=off` is the
+way it was.
+
+Fixed on the way: when a reply that had been drafting alone was joined by a
+second, the head's keys and values for it were dropped without being freed —
+33 MB at 8,000 tokens of context, each time.
+
 ### Measured — against Ollama 0.40.17 on MLX, and a quiet GPU
 
 On the Mac Studio (M3 Ultra), qwen3.8:27b-mlx from the same files, 2026-11-22,
@@ -155,11 +195,13 @@ with the changes above; the two run in the same hour unless said:
 | one at a time, six kinds of request, mean | 62 tok/s | 61–67 (three runs) |
 | — a Chinese essay, an English one | 41, 51 | **55, 58** |
 | — code, worked arithmetic | **90, 81** | 72–78, 71–90 |
-| 4 at once, Ollama as it sets itself up (262,144 context: one at a time) | **99 tok/s** in all | 54 (the night before) |
-| 4 at once, Ollama's context 32,768 (it takes four) | 99 | **104–116** (the night before) |
+| 4 at once, Ollama as it sets itself up (262,144 context: one at a time) | **126 tok/s** in all | 54 (the night before) |
+| 2 at once, Ollama's context 32,768 and four in parallel: Chinese essays; an essay and code | **80**; **100–105** | 71–74; 86–89 |
+| 4 at once, the same: Chinese essays; four kinds of request | **127**; **130** | 111–115; 120–122 |
 
 Ollama drafts for every reply at once, and as few tokens a pass as the text
-pays for; kinfer on MLX drafts five for a reply writing alone. The machine's
+pays for; kinfer on MLX drafts five for a reply writing alone, and three or
+one for two to four writing together. The machine's
 speed moves by a tenth between hours, so only what ran in the same hour is
 compared: the night before, Ollama averaged 64 over the six kinds and kinfer
 as it then was 52; this morning the same two averaged 63 to 67 and 56. What

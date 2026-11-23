@@ -736,3 +736,104 @@ func TestQwen35PrefillTime(t *testing.T) {
 			float64(n)/el.Seconds(), float64(mem.Peak-before)/1e9, float64(before)/1e9)
 	}
 }
+
+// TestQwen35RowsPassCost times a pass that checks drafts for several rows at
+// once: KINFER_MLX_ROWS is a list of rows x drafts ("4x2,8x1"). The rows have
+// read prompts of one length; every pass the head drafts for all of them, the
+// model reads each row's token and its drafts, and each row keeps half of
+// them (the same number, so one Keep serves). What it says is what a pass
+// costs, not how often drafts are kept.
+func TestQwen35RowsPassCost(t *testing.T) {
+	lib, dir, list := os.Getenv("KINFER_MLX_LIB"), os.Getenv("KINFER_MLX_MODEL"), os.Getenv("KINFER_MLX_ROWS")
+	if lib == "" || dir == "" || list == "" {
+		t.Skip("KINFER_MLX_LIB, KINFER_MLX_MODEL and KINFER_MLX_ROWS not all set")
+	}
+	if err := mlx.Open(lib); err != nil {
+		t.Fatal(err)
+	}
+	m, err := LoadQwen35(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	if !m.CanDraft() {
+		t.Skip("the model has no MTP head")
+	}
+	const passes, warm = 24, 4
+	H := m.Config.HiddenSize
+	for _, f := range strings.Split(list, ",") {
+		var B, d int
+		if _, err := fmt.Sscanf(f, "%dx%d", &B, &d); err != nil {
+			t.Fatal(err)
+		}
+		prompts := make([][]int32, B)
+		for r := range prompts {
+			prompts[r] = make([]int32, 100)
+			for i := range prompts[r] {
+				prompts[r][i] = int32(1000 + ((i+7*r)*104729)%50000)
+			}
+		}
+		c := m.NewCache()
+		c.Drafting = true
+		lg, err := m.Forward(prompts, c, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := mlx.Astype(mlx.Argmax(lg, -1, true), mlx.Int32) // [B, 1]
+		lg.Free()
+		keep := d / 2
+		var start time.Time
+		for i := 0; i < passes+warm; i++ {
+			if i == warm {
+				mlx.Eval(tok)
+				start = time.Now()
+			}
+			drafts, err := m.DraftFrom(c, tok, d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mark := c.Mark()
+			logits, hidden, err := m.VerifyFrom(tok, drafts, c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := mlx.NewScope()
+			best := mlx.Astype(mlx.Argmax(mlx.Reshape(logits, B, d+1, m.Config.VocabSize), -1, false), mlx.Int32) // [B, d+1]
+			next := mlx.Contiguous(mlx.Slice(best, []int{0, keep}, []int{B, keep + 1}))
+			s.Escape(best, next)
+			s.Close()
+			out := append([]mlx.Array{hidden, best, next}, c.Arrays()...)
+			if drafts != 0 {
+				out = append(out, drafts)
+			}
+			mlx.EvalStep(out...)
+			best.Int32s()
+			if drafts != 0 {
+				drafts.Free()
+			}
+			best.Free()
+			logits.Free()
+			tok.Free()
+			tok = next
+			if err := c.Keep(mark, keep, hidden); err != nil {
+				t.Fatal(err)
+			}
+			if keep < d {
+				// Keep takes the head's state for one row; here every row's.
+				s := mlx.NewScope()
+				hh := mlx.Contiguous(mlx.Slice(mlx.Reshape(hidden, B, d+1, H), []int{0, keep, 0}, []int{B, keep + 1, H}))
+				s.Escape(hh)
+				s.Close()
+				c.headH.Free()
+				c.headH = hh
+			}
+			hidden.Free()
+		}
+		el := time.Since(start)
+		tok.Free()
+		c.Free()
+		ms := float64(el.Microseconds()) / 1000 / passes
+		t.Logf("%d rows x %d drafts (%d kept): %.1f ms a pass; %d token-rows, %.0f tok/s with the kept, %.0f with all, %.0f with none",
+			B, d, keep, ms, B*(d+1), float64(B*(1+keep))/ms*1000, float64(B*(1+d))/ms*1000, float64(B)/ms*1000)
+	}
+}

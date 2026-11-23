@@ -22,20 +22,40 @@ import (
 // departure. A released row keeps being computed, uselessly, until a newcomer
 // is written into it or Compact drops the free rows in one copy. The columns
 // a long sequence leaves behind are cut when the next sequence joins.
+//
+// A batch whose rows draft (Drafting) is described in batch_draft.go: its
+// keys and values have one more entry, the MTP head's, after the layers'.
 type Qwen35Batch struct {
 	m           *Qwen35
 	conv, state []mlx.Array
-	keys, vals  []mlx.Array
+	keys, vals  []mlx.Array // per layer, then the head's
 	idx         int
 	pad         []int
 	free        []bool
+
+	// Drafting is set, before the first row joins, for a batch whose rows
+	// draft with the MTP head: every pass then feeds the head too, and each
+	// row's head state is headH, [B, 1, hidden]. A row that joins with a head
+	// that has not read all its model has ends it for the batch.
+	Drafting bool
+	headH    mlx.Array
+	// valid and pos are there once the batch has run a Pass: valid[r][c] is
+	// 1 where column c holds a token row r kept, [B, capacity] int32, and
+	// pos[r] is how many tokens row r has read, [B] int32. Until then every
+	// column from pad[r] on is the row's and pos is idx - pad.
+	valid, pos mlx.Array
+	// last is the pass Settle has still to be told the outcome of.
+	last *passed
+	// hv and hp are valid and pos on the host while rows join and leave.
+	hv [][]int32
+	hp []int32
 }
 
 // NewBatch makes an empty batch.
 func (m *Qwen35) NewBatch() *Qwen35Batch {
 	n := len(m.layers)
 	return &Qwen35Batch{m: m, conv: make([]mlx.Array, n), state: make([]mlx.Array, n),
-		keys: make([]mlx.Array, n), vals: make([]mlx.Array, n)}
+		keys: make([]mlx.Array, n+1), vals: make([]mlx.Array, n+1)}
 }
 
 // Len is the number of rows, free ones included.
@@ -73,7 +93,7 @@ func (b *Qwen35Batch) Compact() (map[int]int, error) {
 // Arrays are the batch's current arrays, to evaluate with a Step's logits.
 func (b *Qwen35Batch) Arrays() []mlx.Array {
 	var r []mlx.Array
-	for _, set := range [][]mlx.Array{b.conv, b.state, b.keys, b.vals} {
+	for _, set := range [][]mlx.Array{b.conv, b.state, b.keys, b.vals, {b.headH, b.valid, b.pos}} {
 		for _, a := range set {
 			if a != 0 {
 				r = append(r, a)
@@ -88,9 +108,21 @@ func (b *Qwen35Batch) Free() {
 	for _, a := range b.Arrays() {
 		a.Free()
 	}
+	if b.last != nil {
+		b.last.free()
+	}
 	n := len(b.conv)
 	*b = Qwen35Batch{m: b.m, conv: make([]mlx.Array, n), state: make([]mlx.Array, n),
-		keys: make([]mlx.Array, n), vals: make([]mlx.Array, n)}
+		keys: make([]mlx.Array, n+1), vals: make([]mlx.Array, n+1)}
+}
+
+// rowKV is c's keys and values for the batch's entry i: a layer's, or the
+// head's.
+func (b *Qwen35Batch) rowKV(c *Qwen35Cache, i int) (keys, vals mlx.Array) {
+	if i == len(b.m.layers) {
+		return c.headKeys, c.headVals
+	}
+	return c.keys[i], c.vals[i]
 }
 
 // fill writes c, which has read n tokens, into free row r. The batch must
@@ -103,10 +135,21 @@ func (b *Qwen35Batch) fill(r int, c *Qwen35Cache) {
 		if b.keys[i] == 0 {
 			continue
 		}
-		for _, kv := range []struct{ buf, row *mlx.Array }{{&b.keys[i], &c.keys[i]}, {&b.vals[i], &c.vals[i]}} {
-			*kv.buf = mlx.SliceUpdate(*kv.buf, mlx.Slice(*kv.row, []int{0, 0, 0, 0}, []int{1, Hkv, n, D}),
+		ck, cv := b.rowKV(c, i)
+		for _, kv := range []struct {
+			buf *mlx.Array
+			row mlx.Array
+		}{{&b.keys[i], ck}, {&b.vals[i], cv}} {
+			*kv.buf = mlx.SliceUpdate(*kv.buf, mlx.Slice(kv.row, []int{0, 0, 0, 0}, []int{1, Hkv, n, D}),
 				[]int{r, 0, b.idx - n, 0}, []int{r + 1, Hkv, b.idx, D})
 		}
+	}
+	if b.headH != 0 {
+		b.headH = mlx.SliceUpdate(b.headH, c.headH, []int{r, 0, 0}, []int{r + 1, 1, mc.HiddenSize})
+	}
+	if b.hv != nil {
+		b.hv[r] = ownColumns(b.idx, n)
+		b.hp[r] = int32(n)
 	}
 	for i := range b.conv {
 		if b.conv[i] == 0 {
@@ -136,8 +179,13 @@ func (b *Qwen35Batch) Add(c *Qwen35Cache, room int) (row int, err error) {
 	defer mlx.Recover(&err)
 	scope := mlx.NewScope()
 	defer scope.Close()
-	old := b.Arrays()
 	n := c.Offset
+	if b.Len() == 0 {
+		b.Drafting = b.Drafting && c.HeadReady()
+	} else if b.Drafting && !c.HeadReady() {
+		b.StopDrafting()
+	}
+	old := b.Arrays()
 
 	if b.Len() == 0 {
 		copy(b.conv, c.conv)
@@ -147,9 +195,18 @@ func (b *Qwen35Batch) Add(c *Qwen35Cache, room int) (row int, err error) {
 		b.idx, b.pad, b.free = n, []int{0}, []bool{false}
 		c.conv, c.state, c.keys, c.vals = make([]mlx.Array, len(c.conv)), make([]mlx.Array, len(c.conv)),
 			make([]mlx.Array, len(c.conv)), make([]mlx.Array, len(c.conv))
+		if b.Drafting {
+			last := len(b.m.layers)
+			b.keys[last], b.vals[last], b.headH = c.headKeys, c.headVals, c.headH
+			c.headKeys, c.headVals, c.headH = 0, 0, 0
+		}
+		// What the batch did not take of c — the head's arrays, when the
+		// batch does not draft — goes with it.
+		c.Free()
 		return 0, nil
 	}
 
+	b.pull()
 	b.trim(b.idx - n)
 	b.makeRoom(n)
 	row = -1
@@ -164,6 +221,8 @@ func (b *Qwen35Batch) Add(c *Qwen35Cache, room int) (row int, err error) {
 	} else {
 		row = b.appendRows(c, max(0, room-b.Len()-1))
 	}
+
+	b.push()
 
 	// Our handles to the replaced arrays go before evaluating, so that MLX,
 	// seeing the graph as their only user, writes the updates into them in
@@ -213,6 +272,11 @@ func (b *Qwen35Batch) makeRoom(n int) {
 	for r := range b.pad {
 		b.pad[r] += shift
 	}
+	if shift > 0 {
+		for r := range b.hv {
+			b.hv[r] = append(make([]int32, shift), b.hv[r]...)
+		}
+	}
 	b.idx += shift
 }
 
@@ -227,12 +291,29 @@ func (b *Qwen35Batch) appendRows(c *Qwen35Cache, extra int) int {
 		if b.keys[i] == 0 {
 			continue
 		}
-		for _, kv := range []struct{ buf, row *mlx.Array }{{&b.keys[i], &c.keys[i]}, {&b.vals[i], &c.vals[i]}} {
+		ck, cv := b.rowKV(c, i)
+		for _, kv := range []struct {
+			buf *mlx.Array
+			row mlx.Array
+		}{{&b.keys[i], ck}, {&b.vals[i], cv}} {
 			capacity := (*kv.buf).Shape()[2]
 			row := mlx.Zeros((*kv.buf).Dtype(), 1+extra, Hkv, capacity, D)
-			row = mlx.SliceUpdate(row, mlx.Slice(*kv.row, []int{0, 0, 0, 0}, []int{1, Hkv, n, D}),
+			row = mlx.SliceUpdate(row, mlx.Slice(kv.row, []int{0, 0, 0, 0}, []int{1, Hkv, n, D}),
 				[]int{0, 0, b.idx - n, 0}, []int{1, Hkv, b.idx, D})
 			*kv.buf = mlx.Concatenate(0, *kv.buf, row)
+		}
+	}
+	if b.headH != 0 {
+		parts := []mlx.Array{b.headH, c.headH}
+		if extra > 0 {
+			parts = append(parts, mlx.Zeros(b.headH.Dtype(), extra, 1, mc.HiddenSize))
+		}
+		b.headH = mlx.Concatenate(0, parts...)
+	}
+	if b.hv != nil {
+		b.hv, b.hp = append(b.hv, ownColumns(b.idx, n)), append(b.hp, int32(n))
+		for k := 0; k < extra; k++ {
+			b.hv, b.hp = append(b.hv, ownColumns(b.idx, 1)), append(b.hp, 1)
 		}
 	}
 	for i := range b.conv {
@@ -287,6 +368,9 @@ func (b *Qwen35Batch) trim(most int) {
 	for r := range b.pad {
 		b.pad[r] = max(0, b.pad[r]-cut)
 	}
+	for r := range b.hv {
+		b.hv[r] = b.hv[r][cut:]
+	}
 	b.idx = n
 }
 
@@ -315,6 +399,7 @@ func (b *Qwen35Batch) Remove(rows ...int) (err error) {
 	scope := mlx.NewScope()
 	defer scope.Close()
 	old := b.Arrays()
+	b.pull()
 	idx := mlx.FromInt32(keep, len(keep))
 	for _, set := range [][]mlx.Array{b.conv, b.state, b.keys, b.vals} {
 		for i, a := range set {
@@ -323,8 +408,19 @@ func (b *Qwen35Batch) Remove(rows ...int) (err error) {
 			}
 		}
 	}
+	if b.headH != 0 {
+		b.headH = mlx.Take(b.headH, idx, 0)
+	}
+	if b.hv != nil {
+		hv, hp := make([][]int32, len(keep)), make([]int32, len(keep))
+		for i, r := range keep {
+			hv[i], hp[i] = b.hv[r], b.hp[r]
+		}
+		b.hv, b.hp = hv, hp
+	}
 	b.pad, b.free = pad, free
 	b.trim(b.idx)
+	b.push()
 
 	fresh := b.Arrays()
 	scope.Escape(fresh...)

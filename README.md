@@ -293,12 +293,6 @@ More in [docs/performance.md](docs/performance.md) and
   tok/s against 72 to 78 and 71 to 90), Ollama on prose (55 and 58 against 41
   and 51), where it drafts two tokens a pass and kinfer five. Without drafts
   the two write alike, 39 tok/s.
-- Several replies at once on MLX: Ollama 0.40.17 sizes this itself, and drafts
-  for every reply where kinfer drafts only for one writing alone. With its
-  context set to 32,768 on the Mac Studio it took four at once and wrote 104 to
-  116 tok/s in all, 114 to 120 with eight or sixteen waiting; kinfer writes 99
-  (qwen3.8:27b-mlx, 4 slots of 32,768). At its own 262,144 context it found
-  room for one and wrote 54 with four waiting.
 - A mixture of experts on MLX writes 104 tok/s alone against Ollama's 125. With
   four replies at once it was 188 against 112, measured against Ollama
   0.40.15, which took one request at a time on MLX.
