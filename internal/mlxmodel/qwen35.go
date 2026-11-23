@@ -227,6 +227,7 @@ type linearAttn struct {
 	conv                          mlx.Array // [conv_dim, K, 1]
 	dtBias, aLog                  mlx.Array
 	norm                          mlx.Array
+	nexp                          mlx.Array // -exp(A_log) in float32, [Hv]
 }
 
 type fullAttn struct {
@@ -413,6 +414,7 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 		m.all = append(m.all, a)
 		return a
 	}
+	var tmp []mlx.Array // what m.all's arrays were worked out from
 	take := func(k string) mlx.Array {
 		a := raw[k]
 		delete(raw, k)
@@ -508,6 +510,11 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 				outProj: lin(a + "out_proj"), conv: keep(mlx.Contiguous(conv)),
 				dtBias: plain(a + "dt_bias"), aLog: plain(a + "A_log"), norm: plain(a + "norm.weight"),
 			}
+			// The same for every step, so worked out once.
+			f := mlx.Astype(l.linear.aLog, mlx.Float32)
+			e := mlx.Exp(f)
+			l.linear.nexp = keep(mlx.Negative(e))
+			tmp = append(tmp, f, e)
 		} else {
 			a := p + "self_attn."
 			l.full = &fullAttn{
@@ -535,6 +542,9 @@ func LoadQwen35(dir string) (m *Qwen35, err error) {
 		}
 	}
 	mlx.Eval(m.all...)
+	for _, a := range tmp {
+		a.Free()
+	}
 	return m, nil
 }
 
@@ -698,15 +708,25 @@ func (m *Qwen35) ReadAll(tokens []int32, cache *Qwen35Cache) (logits mlx.Array, 
 func (m *Qwen35) Verify(tok int32, drafts mlx.Array, cache *Qwen35Cache) (logits, hidden mlx.Array, err error) {
 	defer mlx.Recover(&err)
 	ids := mlx.FromInt32([]int32{tok}, 1, 1)
+	defer ids.Free()
+	return m.VerifyFrom(ids, drafts, cache)
+}
+
+// VerifyFrom is Verify with the token as an array, [1, 1] int32, which may be
+// one whose number is written only before the pass is evaluated (mlx.Slot):
+// a pass recorded before the token it starts from is known.
+func (m *Qwen35) VerifyFrom(tok, drafts mlx.Array, cache *Qwen35Cache) (logits, hidden mlx.Array, err error) {
+	defer mlx.Recover(&err)
+	ids, joined := tok, false
 	if drafts != 0 {
-		all := mlx.Concatenate(1, ids, drafts)
-		ids.Free()
-		ids = all
+		ids, joined = mlx.Concatenate(1, tok, drafts), true
 	}
 	cache.keepSteps = true
 	logits, hidden = m.step(ids, cache, nil, true)
 	cache.keepSteps = false
-	ids.Free()
+	if joined {
+		ids.Free()
+	}
 	return logits, hidden, nil
 }
 
@@ -724,15 +744,13 @@ func (m *Qwen35) step(tokens mlx.Array, cache *Qwen35Cache, trace func(layer int
 	for i := range m.layers {
 		l := &m.layers[i]
 		x := mlx.RMSNorm(h, l.inNorm, m.Config.RMSNormEps)
-		var r mlx.Array
 		if l.linear != nil {
-			r = m.deltaNet(l.linear, x, cache, i)
+			h = addProjected(h, m.deltaNet(l.linear, x, cache, i), l.linear.outProj)
 		} else {
-			r = m.attention(l.full, x, cache, i)
+			h = addProjected(h, m.attention(l.full, x, cache, i), l.full.o)
 		}
-		h = mlx.Add(h, r)
 		x = mlx.RMSNorm(h, l.inPost, m.Config.RMSNormEps)
-		h = mlx.Add(h, l.mlp(x))
+		h = l.addMLP(h, x)
 		if trace != nil {
 			trace(i, h)
 		}
@@ -801,10 +819,10 @@ func (m *Qwen35) headRead(tokens, before mlx.Array, cache *Qwen35Cache) mlx.Arra
 	e := m.embed.rows(tokens)
 	x := linear(mlx.Concatenate(-1, mlx.RMSNorm(e, t.enorm, eps), mlx.RMSNorm(before, t.hnorm, eps)), t.fc)
 	kv := &Qwen35Cache{keys: []mlx.Array{cache.headKeys}, vals: []mlx.Array{cache.headVals}, Offset: cache.headOffset}
-	x = mlx.Add(x, m.attention(t.block.full, mlx.RMSNorm(x, t.block.inNorm, eps), kv, 0))
+	x = addProjected(x, m.attention(t.block.full, mlx.RMSNorm(x, t.block.inNorm, eps), kv, 0), t.block.full.o)
 	cache.headKeys, cache.headVals = kv.keys[0], kv.vals[0]
 	y := mlx.RMSNorm(x, t.block.inPost, eps)
-	x = mlx.Add(x, t.block.mlp(y))
+	x = t.block.addMLP(x, y)
 	cache.headOffset += tokens.Shape()[1]
 	return mlx.RMSNorm(x, t.norm, eps)
 }
@@ -818,13 +836,26 @@ func (m *Qwen35) headRead(tokens, before mlx.Array, cache *Qwen35Cache) mlx.Arra
 // written while drafting are written again by the pass that checks them.
 func (m *Qwen35) Draft(cache *Qwen35Cache, tok int32, n int) (drafts mlx.Array, err error) {
 	defer mlx.Recover(&err)
+	ids := mlx.FromInt32([]int32{tok}, 1, 1)
+	defer ids.Free()
+	if drafts, err = m.DraftFrom(cache, ids, n); err == nil && drafts != 0 {
+		mlx.AsyncEvalStep(drafts)
+	}
+	return drafts, err
+}
+
+// DraftFrom is Draft with the token as an array, [1, 1] int32, as VerifyFrom
+// takes it, and without starting on the drafts: the caller evaluates them
+// with the pass that checks them.
+func (m *Qwen35) DraftFrom(cache *Qwen35Cache, tok mlx.Array, n int) (drafts mlx.Array, err error) {
+	defer mlx.Recover(&err)
 	if m.mtp == nil || !cache.Drafting || cache.headH == 0 || n <= 0 {
 		return 0, nil
 	}
 	scope := mlx.NewScope()
 	defer scope.Close()
 	keys, vals, off := cache.headKeys, cache.headVals, cache.headOffset
-	t, h := mlx.FromInt32([]int32{tok}, 1, 1), cache.headH
+	t, h := tok, cache.headH
 	toks := make([]mlx.Array, n)
 	for i := range n {
 		h = m.headRead(t, h, cache)
@@ -833,7 +864,6 @@ func (m *Qwen35) Draft(cache *Qwen35Cache, tok int32, n int) (drafts mlx.Array, 
 	}
 	drafts = mlx.Concatenate(1, toks...)
 	scope.Escape(drafts)
-	mlx.AsyncEval(drafts)
 	// The buffers the drafts are written into belong to their graph; the
 	// cache keeps the ones it had, which are not written in place while
 	// these handles hold them.
@@ -897,6 +927,28 @@ func (c *Qwen35Cache) Keep(mk Mark, i int, hidden mlx.Array) (err error) {
 	return nil
 }
 
+// Branch is a second cache as c would be after Keep(mk, i, hidden), leaving c
+// as it is: where the reply would be had it kept i of the drafts of the pass
+// after mk. It shares c's arrays, as a Clone does, and what it takes back is
+// as unevaluated as Keep leaves it — so the pass after each number of drafts
+// the reply may keep can be recorded while the pass that decides is still
+// being worked out, and the one that was right evaluated the moment it is
+// known. The others are freed, and c with them, before that: a buffer two
+// caches hold is copied when one writes to it.
+func (c *Qwen35Cache) Branch(mk Mark, i int, hidden mlx.Array) (*Qwen35Cache, error) {
+	d := c.Clone()
+	for l := range c.steps {
+		if c.steps[l] != 0 {
+			d.steps[l], d.convIns[l] = c.steps[l].Ref(), c.convIns[l].Ref()
+		}
+	}
+	if err := d.Keep(mk, i, hidden); err != nil {
+		d.Free()
+		return nil, err
+	}
+	return d, nil
+}
+
 // HeadReady reports whether c's head has read everything the model has, so
 // that drafting from it is drafting from the whole conversation: false for a
 // cache whose prompt was read, or pooled, without it.
@@ -904,12 +956,12 @@ func (c *Qwen35Cache) HeadReady() bool {
 	return c.Drafting && c.headH != 0 && c.headOffset == c.Offset
 }
 
-// mlp is the layer's feed-forward part, x [B, L, hidden].
-func (l *qwen35Layer) mlp(x mlx.Array) mlx.Array {
+// addMLP is h plus the layer's feed-forward part of x, [B, L, hidden].
+func (l *qwen35Layer) addMLP(h, x mlx.Array) mlx.Array {
 	if l.moe != nil {
-		return l.moe.forward(x)
+		return mlx.Add(h, l.moe.forward(x))
 	}
-	return swiGLU(x, l.gate, l.up, l.down)
+	return addProjected(h, swiGLUIn(x, l.gate, l.up), l.down)
 }
 
 func swiGLU(x mlx.Array, gate, up, down Linear) mlx.Array {
@@ -962,6 +1014,8 @@ func gather(x mlx.Array, w Linear, idx mlx.Array, sorted bool) mlx.Array {
 	return mlx.GatherMM(x, mlx.Swapaxes(w.W, 1, 2), idx, sorted)
 }
 
+// deltaNet is a DeltaNet layer of x up to its last projection, outProj,
+// which the caller adds to the residual with (addProjected).
 func (m *Qwen35) deltaNet(w *linearAttn, x mlx.Array, cache *Qwen35Cache, i int) mlx.Array {
 	c := m.Config
 	s := x.Shape()
@@ -971,10 +1025,9 @@ func (m *Qwen35) deltaNet(w *linearAttn, x mlx.Array, cache *Qwen35Cache, i int)
 	convDim := 2*keyDim + valDim
 	K := c.LinearConvKernelDim
 
-	qkv := linear(x, w.inQKV)
-	z := mlx.Reshape(linear(x, w.inZ), B, L, Hv, Dv)
-	b := linear(x, w.inB)
-	a := linear(x, w.inA)
+	// The four projections of x, as the layer has always made them: first.
+	qkv := project(x, w.inQKV)
+	z, b, a := w.gateInputs(x)
 
 	convState := cache.conv[i]
 	if convState == 0 {
@@ -993,11 +1046,11 @@ func (m *Qwen35) deltaNet(w *linearAttn, x mlx.Array, cache *Qwen35Cache, i int)
 	// match, and fold the Dk^-0.5 readout scale into q.
 	inv := float32(1 / math.Sqrt(float64(Dk)))
 	eps := 1e-6 * inv * inv
-	q = mlx.MulScalar(mlx.RMSNorm(q, 0, eps), inv*inv)
-	k = mlx.MulScalar(mlx.RMSNorm(k, 0, eps), inv)
+	q, k = mlx.RMSNorm(q, 0, eps), mlx.RMSNorm(k, 0, eps)
+	q = mlx.Multiply(q, mlx.Const(inv*inv, q.Dtype()))
+	k = mlx.Multiply(k, mlx.Const(inv, k.Dtype()))
 
-	beta := mlx.Sigmoid(b)
-	g := mlx.Exp(mlx.Multiply(mlx.Negative(mlx.Exp(mlx.Astype(w.aLog, mlx.Float32))), mlx.Softplus(mlx.Add(a, w.dtBias))))
+	g, beta := w.deltaGates(a, b)
 
 	state := cache.state[i]
 	if state == 0 {
@@ -1016,9 +1069,8 @@ func (m *Qwen35) deltaNet(w *linearAttn, x mlx.Array, cache *Qwen35Cache, i int)
 	cache.state[i] = state
 
 	// RMSNormGated: rms_norm(y) * silu(z), the product in float32.
-	n := mlx.RMSNorm(y, w.norm, c.RMSNormEps)
-	o := mlx.Astype(mlx.Multiply(mlx.SiLU(mlx.Astype(z, mlx.Float32)), mlx.Astype(n, mlx.Float32)), y.Dtype())
-	return linear(mlx.Reshape(o, B, L, valDim), w.outProj)
+	o := w.deltaOut(mlx.RMSNorm(y, w.norm, c.RMSNormEps), z, y.Dtype())
+	return mlx.Reshape(o, B, L, valDim)
 }
 
 // gatedDelta runs the gated delta rule one step at a time, as mlx-lm's
@@ -1054,16 +1106,17 @@ func gatedDelta(q, k, v, g, beta, state mlx.Array) (mlx.Array, mlx.Array) {
 	return mlx.Stack(1, ys...), state
 }
 
+// attention is a full-attention layer of x up to its last projection, o.
 func (m *Qwen35) attention(w *fullAttn, x mlx.Array, cache *Qwen35Cache, i int) mlx.Array {
 	c := m.Config
 	s := x.Shape()
 	B, L := s[0], s[1]
 	H, Hkv, D := c.NumAttentionHeads, c.NumKeyValueHeads, c.HeadDim
 
-	qg := mlx.Split(mlx.Reshape(linear(x, w.q), B, L, H, 2*D), -1, D)
+	qg := mlx.Split(mlx.Reshape(project(x, w.q), B, L, H, 2*D), -1, D)
 	q, gate := qg[0], mlx.Reshape(qg[1], B, L, H*D)
-	k := mlx.Reshape(linear(x, w.k), B, L, Hkv, D)
-	v := mlx.Reshape(linear(x, w.v), B, L, Hkv, D)
+	k := mlx.Reshape(project(x, w.k), B, L, Hkv, D)
+	v := mlx.Reshape(project(x, w.v), B, L, Hkv, D)
 
 	q = mlx.Transpose(mlx.RMSNorm(q, w.qNorm, c.RMSNormEps), 0, 2, 1, 3)
 	k = mlx.Transpose(mlx.RMSNorm(k, w.kNorm, c.RMSNormEps), 0, 2, 1, 3)
@@ -1096,5 +1149,5 @@ func (m *Qwen35) attention(w *fullAttn, x mlx.Array, cache *Qwen35Cache, i int) 
 	}
 	o := mlx.SDPA(q, k, v, float32(1/math.Sqrt(float64(D))), mode, 0)
 	o = mlx.Reshape(mlx.Transpose(o, 0, 2, 1, 3), B, L, H*D)
-	return linear(mlx.Multiply(o, mlx.Sigmoid(gate)), w.o)
+	return gated(o, gate)
 }

@@ -419,16 +419,30 @@ func TestQwen35BatchStepTime(t *testing.T) {
 		y := mlx.FromInt32(first, B, 1)
 		const steps = 32
 		var start time.Time
+		var rec, enc, wait time.Duration
 		for i := 0; i < steps+4; i++ {
 			if i == 4 {
 				start = time.Now()
 			}
+			if i == 4 {
+				rec, enc, wait = 0, 0, 0
+			}
+			t0 := time.Now()
 			s := mlx.NewScope()
 			next := mlx.Reshape(mlx.Astype(mlx.Argmax(b.Step(y), -1, false), mlx.Int32), B, 1)
 			s.Keep(next)
 			s.Close()
-			mlx.AsyncEval(append([]mlx.Array{next}, b.Arrays()...)...)
+			t1 := time.Now()
+			if os.Getenv("KINFER_MLX_PLAIN_EVAL") != "" {
+				mlx.AsyncEval(append([]mlx.Array{next}, b.Arrays()...)...)
+			} else {
+				mlx.AsyncEvalStep(append([]mlx.Array{next}, b.Arrays()...)...)
+			}
+			t2 := time.Now()
 			y.Int32s()
+			wait += time.Since(t2)
+			rec += t1.Sub(t0)
+			enc += t2.Sub(t1)
 			y.Free()
 			y = next
 		}
@@ -436,8 +450,8 @@ func TestQwen35BatchStepTime(t *testing.T) {
 		el := time.Since(start)
 		y.Free()
 		b.Free()
-		t.Logf("batch %2d: %.1f ms a step, %.0f tok/s together", B, float64(el.Microseconds())/1000/steps,
-			float64(B*steps)/el.Seconds())
+		t.Logf("batch %2d: %.1f ms a step, %.0f tok/s together (recording %.1f ms, starting it %.1f ms, waiting %.1f ms)", B, float64(el.Microseconds())/1000/steps,
+			float64(B*steps)/el.Seconds(), float64(rec.Microseconds())/1000/steps, float64(enc.Microseconds())/1000/steps, float64(wait.Microseconds())/1000/steps)
 	}
 }
 
@@ -573,5 +587,152 @@ func TestQwen35PooledWhileDraftingReadsOnWithout(t *testing.T) {
 	}
 	if worst != 0 {
 		t.Errorf("read on without drafting from a cache pooled while drafting: logits differ by up to %g", worst)
+	}
+}
+
+// What a pass that checks drafts costs beside a plain step, for one reply:
+// the pass alone (tokens given, the head left out), then with the head
+// drafting them, as the engine's solo loop runs it. KINFER_MLX_DEPTHS lists
+// the numbers of drafts ("0,1,2,3,5").
+func TestQwen35PassCost(t *testing.T) {
+	lib, dir, depths := os.Getenv("KINFER_MLX_LIB"), os.Getenv("KINFER_MLX_MODEL"), os.Getenv("KINFER_MLX_DEPTHS")
+	if lib == "" || dir == "" || depths == "" {
+		t.Skip("KINFER_MLX_LIB, KINFER_MLX_MODEL and KINFER_MLX_DEPTHS not all set")
+	}
+	if err := mlx.Open(lib); err != nil {
+		t.Fatal(err)
+	}
+	m, err := LoadQwen35(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	prompt := make([]int32, 100)
+	for i := range prompt {
+		prompt[i] = int32(1000 + (i*104729)%50000)
+	}
+	const passes, warm = 32, 4
+	for _, f := range strings.Split(depths, ",") {
+		d, _ := strconv.Atoi(f)
+		for _, head := range []bool{false, true} {
+			if head && !m.CanDraft() {
+				continue
+			}
+			c := m.NewCache()
+			c.Drafting = head
+			lg, err := m.Forward([][]int32{prompt}, c, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tok := mlx.Astype(mlx.Argmax(lg, -1, false), mlx.Int32).Int32s()[0]
+			lg.Free()
+			given := make([]int32, max(d, 1))
+			for i := range given {
+				given[i] = int32(2000 + i*31)
+			}
+			draft := func() mlx.Array {
+				if d == 0 {
+					return 0
+				}
+				if !head {
+					return mlx.FromInt32(given[:d], 1, d)
+				}
+				a, err := m.Draft(c, tok, d)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return a
+			}
+			drafts := draft()
+			var start time.Time
+			kept := 0
+			for i := 0; i < passes+warm; i++ {
+				if i == warm {
+					start, kept = time.Now(), 0
+				}
+				mark := c.Mark()
+				logits, hidden, err := m.Verify(tok, drafts, c)
+				if err != nil {
+					t.Fatal(err)
+				}
+				best := mlx.Astype(mlx.Argmax(logits, -1, false), mlx.Int32)
+				out := append([]mlx.Array{hidden, best}, c.Arrays()...)
+				if drafts != 0 {
+					out = append(out, drafts)
+				}
+				mlx.EvalStep(out...)
+				bs := best.Int32s()
+				k := 0
+				if drafts != 0 {
+					for ds := drafts.Int32s(); k < len(ds) && bs[k] == ds[k]; k++ {
+					}
+					drafts.Free()
+				}
+				tok = bs[k]
+				kept += k
+				best.Free()
+				logits.Free()
+				if err := c.Keep(mark, k, hidden); err != nil {
+					t.Fatal(err)
+				}
+				hidden.Free()
+				drafts = draft()
+			}
+			if drafts != 0 {
+				drafts.Int32s()
+				drafts.Free()
+			}
+			el := time.Since(start)
+			c.Free()
+			what := "tokens given, no head"
+			if head {
+				what = "the head drafting"
+			}
+			t.Logf("%d drafts, %s: %.1f ms a pass, %.2f kept a pass", d, what,
+				float64(el.Microseconds())/1000/passes, float64(kept)/passes)
+		}
+	}
+}
+
+// How fast a long prompt is read, a chunk at a time as the engine reads it,
+// and the most memory MLX held meanwhile. KINFER_MLX_PROMPT is its length in
+// tokens.
+func TestQwen35PrefillTime(t *testing.T) {
+	lib, dir := os.Getenv("KINFER_MLX_LIB"), os.Getenv("KINFER_MLX_MODEL")
+	n, _ := strconv.Atoi(os.Getenv("KINFER_MLX_PROMPT"))
+	if lib == "" || dir == "" || n == 0 {
+		t.Skip("KINFER_MLX_LIB, KINFER_MLX_MODEL and KINFER_MLX_PROMPT not all set")
+	}
+	if err := mlx.Open(lib); err != nil {
+		t.Fatal(err)
+	}
+	m, err := LoadQwen35(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+	prompt := make([]int32, n)
+	for i := range prompt {
+		prompt[i] = int32(1000 + (i*104729)%50000)
+	}
+	const chunk = 2048
+	for rep := 0; rep < 3; rep++ {
+		c := m.NewCache()
+		mlx.ClearCache()
+		mlx.ResetPeak()
+		before := mlx.MemoryUse().Active
+		start := time.Now()
+		for at := 0; at < n; at += chunk {
+			lg, err := m.Forward([][]int32{prompt[at:min(at+chunk, n)]}, c, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lg.Free()
+		}
+		el := time.Since(start)
+		mem := mlx.MemoryUse()
+		c.Free()
+		t.Logf("%d tokens read in %.2f s, %.0f tok/s; memory at most %.2f GB over the %.2f GB held before", n, el.Seconds(),
+			float64(n)/el.Seconds(), float64(mem.Peak-before)/1e9, float64(before)/1e9)
 	}
 }

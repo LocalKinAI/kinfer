@@ -161,11 +161,11 @@ func decodeAttention(q, keys, vals, start mlx.Array, end int, scale float32) mlx
 	tpl := []mlx.KernelTemplate{{Name: "T", Dtype: q.Dtype()}, {Name: "D", Int: D, IsInt: true},
 		{Name: "H", Int: H, IsInt: true}, {Name: "Hkv", Int: Hkv, IsInt: true}, {Name: "NSG", Int: decodeGroups, IsInt: true}}
 	part := daChunks.Run(
-		[]mlx.Array{q, keys, vals, start, mlx.Int(end), mlx.Int(capacity), mlx.Int(decodeChunk), mlx.Int(nsplit), mlx.Scalar(scale)},
+		[]mlx.Array{q, keys, vals, start, mlx.Int(end), mlx.ConstInt(capacity), mlx.ConstInt(decodeChunk), mlx.ConstInt(nsplit), mlx.Const(scale, mlx.Float32)},
 		[]mlx.KernelOutput{{Shape: []int{B * H * nsplit}, Dtype: mlx.Float32}, {Shape: []int{B * H * nsplit}, Dtype: mlx.Float32},
 			{Shape: []int{B * H * nsplit, D}, Dtype: mlx.Float32}},
 		tpl, [3]int{32, decodeGroups * nsplit, B * H}, [3]int{32, decodeGroups, 1})
-	out := daCombine.Run(append(part, mlx.Int(nsplit)),
+	out := daCombine.Run(append(part, mlx.ConstInt(nsplit)),
 		[]mlx.KernelOutput{{Shape: []int{B, H * D}, Dtype: q.Dtype()}},
 		[]mlx.KernelTemplate{{Name: "T", Dtype: q.Dtype()}, {Name: "D", Int: D, IsInt: true}},
 		[3]int{32, 1, B * H}, [3]int{32, 1, 1})

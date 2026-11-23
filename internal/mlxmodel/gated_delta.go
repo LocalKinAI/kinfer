@@ -143,7 +143,7 @@ func gatedDeltaFast(q, k, v, g, beta, state, mask mlx.Array) (mlx.Array, mlx.Arr
 	B, T, Hk, Dk := s[0], s[1], s[2], s[3]
 	Hv, Dv := vs[2], vs[3]
 	plain, masked := gatedDeltaKernels()
-	kern, inputs := plain, []mlx.Array{q, k, v, g, beta, state, mlx.Int(T)}
+	kern, inputs := plain, []mlx.Array{q, k, v, g, beta, state, mlx.ConstInt(T)}
 	if mask != 0 {
 		kern, inputs = masked, append(inputs, mask)
 	}
@@ -163,7 +163,7 @@ func gatedDeltaSteps(q, k, v, g, beta, state mlx.Array) (y, final, states mlx.Ar
 	B, T, Hk, Dk := s[0], s[1], s[2], s[3]
 	Hv, Dv := vs[2], vs[3]
 	gatedDeltaKernels()
-	res := gdSteps.Run([]mlx.Array{q, k, v, g, beta, state, mlx.Int(T)},
+	res := gdSteps.Run([]mlx.Array{q, k, v, g, beta, state, mlx.ConstInt(T)},
 		[]mlx.KernelOutput{{Shape: []int{B, T, Hv, Dv}, Dtype: q.Dtype()}, {Shape: state.Shape(), Dtype: state.Dtype()},
 			{Shape: []int{B, T, Hv, Dv, Dk}, Dtype: state.Dtype()}},
 		[]mlx.KernelTemplate{{Name: "InT", Dtype: q.Dtype()}, {Name: "StT", Dtype: state.Dtype()},

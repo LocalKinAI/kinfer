@@ -373,16 +373,14 @@ func (b *Qwen35Batch) Step(tokens mlx.Array) mlx.Array {
 	for i := range m.layers {
 		l := &m.layers[i]
 		x := mlx.RMSNorm(h, l.inNorm, c.RMSNormEps)
-		var r mlx.Array
 		if l.linear != nil {
 			one := &Qwen35Cache{conv: b.conv, state: b.state}
-			r = m.deltaNet(l.linear, x, one, i)
+			h = addProjected(h, m.deltaNet(l.linear, x, one, i), l.linear.outProj)
 		} else {
-			r = b.attention(l.full, x, i, offsets, starts)
+			h = addProjected(h, b.attention(l.full, x, i, offsets, starts), l.full.o)
 		}
-		h = mlx.Add(h, r)
 		x = mlx.RMSNorm(h, l.inPost, c.RMSNormEps)
-		h = mlx.Add(h, l.mlp(x))
+		h = l.addMLP(h, x)
 	}
 	h = mlx.RMSNorm(h, m.norm, c.RMSNormEps)
 	logits := mlx.Reshape(linear(h, m.head()), B, c.VocabSize)
@@ -396,17 +394,18 @@ func (b *Qwen35Batch) Step(tokens mlx.Array) mlx.Array {
 	return logits
 }
 
-// attention is a full-attention layer's step. Each row reads only its own
-// columns (decodeAttention), not the batch's whole width.
+// attention is a full-attention layer's step up to its last projection.
+// Each row reads only its own columns (decodeAttention), not the batch's
+// whole width.
 func (b *Qwen35Batch) attention(w *fullAttn, x mlx.Array, i int, offsets, starts mlx.Array) mlx.Array {
 	c := b.m.Config
 	B := x.Shape()[0]
 	H, Hkv, D := c.NumAttentionHeads, c.NumKeyValueHeads, c.HeadDim
 
-	qg := mlx.Split(mlx.Reshape(linear(x, w.q), B, 1, H, 2*D), -1, D)
+	qg := mlx.Split(mlx.Reshape(project(x, w.q), B, 1, H, 2*D), -1, D)
 	q, gate := qg[0], mlx.Reshape(qg[1], B, 1, H*D)
-	k := mlx.Reshape(linear(x, w.k), B, 1, Hkv, D)
-	v := mlx.Reshape(linear(x, w.v), B, 1, Hkv, D)
+	k := mlx.Reshape(project(x, w.k), B, 1, Hkv, D)
+	v := mlx.Reshape(project(x, w.v), B, 1, Hkv, D)
 	q = mlx.Transpose(mlx.RMSNorm(q, w.qNorm, c.RMSNormEps), 0, 2, 1, 3)
 	k = mlx.Transpose(mlx.RMSNorm(k, w.kNorm, c.RMSNormEps), 0, 2, 1, 3)
 	v = mlx.Transpose(v, 0, 2, 1, 3)
@@ -430,5 +429,5 @@ func (b *Qwen35Batch) attention(w *fullAttn, x mlx.Array, i int, offsets, starts
 		o = mlx.SDPA(q, keys, vals, scale, "", mask)
 		o = mlx.Reshape(mlx.Transpose(o, 0, 2, 1, 3), B, 1, H*D)
 	}
-	return linear(mlx.Multiply(o, mlx.Sigmoid(gate)), w.o)
+	return gated(o, gate)
 }

@@ -288,12 +288,15 @@ More in [docs/performance.md](docs/performance.md) and
 - Ollama 0.34.3 reads a 103,641-token prompt 4% sooner: 121.8 s against 126.4.
 - With MTP drafting on MLX, Ollama 0.40.15 averaged 78 tok/s over six replies
   where kinfer averaged 72.5 (qwen3.8:27b-mlx on the MacBook Pro). On the Mac
-  Studio, Ollama 0.40.17 averaged 64 over six kinds of request where kinfer
-  averaged 52 to 54; kinfer was ahead on the code alone.
+  Studio, in the same hour, Ollama 0.40.17 averaged 61 to 67 over six kinds of
+  request and kinfer 62: kinfer ahead on code and worked arithmetic (90 and 81
+  tok/s against 72 to 78 and 71 to 90), Ollama on prose (55 and 58 against 41
+  and 51), where it drafts two tokens a pass and kinfer five. Without drafts
+  the two write alike, 39 tok/s.
 - Several replies at once on MLX: Ollama 0.40.17 sizes this itself, and drafts
   for every reply where kinfer drafts only for one writing alone. With its
   context set to 32,768 on the Mac Studio it took four at once and wrote 104 to
-  116 tok/s in all, 114 to 120 with eight or sixteen waiting; kinfer wrote 70
+  116 tok/s in all, 114 to 120 with eight or sixteen waiting; kinfer writes 99
   (qwen3.8:27b-mlx, 4 slots of 32,768). At its own 262,144 context it found
   room for one and wrote 54 with four waiting.
 - A mixture of experts on MLX writes 104 tok/s alone against Ollama's 125. With

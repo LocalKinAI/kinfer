@@ -84,20 +84,89 @@ search's result names it (`tool_reference`) or the model has called it, and
 the search's result reads as the definitions of what it found. Before, every
 MCP tool of a setup was written into every prompt.
 
+### Faster — an MLX model's decoding, the replies unchanged
+
+Ollama 0.40.17 wrote a plain step of qwen3.8:27b-mlx in 26 ms on the Mac Studio
+where kinfer took 35, the same files and the same MLX kernels under both. Two
+things, neither in the weights:
+
+- **The step after the one the GPU is on was not being started.** kinfer
+  records the next step while the GPU works on the current one, but MLX closes a
+  Metal command buffer every 50 operations or 50 MB and waits once ten are
+  unfinished, and a step of a 27B model is hundreds of them: the next step
+  could not be put in until the last had all but finished, and the 8 ms the
+  host then spent recording, the GPU sat out. A step, or a pass that checks
+  drafts, is now evaluated with buffers of 400 operations or 2 GB
+  (`mlx.AsyncEvalStep`); a prompt is read with MLX's own sizes as before —
+  with the large ones, reading 6,000 tokens held 41 GB at its peak instead of
+  3.7. `KINFER_MLX_STEP_BUFFERS=off` turns it off; MLX's own
+  `MLX_MAX_OPS_PER_BUFFER` and `MLX_MAX_MB_PER_BUFFER`, when set, are left as
+  they are.
+- **Some 3,400 small operations a step, 3 µs each whatever they compute.** Six
+  Metal kernels now each do a run of them — a quantized weight's own scale
+  with the sum or the SwiGLU it feeds, a DeltaNet layer's gates, its gated
+  output: about 2,200 fewer. They do the same arithmetic in the same order and
+  types, rounding where the operations round.
+
+Checked to the bit: each kernel against the operations it stands for, in
+bfloat16, float16 and float32; five models' logits against the build before
+(prompt, steps, a pass that checks drafts, a batch — Qwen3.5-0.8B unquantized
+and 4-bit, Qwen3.8-27B 4-bit and NVFP4), by a fingerprint printed by both; and
+48 replies from four of them, greedy and sampled, the same in both builds.
+(The fingerprint is there because the first version of this passed its own
+tests and was wrong: it left an unquantized model's residual stream in
+float32, at less than half the speed, and the test compared it with a
+reference changed the same way.)
+
+On the Mac Studio (M3 Ultra), tok/s, before → after:
+
+| | one reply | 4 at once | 8 at once |
+|---|---|---|---|
+| qwen3.8:27b-mlx (NVFP4), no drafts | 28 → **39** | 80 → **99** | 158 → 196 (model alone) |
+| the same, drafting, six kinds of request | 58 → **62** | | |
+| Qwen3.8-27B 4-bit | 33 → **40** | 78 → **87** | |
+| Qwen3.5-0.8B unquantized | 207 → 216 | 592 → **790** | |
+| Qwen3.5-0.8B 4-bit | 200 → 216 | 732 → 776 | |
+
+Sixteen rows and more are the GPU's own work and unchanged.
+
+### Added — the number of drafts chosen by the text (not yet the default)
+
+`KINFER_MLX_DRAFT=auto` has a reply writing alone on MLX draft as many tokens
+a pass as pay — one to five, by what a pass of each depth has cost and how
+often the draft at each place has been kept, both followed as the text
+changes — and record the passes that may come next while the GPU works on the
+current one. On the Mac Studio a Chinese essay went from 41 to 46 tok/s and a
+list from 47 to 51 at temperature 0, code and arithmetic stayed where they
+were, and six replies sampled with thinking averaged 57 where five drafts
+every pass gave 59. A
+reply drafted to another depth can differ from the same reply drafted to
+five where two tokens were all but equally likely, which is why it is not
+the default.
+
 ### Measured — against Ollama 0.40.17 on MLX, and a quiet GPU
 
-On the Mac Studio (M3 Ultra), qwen3.8:27b-mlx from the same files, 2026-11-22:
+On the Mac Studio (M3 Ultra), qwen3.8:27b-mlx from the same files, 2026-11-22,
+with the changes above; the two run in the same hour unless said:
 
 | | kinfer | Ollama 0.40.17 |
 |---|---|---|
-| one at a time, six kinds of request, mean | 52–54 tok/s | **64 tok/s** |
-| 4 at once, Ollama as it sets itself up (262,144 context: one at a time) | **70 tok/s** in all | 54 |
-| 4 at once, Ollama's context 32,768 (it takes four) | 70 | **104–116** |
-| 16 waiting, the same | 71 | **115–120** |
+| one at a time, no drafts | 39 tok/s | 38 (asked for logprobs, which it does not draft with) |
+| one at a time, six kinds of request, mean | 62 tok/s | 61–67 (three runs) |
+| — a Chinese essay, an English one | 41, 51 | **55, 58** |
+| — code, worked arithmetic | **90, 81** | 72–78, 71–90 |
+| 4 at once, Ollama as it sets itself up (262,144 context: one at a time) | **99 tok/s** in all | 54 (the night before) |
+| 4 at once, Ollama's context 32,768 (it takes four) | 99 | **104–116** (the night before) |
 
-Ollama drafts for every reply at once; kinfer on MLX drafts for a reply writing
-alone, and on a Chinese essay its drafts cost what they saved (26% taken, 33
-tok/s against Ollama's 52). Both are to be worked on.
+Ollama drafts for every reply at once, and as few tokens a pass as the text
+pays for; kinfer on MLX drafts five for a reply writing alone. The machine's
+speed moves by a tenth between hours, so only what ran in the same hour is
+compared: the night before, Ollama averaged 64 over the six kinds and kinfer
+as it then was 52; this morning the same two averaged 63 to 67 and 56. What
+Ollama's own log says its passes cost —
+26 ms with no drafts, 33 to 35 with one, 38 to 40 with two, 45 with three, 54
+with four — is what kinfer's cost with one to three once the pass after is
+recorded ahead (36, 40, 48), and 52 with five.
 
 A GPU left quiet for 3 to 120 seconds reads the next prompt's first few hundred
 tokens 10–13% slower (0.03 to 0.1 s a request) and a 3,400-token prompt 0–1%

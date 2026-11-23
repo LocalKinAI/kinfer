@@ -38,6 +38,11 @@ const (
 	defaultCtx   = 32768
 	prefillChunk = 2048
 	cacheLimit   = 4 << 30
+	// stepRows is the widest batch whose step is evaluated with a step's
+	// command buffers (mlx.AsyncEvalStep). On an M3 Ultra they took a step
+	// of Qwen3.8-27B from 33 to 26 ms with one row and 43 to 38 with four,
+	// and changed nothing with sixteen.
+	stepRows = 8
 )
 
 // IsModelDir reports whether path is a directory MLX can serve: a
@@ -85,10 +90,15 @@ type Engine struct {
 	reusedTok atomic.Int64
 	broken    atomic.Bool
 
-	// drafts is how many tokens a reply writing alone drafts a step with
+	// drafts is the most tokens a reply writing alone drafts a pass with
 	// the model's MTP head (solo); 0 when it has none or -draft is off.
+	// depth chooses how many of them each pass drafts.
 	drafts            int
+	depth             *depths
 	drafted, accepted atomic.Int64
+	// ahead and behind count the passes that were recorded before the one
+	// before them was read, and the ones that had to be recorded after.
+	ahead, behind atomic.Int64
 }
 
 type job struct {
@@ -196,13 +206,23 @@ func Open(dir string, opts engine.Options) (*Engine, error) {
 		switch size := model.Bytes(); {
 		case opts.Draft > 0:
 			e.drafts = opts.Draft
+			e.depth = newDepths(e.drafts)
+			e.depth.fixed = e.drafts
+			log.Printf("draft: a reply writing alone drafts %d tokens a step with the model's MTP head — -draft -1 turns it off", e.drafts)
 		case size < draftsFrom:
 			log.Printf("draft: off for a model of %.1f GB, whose steps are too quick for its MTP head's drafts to pay — -draft N drafts N tokens a step",
 				float64(size)/1e9)
+		case os.Getenv("KINFER_MLX_DRAFT") == "auto":
+			// Not the default yet: a reply drafted to another depth can
+			// differ from the same reply drafted to five where two tokens
+			// were all but equally likely.
+			e.drafts = maxDrafts
+			e.depth = newDepths(e.drafts)
+			log.Printf("draft: a reply writing alone drafts up to %d tokens a step with the model's MTP head, as many as the text it is writing pays for (KINFER_MLX_DRAFT=auto) — -draft N always drafts N, -draft -1 none", e.drafts)
 		default:
-			e.drafts = defaultDrafts
-		}
-		if e.drafts > 0 {
+			e.drafts = maxDrafts
+			e.depth = newDepths(e.drafts)
+			e.depth.fixed = e.drafts
 			log.Printf("draft: a reply writing alone drafts up to %d tokens a step with the model's MTP head — -draft -1 turns it off", e.drafts)
 		}
 	}
@@ -512,13 +532,23 @@ func (e *Engine) run() {
 	}
 }
 
-// defaultDrafts is how many tokens a step drafts when -draft does not say.
-// On Ollama's qwen3.8:27b-mlx on an M5 Max, six replies averaged 72.5 tok/s
-// with five drafts against 67.4 with three and 30 with none: MLX's kernels for
-// passes of six to sixteen rows (after 0.32.4) make checking five drafts cost
-// little more than checking three. With 0.32.4, where a pass of five rows or
-// more costs more per row than one of four, three was the best.
-const defaultDrafts = 5
+// maxDrafts is the most tokens a step drafts when -draft does not say; how
+// many each pass drafts is chosen as the reply goes (depths). On Ollama's
+// qwen3.8:27b-mlx on an M5 Max, six replies averaged 72.5 tok/s with five
+// drafts every pass against 67.4 with three and 30 with none: MLX's kernels
+// for passes of six to sixteen rows (after 0.32.4) make checking five drafts
+// cost little more than checking three. On the M3 Ultra a pass of six drafts
+// costs a fifth more than one of five, which no rate of agreement pays for;
+// prose pays for two.
+const maxDrafts = 5
+
+// aheadDepth is the most drafts a pass has for the passes after it to be
+// recorded ahead (solo). On the M3 Ultra, with Qwen3.8-27B, that took a pass
+// of one draft from 40 to 36 ms and one of two from 44 to 40; a pass of five
+// is 52 ms either way — the GPU's own work, the head's five steps among it,
+// covers the recording — and recording four passes for each one run is a
+// whole core's work.
+const aheadDepth = 3
 
 // draftsFrom is the size of weights below which a model does not draft unless
 // -draft says so. A small model's step is quick beside its head's, which also
@@ -528,6 +558,123 @@ const defaultDrafts = 5
 // between the two drafting starts to pay is not measured; this is a guess.
 const draftsFrom = 4e9
 
+// A pass is one pass that checks drafts, recorded and not yet read: the token
+// it starts from in a slot, written when the pass is evaluated; the drafts
+// the head makes after that token; and the model's reading of all of them on
+// c, which the pass has moved on past them.
+type pass struct {
+	c      *mlxmodel.Qwen35Cache
+	mark   mlxmodel.Mark
+	slot   *mlx.Slot
+	drafts mlx.Array // [1, n]; 0 when the head has none
+	logits mlx.Array
+	hidden mlx.Array
+	best   mlx.Array // each row's likeliest token, for a reply that takes it; else 0
+	n      int       // drafts
+}
+
+// free releases the pass's arrays and, with cache, the cache it is on.
+func (p *pass) free(cache bool) {
+	for _, a := range []mlx.Array{p.drafts, p.logits, p.hidden, p.best} {
+		if a != 0 {
+			a.Free()
+		}
+	}
+	if p.slot != nil {
+		p.slot.Free()
+	}
+	if cache && p.c != nil {
+		p.c.Free()
+	}
+	*p = pass{}
+}
+
+// record records, on c, the pass that drafts n tokens after a token and
+// checks them. With the token not yet known (tok nil) nothing of it is
+// worked out until submit names it; with it known the head starts on the
+// drafts at once, while the pass that checks them is still being recorded.
+func (e *Engine) record(c *mlxmodel.Qwen35Cache, n int, greedy bool, tok *int32) (p *pass, err error) {
+	p = &pass{c: c, slot: mlx.NewSlot(1, 1)}
+	defer func() {
+		if err != nil {
+			p.free(false)
+			p = nil
+		}
+	}()
+	defer mlx.Recover(&err)
+	if tok != nil {
+		p.slot.Set(*tok)
+	}
+	if p.drafts, err = e.model.DraftFrom(c, p.slot.Array, n); err != nil {
+		return p, err
+	}
+	if p.drafts != 0 {
+		p.n = n
+		if tok != nil {
+			mlx.AsyncEvalStep(p.drafts)
+		}
+	}
+	p.mark = c.Mark()
+	if p.logits, p.hidden, err = e.model.VerifyFrom(p.slot.Array, p.drafts, c); err != nil {
+		return p, err
+	}
+	if greedy {
+		s := mlx.NewScope()
+		p.best = mlx.Astype(mlx.Argmax(p.logits, -1, false), mlx.Int32)
+		s.Escape(p.best)
+		s.Close()
+	}
+	return p, nil
+}
+
+// submit names the token p starts from and has the GPU begin on it.
+func (e *Engine) submit(p *pass, tok int32) (err error) {
+	defer mlx.Recover(&err)
+	p.slot.Set(tok)
+	out := append([]mlx.Array{p.hidden}, p.c.Arrays()...)
+	if p.drafts != 0 {
+		out = append(out, p.drafts)
+	}
+	if p.best != 0 {
+		out = append(out, p.best)
+	} else {
+		out = append(out, p.logits)
+	}
+	mlx.AsyncEvalStep(out...)
+	return nil
+}
+
+// read waits for p and returns the drafts it checked and the reply's tokens
+// at their positions: each as the reply takes it, up to and including the
+// first that differs from its draft, or one past the last draft when all
+// hold.
+func (e *Engine) read(p *pass, j *job) (ds, toks []int32, wait time.Duration, err error) {
+	defer mlx.Recover(&err)
+	// wait is how long the GPU was still at it: the logits are the last of
+	// the pass. What follows is the host's work.
+	t := time.Now()
+	if p.best != 0 {
+		p.best.Eval()
+	} else {
+		p.logits.Eval()
+	}
+	wait = time.Since(t)
+	if p.drafts != 0 {
+		ds = p.drafts.Int32s()
+	}
+	if p.best == 0 {
+		toks, err = e.checkDrafts(p.logits, ds, j)
+		return ds, toks, wait, err
+	}
+	for i, t := range p.best.Int32s() {
+		toks = append(toks, t)
+		if i < len(ds) && t != ds[i] {
+			break
+		}
+	}
+	return ds, toks, wait, nil
+}
+
 // solo writes j's reply while it has the model to itself, drafting with the
 // MTP head: each pass reads the token the reply is sure of with the drafts
 // after it, and the reply keeps as many drafts as the model agrees with,
@@ -536,43 +683,86 @@ const draftsFrom = 4e9
 // when the reply ends (nil) or another request arrives, with j's cache read
 // up to j.last, as a batch row's is.
 //
-// A step waits on the GPU once: the pass is built while the drafts it checks
-// are worked out, and is evaluated with them, with what Keep took back before
-// them, and, greedy, with the tokens the reply takes.
+// How many drafts a pass has is depths' choice. And a pass cannot be started
+// before the one before it is read — where it starts depends on how many
+// drafts that one kept — but it can be recorded: while the GPU works on a
+// pass, the passes that would follow it keeping none, one or all of its
+// drafts are recorded on branches of its cache, the likeliest first, and the
+// one that turns out right is started the moment the pass is read. Recording
+// a pass is some 9 ms of the host's time for a model of 64 layers, which the
+// GPU would otherwise sit out between every two passes.
 func (e *Engine) solo(j *job, c *mlxmodel.Qwen35Cache) *mlxmodel.Qwen35Cache {
-	var drafts mlx.Array
-	free := func() {
-		if drafts != 0 {
-			drafts.Free()
-			drafts = 0
-		}
+	greedy := j.params.Temperature <= 0 && !sampling.PenaltiesOn(j.params.Params)
+	// room is how many drafts a pass may have once the reply has written
+	// taken tokens more: no more than it may still write after the one the
+	// pass is sure of.
+	room := func(n, taken int) int { return max(0, min(n, j.maxGen-len(j.gen)-taken-1)) }
+	cur, err := e.record(c, room(e.depth.next(), 0), greedy, &j.last)
+	if err == nil {
+		err = e.submit(cur, j.last)
 	}
-	fail := func(err error) *mlxmodel.Qwen35Cache {
-		free()
+	if err != nil {
+		if cur != nil {
+			cur.free(false)
+		}
 		c.Free()
 		e.finish(j, err)
 		return nil
 	}
-	drafts, err := e.model.Draft(c, j.last, e.draftsFor(j))
-	if err != nil {
-		return fail(err)
+	var readAt time.Time
+	passes, ahead := 0, e.ahead.Load()
+	if e.prof.on {
+		start, wrote := time.Now(), len(j.gen)
+		defer func() {
+			log.Printf("mlx profile: a reply alone wrote %d tokens in %d passes, %.1f ms a pass, %d of them recorded ahead; depth now %d, costs %.0f ms, kept %.2f, %d outcomes recorded ahead",
+				len(j.gen)-wrote, passes, float64(time.Since(start).Milliseconds())/float64(max(1, passes)), e.ahead.Load()-ahead,
+				e.depth.cur, e.depth.cost[1:], e.depth.rate[1:], e.depth.vars)
+		}()
 	}
 	for {
-		if len(e.jobs) > 0 || e.closing() {
-			free()
-			return c
+		// While the GPU works on cur: the passes that may come after it.
+		n := e.depth.next()
+		after := map[int]*pass{}
+		var each time.Duration
+		if cur.n <= aheadDepth && len(e.jobs) == 0 && !e.closing() {
+			t := time.Now()
+			for _, kept := range e.depth.likely(cur.n) {
+				if len(after) >= e.depth.vars {
+					break
+				}
+				if j.maxGen-len(j.gen)-kept-1 <= 0 {
+					continue // the reply ends with this pass
+				}
+				b, err := cur.c.Branch(cur.mark, kept, cur.hidden)
+				if err != nil {
+					break
+				}
+				p, err := e.record(b, room(n, kept+1), greedy, nil)
+				if err != nil {
+					b.Free()
+					break
+				}
+				after[kept] = p
+			}
+			if len(after) > 0 {
+				each = time.Since(t) / time.Duration(len(after))
+			}
 		}
-		mark := c.Mark()
-		logits, hidden, err := e.model.Verify(j.last, drafts, c)
-		if err != nil {
-			return fail(err)
+		drop := func(but *pass) {
+			for _, p := range after {
+				if p != but {
+					p.free(true)
+				}
+			}
 		}
-		ds, toks, err := e.checkPass(logits, hidden, drafts, c, j)
-		logits.Free()
-		free()
+
+		ds, toks, wait, err := e.read(cur, j)
+		now := time.Now()
 		if err != nil {
-			hidden.Free()
-			return fail(err)
+			drop(nil)
+			cur.free(true)
+			e.finish(j, err)
+			return nil
 		}
 		e.drafted.Add(int64(len(ds)))
 		kept, ended := 0, false
@@ -586,65 +776,70 @@ func (e *Engine) solo(j *job, c *mlxmodel.Qwen35Cache) *mlxmodel.Qwen35Cache {
 			}
 		}
 		e.accepted.Add(int64(kept))
+		var ms float64
+		if !readAt.IsZero() {
+			ms = float64(now.Sub(readAt).Microseconds()) / 1000
+		}
+		e.depth.observe(cur.n, len(ds), kept, ms)
+		readAt = now
+		passes++
+		// One more outcome is recorded ahead while there is time for it —
+		// the GPU still busy when the last was done — and one fewer when
+		// recording them held up the reading.
+		if len(after) > 0 {
+			switch {
+			case wait < 500*time.Microsecond && e.depth.vars > 1:
+				e.depth.vars--
+			case wait > each*3/2 && e.depth.vars <= e.drafts:
+				e.depth.vars++
+			}
+		}
 		if ended {
-			hidden.Free()
-			c.Free()
+			drop(nil)
+			cur.free(true)
 			return nil
 		}
-		err = c.Keep(mark, kept, hidden)
-		hidden.Free()
-		if err != nil {
-			return fail(err)
+		if len(e.jobs) > 0 || e.closing() {
+			drop(nil)
+			c := cur.c
+			err := c.Keep(cur.mark, kept, cur.hidden)
+			cur.free(false)
+			if err != nil {
+				c.Free()
+				e.finish(j, err)
+				return nil
+			}
+			return c
 		}
-		if drafts, err = e.model.Draft(c, j.last, e.draftsFor(j)); err != nil {
-			return fail(err)
-		}
-	}
-}
-
-// checkPass evaluates a Verify pass, with the drafts it checks, and returns
-// those drafts and the reply's tokens at their positions: each sampled as the
-// reply would sample it, up to and including the first that differs from its
-// draft, or one past the last draft when all hold.
-func (e *Engine) checkPass(logits, hidden, drafts mlx.Array, c *mlxmodel.Qwen35Cache, j *job) (ds, toks []int32, err error) {
-	defer mlx.Recover(&err)
-	// Greedy and without penalties, every row's token is its argmax, worked
-	// out with the pass; otherwise each is sampled with the history before it.
-	greedy := j.params.Temperature <= 0 && !sampling.PenaltiesOn(j.params.Params)
-	var best []int32
-	func() {
-		scope := mlx.NewScope()
-		defer scope.Close()
-		out := append([]mlx.Array{hidden}, c.Arrays()...)
-		if drafts != 0 {
-			out = append(out, drafts)
-		}
-		var b mlx.Array
-		if greedy {
-			b = mlx.Astype(mlx.Argmax(logits, -1, false), mlx.Int32)
-			out = append(out, b)
+		// The others go, and cur's cache with them, before the pass is
+		// started: a buffer they still held would be copied, not written.
+		next := after[kept]
+		if next != nil {
+			drop(next)
+			cur.free(true)
+			e.ahead.Add(1)
 		} else {
-			out = append(out, logits)
+			drop(nil)
+			c := cur.c
+			err := c.Keep(cur.mark, kept, cur.hidden)
+			cur.free(false)
+			if err == nil {
+				next, err = e.record(c, room(n, 0), greedy, &j.last)
+			}
+			if err != nil {
+				c.Free()
+				e.finish(j, err)
+				return nil
+			}
+			e.behind.Add(1)
 		}
-		mlx.Eval(out...)
-		if drafts != 0 {
-			ds = drafts.Int32s()
+		if err := e.submit(next, j.last); err != nil {
+			next.free(true)
+			e.finish(j, err)
+			return nil
 		}
-		if greedy {
-			best = b.Int32s()
-		}
-	}()
-	if !greedy {
-		toks, err = e.checkDrafts(logits, ds, j)
-		return ds, toks, err
+		cur = next
 	}
-	for i, t := range best {
-		toks = append(toks, t)
-		if i < len(ds) && t != ds[i] {
-			break
-		}
-	}
-	return ds, toks, nil
 }
 
 // checkDrafts samples, from evaluated logits [len(drafts)+1, vocab], the
@@ -685,12 +880,6 @@ func (e *Engine) checkDrafts(logits mlx.Array, drafts []int32, j *job) (toks []i
 		}
 	}
 	return toks, nil
-}
-
-// draftsFor is how many tokens j may draft this step: no more than it may
-// still write after the one it is sure of.
-func (e *Engine) draftsFor(j *job) int {
-	return max(0, min(e.drafts, j.maxGen-len(j.gen)-1))
 }
 
 // closing reports whether the engine is being closed.
@@ -855,7 +1044,14 @@ func (e *Engine) step(b *mlxmodel.Qwen35Batch, rows []*job, in mlx.Array) (next 
 	}
 	next = sampleGraph(logits, params, hist, rngs)
 	s.Keep(next)
-	mlx.AsyncEval(append([]mlx.Array{next}, b.Arrays()...)...)
+	// A few rows' step fits in a few command buffers, so the one after it can
+	// be queued while it runs; a wide batch keeps the GPU busy as it is, and
+	// what its buffers would hold meanwhile is no longer small.
+	if out := append([]mlx.Array{next}, b.Arrays()...); len(rows) <= stepRows {
+		mlx.AsyncEvalStep(out...)
+	} else {
+		mlx.AsyncEval(out...)
+	}
 	return next, nil
 }
 
