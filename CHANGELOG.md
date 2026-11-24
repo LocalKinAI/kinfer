@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.10.0 — 2026-11-24
 
 From a look at what Ollama, Strata, ds4, llama.cpp, MLX and the newer Mac
 engines changed in three weeks: first what it found wrong here.
@@ -52,7 +52,17 @@ llama.cpp cleared a recurrent state by multiplying it by zero, and a NaN
 times zero is a NaN: once one was in, every reply after it was wrong until
 the model was loaded again. Upstream found it on Qwen3.8-Flash-Next over RPC
 with a q8_0 KV cache, which is how kinfer runs a model across two Macs
-(upstream #31913; patch 0009, libraries b11998k9).
+(upstream #31913; patch 0009).
+
+Writing the zeros cost speed on its own, and the release regression found
+it: ornith-1.5-35b wrote at 102 tokens a second where v0.9.0 wrote at 104,
+Qwen3.8-Flash-Next one in a hundred slower, the replies the same. Metal
+orders a graph's operations so that those which do not touch each other run
+together, and looks ahead only across operations it knows; a scale is one of
+them and a fill was not, so the look-ahead stopped at every layer's clear.
+A fill reads and writes what a scale does and is now looked across like one
+(patch 0010, libraries b11998k10): 104 again on the Mac Studio, today's code
+on the libraries before 0009 measuring the same.
 
 ### Added — what was cached, in the usage
 
@@ -189,7 +199,7 @@ second, the head's keys and values for it were dropped without being freed —
 Thinking Machines' Inkling 2 Mini (26B parameters, 20 GB, Apache 2.0,
 released 2026-11-20) comes either way: `kinfer pull
 thinkingmachines/Inkling-2-Mini` fetches the publisher's own files from
-Hugging Face (18.2 GB; the 0.6 GB file of its draft head, which kinfer does
+Hugging Face (19.5 GB; the 0.6 GB file of its draft head, which kinfer does
 not read, is left), or, where Ollama has it — `ollama pull inkling-2-mini` —
 the model is `inkling-2-mini` in kinfer too, nothing downloaded twice. It is a
 model unlike the others here: 24 layers of which the
@@ -345,6 +355,125 @@ recorded ahead (36, 40, 48), and 52 with five.
 A GPU left quiet for 3 to 120 seconds reads the next prompt's first few hundred
 tokens 10–13% slower (0.03 to 0.1 s a request) and a 3,400-token prompt 0–1%
 slower; writing is not slower. Nothing is kept running to prevent it.
+
+### Run before release
+
+On v0.10.0-rc.2, which is this release's code and libraries under that name,
+the same binary on both machines; each machine's own kinfer service stopped
+for the run. A first candidate, on the libraries with patch 0009 alone, ran
+the same list the same day and is where ornith's two in a hundred were found;
+what follows is the second.
+
+- **Unit tests**, with the race detector on the server, the service manager
+  and the templates.
+- **The box** (Mac Studio M3 Ultra, 96 GB):
+  - Seven models through the runners: qwen2.5-0.5b, ornith-1.5-35b,
+    qwen3.8-27b q4_k_m, qwen3.8:27b-mlx, Flash-Next, V4.1 alone and
+    inkling-2-mini. Of 130 checks 125 passed. The 5 that failed are the
+    Responses check at a short limit, as in every release: a model that
+    thinks first has no tokens left to answer in. The check written since,
+    with room to think, passes on the four thinking models it is put to.
+  - The service's own flags: 16 at once on ornith and on Flash-Next; 17 kept
+    tool calls, none empty; a 15k-token request to the 27B beside ornith in
+    64.5 s, then 1.5 s and 1.5 s, the usage saying 15,254 of its 15,258
+    tokens were read already.
+  - Pictures and sound embedded against Ollama: cosine 0.9999 on all ten.
+  - `kinfer service`: 9 of 9. v0.8.0's fixes again, and what v0.9.0 added:
+    effort and reasoning in the prompt on five models, a hang-up, a runner
+    killed mid-reply (the next reply in 3.5 s), a 57 s reply under
+    `-watchdog 30s`.
+  - Speech said and heard back, speech streamed, a 512² picture in 8.5 s.
+  - What this release adds:
+    - A reply held to a JSON Schema and to JSON in the four dialects, at
+      temperature 1.2 over three seeds too, on qwen2.5-0.5b and ornith; a
+      schema that cannot be held to is refused with 400.
+    - What was cached, in the usage: 853 of 869 tokens the OpenAI way and
+      the Anthropic way; 853, 865 and 884 over three turns of one
+      conversation.
+    - Inkling 2 Mini: nine pictures with known answers, all read rightly,
+      in Chinese and in English; two pictures in one request, and a second
+      turn; a prompt read once (1,029 tokens in 0.1 s the second time); a
+      file that is not a picture refused with 400; 11 of 12 tool requests;
+      2 at once 82–83 tok/s, 4 at once 125–127.
+    - The same model from its publisher's files, as `kinfer pull` leaves
+      them, the 19.5 GB file put there beforehand: loaded in 5.6 s, the same
+      answers.
+    - The 27B on MLX: 11 of 12 tool requests, every boolean a boolean; 2 at
+      once 80–87 tok/s, 4 at once 126.
+    - An hour's recording, as AAC, heard in 178 s: 83,742 characters, and
+      the reply says it was cut.
+  - The door, with a key set: the 16 checks of v0.9.0, 7 from the box
+    itself and 9 from a Mac mini, all as then.
+- **The laptop** (MacBook Pro M5 Max, 48 GB):
+  - Five models: ornith-1.5:35b, qwen3.8:27b-mlx, Flash-Next, V4.1 and
+    inkling-2-mini. Of 107 checks 102 passed. Four of the 5 that failed are
+    the same Responses check. The fifth is chat, speech and transcription
+    loaded at once, where the speech models' room takes ornith off the GPU:
+    it fails on every version since v0.7.2 on that laptop.
+  - Room made for a picture; a runner killed mid-reply; 16 at once; 17 kept
+    tool calls, none empty.
+  - `kinfer run`: a daemon started, kept and stopped; `-local`.
+    `kinfer service`: 9 of 9.
+  - What v0.9.0 added, and what this release adds, as on the box. Inkling's
+    nine pictures the same; 10 of its 12 tool requests, the two it missed
+    asked in English and answered with a well-formed call whose values it
+    wrote in Chinese, twice the same; the 27B on MLX 11 of 12.
+- **Speed against v0.9.0, model by model.**
+  - A fresh server for each run, the two versions alternated three times
+    each, v0.10.0 first. Every reply's md5 was the same on both versions.
+  - The table gives tok/s as v0.10.0 / v0.9.0, over all three runs.
+
+  | Machine | Model | Prompt | Long reply | Short reply |
+  |---|---|---|---|---|
+  | box | qwen2.5-0.5b | 12,469–12,529 / 12,500–12,581 | 293.7–296.9 / 296.2–297.8 | 314.4–317.6 / 316.7–318.2 |
+  | box | ornith-1.5-35b | 1,828–1,832 / 1,829–1,830 | 104.4–104.6 / 104.2–104.5 | 94.1–94.4 / 94.3–94.6 |
+  | box | qwen3.8-27b q4_k_m | 300.3–300.8 / 300.5–300.8 | 41.7–41.8 / 41.7 | 34.1–34.2 / 34.2 |
+  | box | qwen3.8:27b-mlx | 347.1–347.5 / 333.6–333.8 | **48.9–49.3** / 43.7–43.8 | **45.1–45.5** / 40.9–41.0 |
+  | box | Flash-Next | 752.4–756.9 / 752.0–755.2 | 42.7–43.2 / 42.7–43.0 | 43.1–43.6 / 43.0–43.6 |
+  | box | V4.1 alone | 225.2–229.0 / 200.4–231.5 | 12.1–14.2 / 13.2–14.2 | 17.4–17.9 / 17.6–18.1 |
+  | laptop | ornith-1.5:35b | 2,881–2,894 / 2,890–2,892 | 135.7–136.1 / 135.6–136.3 | 130.3–131.4 / 131.1–131.7 |
+  | laptop | qwen3.8:27b-mlx | **936–946** / 803–811 | **52.6–53.9** / 50.2–50.8 | **45.8–46.1** / 43.8–44.6 |
+  | laptop | Flash-Next | 932–940 / 928–932 | 28.2–29.3 / 28.9–29.7 | 32.0–32.6 / 31.3–32.4 |
+  | laptop | V4.1 | 195–254 / 217–237 | 10.9–11.1 / 10.7–11.0 | 14.4–14.6 / 14.1–14.7 |
+
+  - The 27B on MLX is the model this release set out to make faster: its
+    long reply an eighth faster on the box and a twentieth on the laptop.
+  - V4.1 on the box reads itself from the disk on each version's first run:
+    12.1 and 13.2 there, 14.1–14.2 on both after.
+  - qwen2.5-0.5b's long reply averaged 295.1 against 296.9, 0.6% apart; its
+    runs of v0.9.0 against v0.8.1 spread as far. Not looked into.
+  - The box's media, three runs each, as v0.10.0 / v0.9.0:
+    - 64 sentences embedded at once: 0.80–0.81 / 0.79–0.80 s
+    - a picture embedded: 0.122–0.123 / 0.123–0.124 s
+    - a sound embedded: 0.104–0.110 / 0.106–0.107 s
+    - a sentence spoken: 1.03–1.19 / 1.09–1.10 s
+    - transcribed: 0.19 / 0.19–0.23 s
+    - a 512² picture: 7.41–7.45 / 7.41–7.42 s
+- **Inkling 2 Mini**, which v0.9.0 does not serve, against Ollama 0.40.17 on
+  the box from the same files, one after the other:
+
+  | | kinfer, box | Ollama, box | kinfer, laptop |
+  |---|---|---|---|
+  | one at a time, twelve requests, mean | **51.8 tok/s** | 31.8 (23.7–48.7) | 61.7 |
+  | 2 at once, in all | 83–84 | | 92–93 |
+  | 4 at once, in all | **125–127** | 34 (one at a time) | 130–131 |
+  | 8 at once, in all | 155–158 | | 159–164 |
+  | a 3,276-token prompt read | 875–881 tok/s | 842–846 | 1,060–1,216 |
+  | four short answers | **10.9 s** | 17.0 s | 8.9 s |
+
+  It thinks for some ninety tokens before every answer, asked to or not, on
+  Ollama as here: a short answer is two seconds.
+- **The two machines:** V4.1 served by the box, with the laptop's worker over
+  Thunderbolt, found by `-peers auto`: 19.5–22.4 tok/s, and a 3,614-token
+  prompt read at 253 tok/s. v0.9.0, run the same way just after, gave
+  19.1–22.2 and 242. The laptop's GPU had 31.2 GB free of 37.4.
+- **Agents:** `kinfer launch claude` (Claude Code 2.1.329) and
+  `kinfer launch codex` (Codex 0.155.1), from a Mac mini against the box with
+  a key set: both answered.
+- **Built from** the b11998 source kept on disk, as v0.9.0 was.
+- **Not run:** Linux and Windows beyond building; GPUs off the Mac; the
+  19.5 GB download of Inkling's file itself, `kinfer pull` having been run
+  with the file in place; `kinfer launch` for Pi, Hermes and OpenClaw.
 
 ## v0.9.0 — 2026-11-21
 

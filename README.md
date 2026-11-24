@@ -453,6 +453,15 @@ GGUFs are. The MLX engine is Go over mlx-c, with no cgo and no Python, and
 checked against mlx-lm layer by layer. MLX's libraries (78 MB) are fetched once,
 the first time an MLX model loads, and need macOS 26.2.
 
+Thinking Machines' Inkling 2 Mini is served on MLX too, from its publisher's
+own files (`kinfer pull thinkingmachines/Inkling-2-Mini`, 19.5 GB) or from
+Ollama's copy (`inkling-2-mini`). It is a model built unlike the others — 24
+layers of which the middle 12 run three times a token, 128 experts a layer —
+and kinfer's port of it writes 52 tok/s on the Mac Studio where Ollama 0.40.17
+writes 31 from the same files, and 125 with four replies at once where Ollama
+takes them one at a time. It reads pictures at their own size, a token for
+every 40 × 40 pixels, calls tools and thinks, in all four dialects.
+
 Neither engine wins everywhere, which is why kinfer carries both. On the Mac
 Studio:
 
@@ -463,10 +472,10 @@ Studio:
 | Qwen3.8-27B, 16 replies at once | 105 tok/s | **130 tok/s** |
 
 A model that keeps its MTP head drafts with it on MLX too: Ollama's
-qwen3.8:27b-mlx on the MacBook Pro went from 30 tok/s to 40–107. Pictures read
-by a chat model run only on llama.cpp so far, and so do embeddings, but for
-EmbeddingGemma 2, which Ollama keeps in NVFP4: that one runs on MLX. The
-numbers: [CHANGELOG.md](CHANGELOG.md).
+qwen3.8:27b-mlx on the MacBook Pro went from 30 tok/s to 40–107. Pictures are
+read by a chat model on llama.cpp, with its projector, and on MLX by Inkling 2;
+embeddings run on llama.cpp, but for EmbeddingGemma 2, which Ollama keeps in
+NVFP4: that one runs on MLX. The numbers: [CHANGELOG.md](CHANGELOG.md).
 
 ## How it is built
 
@@ -561,7 +570,8 @@ What each does, and how serve sizes itself: [docs/serving.md](docs/serving.md).
 - **An experiment** off the Mac's GPU: Vulkan has only run on a software driver,
   and CUDA and ROCm on no real card. `kinfer launch` for Pi, Hermes Agent and
   OpenClaw is written from their documentation and not yet run.
-- **MLX serves Qwen3.5 and Qwen3.8** as chat models; anything else is a GGUF.
+- **MLX serves Qwen3.5, Qwen3.8 and Inkling 2** as chat models; anything else
+  is a GGUF.
 - **A key is optional.** `serve` listens on every interface and, unless
   `KINFER_API_KEY` is set, answers whatever on the network reaches its port:
   put it on a network you trust, or keep it to this machine with
@@ -592,7 +602,7 @@ release — after diffing its `llama.h`; see `internal/nativelib/libs/README.md`
 
 `scripts/build-libs.sh` instead builds b11998 from source with kinfer's patch
 (`patches/llama.cpp/b11998/`; about two minutes, cmake and Xcode's command line
-tools) into `darwin_arm64_b11998k9/`, replacing the release set. It matters
+tools) into `darwin_arm64_b11998k10/`, replacing the release set. It matters
 for a model whose experts or tables come from the SSD — see
 [When the experts do not fit in memory either](docs/big-models.md#when-the-experts-do-not-fit-in-memory-either);
 with the release set `-host-experts` and `-moe-cache` work as before and there is

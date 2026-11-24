@@ -32,7 +32,7 @@
 # given the memory its machine's other apps hold. Metal compiles the kernels at
 # the language version a current SDK gets, also for a kinfer built without cgo,
 # which would otherwise get Metal 2.4 and lose the bfloat kernels. The libraries
-# land in internal/nativelib/libs/darwin_arm64_${VERSION}k9, which replaces the
+# land in internal/nativelib/libs/darwin_arm64_${VERSION}k10, which replaces the
 # release set the way one release replaces another (see fetch-libs.sh).
 #
 # Needs cmake, ninja and Xcode's command line tools; about two minutes on an M4.
@@ -41,8 +41,8 @@
 set -euo pipefail
 
 VERSION=b11998 # the release the patches are made against
-LEVEL=k9       # bumped when the patches change, so a cached copy is not reused
-# The sha256 of codeload's tarball of $VERSION, as every build k1–k9 was made from
+LEVEL=k10      # bumped when the patches change, so a cached copy is not reused
+# The sha256 of codeload's tarball of $VERSION, as every build k1–k10 was made from
 # it. Changed with VERSION; a source that differs is refused, as
 # fetch-libs-other.sh refuses a release archive that differs.
 SRC_SHA=1f31ceacc2840237f81bf7dd77953b84d787781c62ff75065c1df08e54a915cc

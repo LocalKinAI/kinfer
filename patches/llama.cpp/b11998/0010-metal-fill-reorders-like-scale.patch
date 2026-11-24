@@ -1,0 +1,10 @@
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -464,6 +464,7 @@
+             case GGML_OP_DIV:
+             case GGML_OP_GLU:
+             case GGML_OP_SCALE:
++            case GGML_OP_FILL: // reads and writes what SCALE does; a recurrent state is cleared with it (0009), once a layer
+             case GGML_OP_UNARY:
+             case GGML_OP_GET_ROWS:
+             case GGML_OP_SET_ROWS:
